@@ -15,8 +15,8 @@
 - 可选设置：区域、时区、默认同步天数、自动同步和个人心率提醒阈值
 - `natural_query_sync_minutes`：自然语言健康问题的最短云端刷新间隔，默认 15 分钟
 - `enable_proactive_health_monitor` / `health_check_interval_minutes`：主动检查开关与间隔，默认每 30 分钟；命中条件后由当前 Bot 人格自然地发出关心，而不是执行指令式模板
-- `health_dialogue_provider_id` / `health_dialogue_persona_id`：可选的健康自然对话模型与人格 ID；填写后先由该模型按该人格生成健康解读草稿
-- `proactive_reminder_provider_id` / `proactive_reminder_persona_id`：可选的主动提醒模型与人格 ID；填写后用于后台触发后的关心措辞
+- `health_dialogue_provider_id` / `health_dialogue_persona_id`：直接下拉选择已配置的健康自然对话模型与人格；选择后先由该模型按该人格生成健康解读草稿
+- `proactive_reminder_provider_id` / `proactive_reminder_persona_id`：直接下拉选择已配置的主动提醒模型与人格；选择后用于后台触发后的关心措辞
 - `enable_late_night_activity_check` / `late_night_start` / `late_night_end` / `late_night_activity_window_minutes`：深夜活动检查开关、时段与近期活动窗口
 - `heart_rate_high`、`heart_rate_low`、`spo2_low`、`stress_high`、`sleep_min_minutes`：个人提示阈值；`0` 表示关闭对应指标
 - `alert_data_max_age_minutes`、`alert_consecutive_count`、`alert_cooldown_minutes`、`proactive_daily_limit`：样本新鲜度、连续样本、防刷屏冷却和每日主动消息上限
@@ -61,7 +61,7 @@
 
 规则服务只负责读取已同步数据并决定“是否值得提醒”；只有命中阈值或深夜活动等条件后，插件才会调用该私聊当前使用的聊天模型和人格，生成一两句自然关心。它不会把“刚检查了一次”“云端延迟”等技术说明塞进聊天，也不会在模型或人格不可用时退化为固定模板消息。
 
-若要为健康功能单独选模型，请在 AstrBot「服务提供商」中复制聊天模型的 **Provider ID**，在 AstrBot「人格管理」中复制人格的 `persona_id`，分别填入上面的两个配置组。四项均可留空：健康对话将保持当前会话原有的模型流程，主动提醒则使用当前私聊的模型和人格。填写自定义 Provider ID 后，相应的已同步健康数据会发送给该服务提供商，请只选择你信任的模型服务。
+在插件配置页，这四项都会直接显示 AstrBot 已配置的聊天模型或人格供选择，不需要复制 ID。四项均可不选：健康对话将保持当前会话原有的模型流程，主动提醒则使用当前私聊的模型和人格。选择自定义模型后，相应的已同步健康数据会发送给该服务提供商，请只选择你信任的模型服务。
 
 “太晚还没睡”不会根据“云端没有睡眠记录”猜测，因为小米睡眠数据通常醒来后才上传。插件只在设定深夜时段内、所有者最近确实发过私聊消息时，最多每晚提示一次。所有异常合并为一条私聊消息，并同时受到同事件去重、同类型冷却和全局主动消息冷却保护。
 
