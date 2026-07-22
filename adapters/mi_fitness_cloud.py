@@ -412,3 +412,21 @@ class MiFitnessCloudAdapter(DataAdapter):
         if self._client:
             await self._client.aclose()
             self._client = None
+
+    async def probe_data_keys(self, start: datetime, end: datetime) -> dict[str, str]:
+        """Return safe key-level availability diagnostics without returning raw records.
+
+        Args:
+            start: Probe window start.
+            end: Probe window end.
+
+        Returns:
+            Mapping of candidate key to count or a sanitized error category.
+        """
+        result: dict[str, str] = {}
+        for key in ("steps", "heart_rate", "resting_heart_rate", "heartrate", "hr", "sleep", "spo2", "blood_oxygen", "stress", "weight"):
+            try:
+                result[key] = str(len(await self._fetch_key(key, start, end, self.region)))
+            except Exception as error:
+                result[key] = f"错误：{redact_error(error)}"
+        return result

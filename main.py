@@ -7,6 +7,7 @@ import logging
 import os
 from contextlib import suppress
 from datetime import timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig
@@ -172,6 +173,18 @@ class MiFitnessHealthPlugin(Star):
             yield result
             return
         yield event.plain_result("健康详情（云端已同步数据，非实时）\n" + await self.query_service.care_snapshot())
+
+    @filter.command("健康诊断")
+    async def health_diagnose(self, event: AstrMessageEvent):
+        """Probe cloud keys safely to diagnose an account-specific missing data type."""
+        async for result in self._guard(event):
+            yield result
+            return
+        if not self.adapter.is_connected() and not await self.adapter.connect():
+            yield event.plain_result(f"健康诊断无法连接：{self.adapter.last_error or '未知错误'}")
+            return
+        data = await self.adapter.probe_data_keys(datetime.now(UTC) - timedelta(days=30), datetime.now(UTC))
+        yield event.plain_result("健康云诊断（仅记录数/脱敏错误，不含健康明细或凭证）\n" + "\n".join(f"{key}：{value}" for key, value in data.items()))
 
     @filter.command("健康状态")
     async def health_status(self, event: AstrMessageEvent):
