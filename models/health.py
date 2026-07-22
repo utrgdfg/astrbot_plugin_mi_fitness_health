@@ -48,6 +48,7 @@ class BodyMeasurement:
 @dataclass(frozen=True, slots=True)
 class SleepSession:
     """One sleep session reported by Xiaomi cloud."""
+
     record_id: str
     start_at: datetime
     end_at: datetime
@@ -60,6 +61,7 @@ class SleepSession:
 @dataclass(frozen=True, slots=True)
 class SpO2Sample:
     """One blood-oxygen record reported by Xiaomi cloud."""
+
     record_id: str
     timestamp: datetime
     percent: int
@@ -68,6 +70,7 @@ class SpO2Sample:
 @dataclass(frozen=True, slots=True)
 class StressSample:
     """One stress score reported by Xiaomi cloud."""
+
     record_id: str
     timestamp: datetime
     score: int

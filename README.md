@@ -2,24 +2,28 @@
 
 原生 AstrBot 插件，从小米运动健康云读取**已同步的历史数据**并缓存到本地 SQLite。它不连接蓝牙设备、不是实时监护，也不构成医疗诊断。
 
-当前支持步数、距离、活动消耗、心率、体重、部分身体成分、睡眠、血氧和压力。仅使用账号实际返回的数据；未知或缺失字段不会被伪造。
+当前稳定读取步数、距离、活动消耗、心率、体重及部分身体成分；同时提供睡眠、血氧和压力的兼容性读取。这三类数据的云端 key/字段会因账号、设备、区域和小米服务版本不同而变化，只有通过账号实际返回并通过校验的记录才会展示；未知或缺失字段不会被伪造。
 
 ## 安装和配置
 
-将插件 ZIP 导入 AstrBot 后，在“插件管理 → 小米运动健康 → 配置”中填写：
+将插件 ZIP 导入 AstrBot 4.18.1 或更高的 4.x 版本后，在“插件管理 → 小米运动健康 → 配置”中填写：
 
 - `user_id`：小米 Cookies 中的 `userId`
 - `pass_token`：小米 Cookies 中的 `passToken`
-- `owner_platform_id`：唯一允许查询健康数据的消息平台用户 ID
-- `owner_platform_instance_id`：建议同时填写 AstrBot 平台实例 ID，避免跨平台同号
+- `owner_platform_id`：必填。所有者先私聊机器人发送 `/sid`，复制返回的 `UID`
+- `owner_platform_instance_id`：v0.5.0 起必填。复制同一条 `/sid` 结果中的 `Bot ID`，与 `UID` 一起校验，避免跨平台同号越权
 - 可选设置：区域、时区、默认同步天数、自动同步和个人心率提醒阈值
 - `natural_query_sync_minutes`：自然语言健康问题的最短云端刷新间隔，默认 15 分钟
 - `enable_proactive_health_monitor` / `health_check_interval_minutes`：主动检查开关与间隔，默认每 30 分钟
-- `late_night_start` / `late_night_end`：深夜活动检查窗口，默认 00:30–06:00
+- `enable_late_night_activity_check` / `late_night_start` / `late_night_end` / `late_night_activity_window_minutes`：深夜活动检查开关、时段与近期活动窗口
 - `heart_rate_high`、`heart_rate_low`、`spo2_low`、`stress_high`、`sleep_min_minutes`：个人提示阈值；`0` 表示关闭对应指标
-- `alert_consecutive_count`、`alert_cooldown_minutes`、`proactive_daily_limit`：连续样本、防刷屏冷却和每日主动消息上限
+- `alert_data_max_age_minutes`、`alert_consecutive_count`、`alert_cooldown_minutes`、`proactive_daily_limit`：样本新鲜度、连续样本、防刷屏冷却和每日主动消息上限
 
-`passToken` 等同账号登录凭证。仅应由受信任管理员在 AstrBot 配置页面填写，绝不可发送到聊天、日志、截图、Issue 或模型。插件不支持明文密码登录。
+主动健康检查和深夜私聊活动检查默认开启。如果不需要周期性云端请求，请同时关闭 `enable_proactive_health_monitor` 与 `enable_auto_sync`；自然语言健康查询仍可能按需刷新。
+
+`owner_platform_id` 或 `owner_platform_instance_id` 为空时，所有健康数据命令、普通对话工具和主动监控都会保持禁用；填写并重新加载插件后生效。
+
+`passToken` 等同账号登录凭证。仅应由受信任管理员在 AstrBot 配置页面填写，绝不可发送到聊天、日志、截图、Issue 或模型。Schema 已请求密码输入样式，但遮罩不等于加密存储，不同 AstrBot WebUI 版本也可能仍然回显；需要更严格保护时，请将配置页的 `pass_token` 留空并通过进程环境变量 `MI_FITNESS_PASS_TOKEN` 提供。插件不支持明文账号密码登录。
 
 ### 获取凭证
 
@@ -57,13 +61,15 @@
 
 主动发送需要插件先从所有者的一次私聊中记录统一会话标识。AstrBot 的 QQ 官方 API 适配器不支持该主动发送方式；AIOCQHTTP/NapCat 等通常支持。对话查询不受此主动发送限制。
 
+睡眠、血氧和压力属于账号差异较大的兼容性数据源。可用 `/健康诊断` 查看最近 30 天候选 key 的脱敏记录数；诊断有记录但同步仍为空时，请在 Issue 中只提供 key 名、记录数和脱敏错误，不要提交原始健康数据或 Cookie。
+
 ## 开发验证
 
 测试不连接真实小米服务：
 
 ```powershell
-$env:PYTHONPATH = 'G:\'
-python -m unittest astrbot_plugin_mi_fitness_health.tests.test_database
+# 在仓库目录的上一级执行；仓库目录名保持 astrbot_plugin_mi_fitness_health
+python -m unittest discover -s .\astrbot_plugin_mi_fitness_health\tests -v
 ```
 
 实际小米云登录和字段兼容性仍需由用户使用自己的账号在受控环境中验证。请不要在测试或 Issue 中提交任何真实 Cookie。

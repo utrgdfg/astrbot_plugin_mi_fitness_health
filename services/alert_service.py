@@ -55,19 +55,31 @@ class AlertService:
 
     def _is_fresh(self, value: object) -> bool:
         timestamp = self._timestamp(value)
-        return bool(timestamp and timestamp >= datetime.now(UTC) - timedelta(minutes=self.data_max_age_minutes))
+        return bool(
+            timestamp
+            and timestamp
+            >= datetime.now(UTC) - timedelta(minutes=self.data_max_age_minutes)
+        )
 
     async def _eligible(self, alert_type: str, event_key: str) -> bool:
-        if await asyncio.to_thread(self.database.alert_event_sent, alert_type, event_key):
+        if await asyncio.to_thread(
+            self.database.alert_event_sent, alert_type, event_key
+        ):
             return False
         last = await asyncio.to_thread(self.database.last_alert_at, alert_type)
         if not last:
             return True
         timestamp = self._timestamp(last)
-        return not timestamp or timestamp <= datetime.now(UTC) - timedelta(minutes=self.cooldown_minutes)
+        return not timestamp or timestamp <= datetime.now(UTC) - timedelta(
+            minutes=self.cooldown_minutes
+        )
 
-    async def _evaluate_heart_rate(self, cutoff: str, findings: list[AlertFinding]) -> None:
-        rows = await asyncio.to_thread(self.database.heart_rates_since, self.user_id, cutoff, 200)
+    async def _evaluate_heart_rate(
+        self, cutoff: str, findings: list[AlertFinding]
+    ) -> None:
+        rows = await asyncio.to_thread(
+            self.database.heart_rates_since, self.user_id, cutoff, 200
+        )
         if not rows or not self._is_fresh(rows[0]["timestamp"]):
             return
         for label, threshold, compare in (
@@ -77,8 +89,15 @@ class AlertService:
             if threshold <= 0:
                 continue
             matching = 0
-            for row in rows:  # newest first: only the current uninterrupted sequence counts
-                if row["is_workout"] or row["sample_type"] != "passive" or not compare(row["bpm"], threshold):
+            for (
+                row
+            ) in rows:  # newest first: only the current uninterrupted sequence counts
+                if (
+                    not self._is_fresh(row["timestamp"])
+                    or row["is_workout"]
+                    or row["sample_type"] != "passive"
+                    or not compare(row["bpm"], threshold)
+                ):
                     break
                 matching += 1
                 if matching >= self.consecutive:
@@ -86,12 +105,14 @@ class AlertService:
                     event_key = str(rows[0]["record_id"])
                     if await self._eligible(alert_type, event_key):
                         direction = "高于" if label == "high" else "低于"
-                        findings.append(AlertFinding(
-                            alert_type,
-                            event_key,
-                            f"最近连续 {matching} 条非运动被动心率记录{direction}你配置的 {threshold} bpm 阈值"
-                            f"（最新采集：{rows[0]['timestamp']}）。建议先休息并按需复测；这不是医疗诊断。",
-                        ))
+                        findings.append(
+                            AlertFinding(
+                                alert_type,
+                                event_key,
+                                f"最近连续 {matching} 条非运动被动心率记录{direction}你配置的 {threshold} bpm 阈值"
+                                f"（最新采集：{rows[0]['timestamp']}）。建议先休息并按需复测；这不是医疗诊断。",
+                            )
+                        )
                     break
 
     async def _evaluate_metric_sequence(
@@ -106,11 +127,15 @@ class AlertService:
     ) -> None:
         if threshold <= 0:
             return
-        rows = await asyncio.to_thread(self.database.metric_samples_since, table, self.user_id, cutoff, 200)
+        rows = await asyncio.to_thread(
+            self.database.metric_samples_since, table, self.user_id, cutoff, 200
+        )
         if not rows or not self._is_fresh(rows[0]["timestamp"]):
             return
         matching = 0
         for row in rows:
+            if not self._is_fresh(row["timestamp"]):
+                break
             value = int(row[column])
             abnormal = value < threshold if direction == "低于" else value > threshold
             if not abnormal:
@@ -121,12 +146,14 @@ class AlertService:
                 if await self._eligible(alert_type, event_key):
                     label = "血氧" if table == "spo2_samples" else "压力分数"
                     suffix = "%" if table == "spo2_samples" else ""
-                    findings.append(AlertFinding(
-                        alert_type,
-                        event_key,
-                        f"最近连续 {matching} 条{label}记录{direction}你配置的 {threshold}{suffix} 阈值"
-                        f"（最新采集：{rows[0]['timestamp']}）。建议结合当时状态复测；这不是医疗诊断。",
-                    ))
+                    findings.append(
+                        AlertFinding(
+                            alert_type,
+                            event_key,
+                            f"最近连续 {matching} 条{label}记录{direction}你配置的 {threshold}{suffix} 阈值"
+                            f"（最新采集：{rows[0]['timestamp']}）。建议结合当时状态复测；这不是医疗诊断。",
+                        )
+                    )
                 break
 
     async def _evaluate_sleep(self, findings: list[AlertFinding]) -> None:
@@ -142,12 +169,14 @@ class AlertService:
         event_key = str(sleep["record_id"])
         if not await self._eligible(alert_type, event_key):
             return
-        findings.append(AlertFinding(
-            alert_type,
-            event_key,
-            f"最近一段睡眠记录为 {sleep['asleep_minutes']} 分钟，低于你配置的 {self.sleep_min_minutes} 分钟阈值"
-            f"（结束：{sleep['end_at']}）。今天如果方便，可以给自己留些恢复时间；这不是医疗诊断。",
-        ))
+        findings.append(
+            AlertFinding(
+                alert_type,
+                event_key,
+                f"最近一段睡眠记录为 {sleep['asleep_minutes']} 分钟，低于你配置的 {self.sleep_min_minutes} 分钟阈值"
+                f"（结束：{sleep['end_at']}）。今天如果方便，可以给自己留些恢复时间；这不是医疗诊断。",
+            )
+        )
 
     async def evaluate(self) -> list[AlertFinding]:
         """Return unsent, fresh findings without persisting before delivery."""
@@ -155,10 +184,22 @@ class AlertService:
         findings: list[AlertFinding] = []
         await self._evaluate_heart_rate(cutoff, findings)
         await self._evaluate_metric_sequence(
-            "spo2_samples", "percent", self.spo2_low, "spo2_low", "低于", cutoff, findings
+            "spo2_samples",
+            "percent",
+            self.spo2_low,
+            "spo2_low",
+            "低于",
+            cutoff,
+            findings,
         )
         await self._evaluate_metric_sequence(
-            "stress_samples", "score", self.stress_high, "stress_high", "高于", cutoff, findings
+            "stress_samples",
+            "score",
+            self.stress_high,
+            "stress_high",
+            "高于",
+            cutoff,
+            findings,
         )
         await self._evaluate_sleep(findings)
         return findings

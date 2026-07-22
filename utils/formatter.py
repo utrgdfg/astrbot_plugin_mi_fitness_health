@@ -2,31 +2,45 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-
 
 def measurement_text(row: dict | None) -> str:
     """Format an optional body measurement without inventing missing fields."""
     if not row:
         return "最近身体测量：暂无数据"
-    labels = (("weight_kg", "体重", "kg"), ("bmi", "BMI", ""), ("body_fat_pct", "体脂", "%"),
-              ("muscle_mass_kg", "肌肉量", "kg"), ("water_pct", "水分", "%"),
-              ("basal_metabolism_kcal", "基础代谢", "kcal"), ("metabolic_age", "身体年龄", ""))
-    values = [f"{label}：{row[key]}{unit}" for key, label, unit in labels if row.get(key) is not None]
+    labels = (
+        ("weight_kg", "体重", "kg"),
+        ("bmi", "BMI", ""),
+        ("body_fat_pct", "体脂", "%"),
+        ("muscle_mass_kg", "肌肉量", "kg"),
+        ("water_pct", "水分", "%"),
+        ("basal_metabolism_kcal", "基础代谢", "kcal"),
+        ("metabolic_age", "身体年龄", ""),
+    )
+    values = [
+        f"{label}：{row[key]}{unit}"
+        for key, label, unit in labels
+        if row.get(key) is not None
+    ]
     return f"最近身体测量（采集：{row['timestamp']}）\n" + "，".join(values)
 
 
-def today_text(activity: dict | None, heart_rates: list[dict], measurement: dict | None) -> str:
+def today_text(
+    activity: dict | None, heart_rates: list[dict], measurement: dict | None
+) -> str:
     """Format today's cached cloud summary with latest data timestamps."""
     lines = ["今日健康（小米云端已同步数据，非实时监护）"]
     if activity:
-        lines.append(f"步数：{activity['steps']}｜距离：{activity['distance_m']:.0f} m｜活动消耗：{activity['active_kcal']:.0f} kcal")
+        lines.append(
+            f"步数：{activity['steps']}｜距离：{activity['distance_m']:.0f} m｜活动消耗：{activity['active_kcal']:.0f} kcal"
+        )
         lines.append(f"活动采集/更新：{activity['collected_at']}")
     else:
         lines.append("步数/距离/活动消耗：暂无今日数据")
     if heart_rates:
         values = [item["bpm"] for item in heart_rates]
-        lines.append(f"心率：最新 {heart_rates[0]['bpm']} bpm（采集：{heart_rates[0]['timestamp']}），平均 {sum(values)/len(values):.0f}，最高 {max(values)}，最低 {min(values)}")
+        lines.append(
+            f"心率：最新 {heart_rates[0]['bpm']} bpm（采集：{heart_rates[0]['timestamp']}），平均 {sum(values) / len(values):.0f}，最高 {max(values)}，最低 {min(values)}"
+        )
     else:
         lines.append("心率：暂无最近 24 小时数据")
     lines.append(measurement_text(measurement))

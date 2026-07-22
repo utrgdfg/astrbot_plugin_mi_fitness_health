@@ -5,14 +5,17 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 
-from ..adapters import MiFitnessCloudAdapter
+from ..adapters import MiFitnessAuthenticationError, MiFitnessCloudAdapter
 from ..storage import Database
+from ..utils.privacy import redact_error
 
 
 class SyncService:
     """Coordinate manual, startup, and periodic syncs with one async lock."""
 
-    def __init__(self, adapter: MiFitnessCloudAdapter, database: Database, user_id: str):
+    def __init__(
+        self, adapter: MiFitnessCloudAdapter, database: Database, user_id: str
+    ):
         """Create a sync service.
 
         Args:
@@ -46,6 +49,7 @@ class SyncService:
             start = end - timedelta(days=days + 2)  # delayed uploads and corrections
             counters = {"added": 0, "updated": 0, "errors": 0}
             details: dict[str, dict[str, object]] = {}
+            first_error = ""
             for data_type, iterator in (
                 ("daily_activity", self.adapter.iter_daily_activity(start, end)),
                 ("heart_rate", self.adapter.iter_heart_rate(start, end)),
@@ -56,15 +60,35 @@ class SyncService:
             ):
                 try:
                     records = [record async for record in iterator]
-                    outcome = await asyncio.to_thread(self.database.upsert_many, self.user_id, data_type, records)
-                    latest = max((getattr(record, "timestamp", None) or getattr(record, "collected_at", None) or getattr(record, "end_at", None) for record in records), default=None)
-                    await asyncio.to_thread(self.database.update_sync_state, data_type, latest)
+                    outcome = await asyncio.to_thread(
+                        self.database.upsert_many, self.user_id, data_type, records
+                    )
+                    latest = max(
+                        (
+                            getattr(record, "timestamp", None)
+                            or getattr(record, "collected_at", None)
+                            or getattr(record, "end_at", None)
+                            for record in records
+                        ),
+                        default=None,
+                    )
+                    await asyncio.to_thread(
+                        self.database.update_sync_state, data_type, latest
+                    )
                     counters["added"] += outcome["added"]
                     counters["updated"] += outcome["updated"]
                     details[data_type] = {"fetched": len(records), **outcome}
+                except MiFitnessAuthenticationError:
+                    raise
                 except Exception as error:
                     # A variant key can fail for one account. Keep the other
                     # datasets usable and expose only a short safe status.
                     counters["errors"] += 1
-                    details[data_type] = {"error": str(error)[:120]}
+                    reason = redact_error(error)
+                    first_error = first_error or reason
+                    details[data_type] = {"error": reason}
+            if counters["errors"] == len(details):
+                raise RuntimeError(
+                    f"所有健康数据集同步失败：{first_error or '未知云端错误'}"
+                )
             return {**counters, "types": len(details), "days": days, "details": details}

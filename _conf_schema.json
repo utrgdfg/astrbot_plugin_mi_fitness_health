@@ -8,6 +8,7 @@
   },
   "pass_token": {
     "type": "string",
+    "password": true,
     "description": "小米 passToken（敏感）",
     "hint": "在同一 Cookies 列表复制 passToken。它等同登录凭证：只能在此受控插件配置页填写，绝不可发送到聊天、日志、截图、Issue 或模型。",
     "obvious_hint": true,
@@ -27,8 +28,8 @@
   },
   "sync_interval_minutes": {"type": "int", "description": "自动同步间隔（分钟）", "default": 60},
   "default_sync_days": {"type": "int", "description": "默认同步天数", "default": 7},
-  "owner_platform_id": {"type": "string", "description": "健康数据所有者平台 ID", "hint": "只有此 ID 可执行健康查询与数据管理。", "default": ""},
-  "owner_platform_instance_id": {"type": "string", "description": "所有者平台实例 ID（可选）", "hint": "建议填写 AstrBot 平台实例 ID，与 owner_platform_id 一起校验，避免不同平台出现相同用户 ID。", "default": ""},
+  "owner_platform_id": {"type": "string", "description": "健康数据所有者平台 ID", "hint": "必填。由所有者私聊机器人发送 /sid，复制其中的 UID；只有此 ID 可执行健康查询与数据管理。", "obvious_hint": true, "default": ""},
+  "owner_platform_instance_id": {"type": "string", "description": "所有者平台实例 ID", "hint": "必填。由所有者私聊机器人发送 /sid，复制其中的 Bot ID；它与 UID 一起校验，避免跨平台同号越权。", "obvious_hint": true, "default": ""},
   "enable_auto_sync": {"type": "bool", "description": "启用自动同步", "default": true},
   "enable_health_alerts": {"type": "bool", "description": "启用用户阈值健康提示", "hint": "只评估你配置的连续阈值，默认阈值为 0 时对应指标不提示；不作医疗诊断。", "default": true},
   "enable_care_dialogue": {"type": "bool", "description": "允许在普通对话中调用健康数据", "hint": "仅对 owner_platform_id 的私聊生效；模型可调用插件工具读取数据，不作医疗诊断。", "default": true},

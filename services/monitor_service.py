@@ -62,14 +62,19 @@ class HealthMonitorService:
 
     def _night_key(self, now: datetime) -> str:
         """Map an across-midnight window to one night for once-per-night dedupe."""
-        if self.late_night_start > self.late_night_end and now.time() >= self.late_night_start:
+        if (
+            self.late_night_start > self.late_night_end
+            and now.time() >= self.late_night_start
+        ):
             return (now.date() + timedelta(days=1)).isoformat()
         return now.date().isoformat()
 
     async def proactive_cooling_down(self, now: datetime | None = None) -> bool:
         """Apply one global cooldown across all proactive message categories."""
         current_local = (now or datetime.now(self.timezone)).astimezone(self.timezone)
-        local_midnight = current_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        local_midnight = current_local.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
         sent_today = await asyncio.to_thread(
             self.database.alert_count_since,
             "proactive_message",
@@ -88,7 +93,9 @@ class HealthMonitorService:
         except ValueError:
             return False
 
-    async def evaluate_late_activity(self, now: datetime | None = None) -> MonitorFinding | None:
+    async def evaluate_late_activity(
+        self, now: datetime | None = None
+    ) -> MonitorFinding | None:
         """Return a finding only when recent owner chat proves late activity.
 
         Missing Xiaomi sleep data is deliberately not considered proof that a
@@ -101,9 +108,13 @@ class HealthMonitorService:
         if not self._is_late_night(now.time()):
             return None
         event_key = self._night_key(now)
-        if await asyncio.to_thread(self.database.alert_event_sent, "late_night_activity", event_key):
+        if await asyncio.to_thread(
+            self.database.alert_event_sent, "late_night_activity", event_key
+        ):
             return None
-        state = await asyncio.to_thread(self.database.private_owner_session, self.owner_platform_id)
+        state = await asyncio.to_thread(
+            self.database.private_owner_session, self.owner_platform_id
+        )
         if not state:
             return None
         try:
@@ -113,10 +124,14 @@ class HealthMonitorService:
             return None
         if now_utc - last_seen > timedelta(minutes=self.activity_window_minutes):
             return None
-        last_alert = await asyncio.to_thread(self.database.last_alert_at, "late_night_activity")
+        last_alert = await asyncio.to_thread(
+            self.database.last_alert_at, "late_night_activity"
+        )
         if last_alert:
             try:
-                if datetime.fromisoformat(last_alert) > now_utc - timedelta(minutes=self.cooldown_minutes):
+                if datetime.fromisoformat(last_alert) > now_utc - timedelta(
+                    minutes=self.cooldown_minutes
+                ):
                     return None
             except ValueError:
                 pass
@@ -127,7 +142,9 @@ class HealthMonitorService:
             "这个判断只来自你的私聊活动，不是手环实时检测。",
         )
 
-    async def mark_sent(self, finding: MonitorFinding, sent_at: datetime | None = None) -> None:
+    async def mark_sent(
+        self, finding: MonitorFinding, sent_at: datetime | None = None
+    ) -> None:
         """Start cooldown only after the proactive message was delivered."""
         await asyncio.to_thread(
             self.database.add_alert,
@@ -137,6 +154,10 @@ class HealthMonitorService:
             sent_at,
         )
 
-    async def mark_proactive_sent(self, message: str, sent_at: datetime | None = None) -> None:
+    async def mark_proactive_sent(
+        self, message: str, sent_at: datetime | None = None
+    ) -> None:
         """Record the global cooldown after one combined message is delivered."""
-        await asyncio.to_thread(self.database.add_alert, "proactive_message", message, None, sent_at)
+        await asyncio.to_thread(
+            self.database.add_alert, "proactive_message", message, None, sent_at
+        )

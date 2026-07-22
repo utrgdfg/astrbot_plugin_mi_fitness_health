@@ -36,7 +36,9 @@ class QueryServiceTest(unittest.TestCase):
             database.initialize()
             service = QueryService(database, "user", "Asia/Shanghai")
             now = datetime.now(UTC)
-            database.upsert_activity("user", DailyActivity(service.today(), 4321, 3000, 210, now))
+            database.upsert_activity(
+                "user", DailyActivity(service.today(), 4321, 3000, 210, now)
+            )
             database.upsert_measurement("user", BodyMeasurement("weight", now, 60.0))
             snapshot = asyncio.run(service.care_snapshot("我今天走了多少步"))
             self.assertIn("4321 步", snapshot)
