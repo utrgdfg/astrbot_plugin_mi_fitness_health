@@ -163,7 +163,15 @@ class MiFitnessHealthPlugin(Star):
             yield result
             return
         activity, rates, measurement = await self.query_service.today_summary()
-        yield event.plain_result(today_text(activity, rates, measurement))
+        yield event.plain_result(today_text(activity, rates, measurement) + "\n" + await self.query_service.care_snapshot())
+
+    @filter.command("健康详情")
+    async def health_details(self, event: AstrMessageEvent):
+        """Show latest supported sleep, blood-oxygen, and stress cloud records."""
+        async for result in self._guard(event):
+            yield result
+            return
+        yield event.plain_result("健康详情（云端已同步数据，非实时）\n" + await self.query_service.care_snapshot())
 
     @filter.command("健康状态")
     async def health_status(self, event: AstrMessageEvent):
