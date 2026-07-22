@@ -2,6 +2,15 @@
 
 本项目遵循语义化版本。小米运动健康云数据来自手机端已经上传的历史记录；所有版本均不提供蓝牙实时监护，也不构成医疗诊断。
 
+## [v0.5.7] - 2026-07-23
+
+### 调整
+
+- 插件定位调整为日常对话增强：移除心率、血氧、压力、睡眠时长等阈值式“异常”评估和主动告警链路，不再把小米数据当作专业健康检测。
+- Bot 会在睡眠、疲劳、早晚问候、加班、运动和深夜聊天等日常对话线索出现时，在后台准备最小必要的已同步生活数据，并只在有助于自然交流时融入回复。
+- 后台主动消息仅保留深夜仍有私聊活动等自然关心时机，继续受事件去重、冷却和每日上限保护；措辞仍由所选模型与人格生成。
+- 配置页、帮助文本和 README 统一改为“生活数据 / 日常关心”表述，并清理不再使用的体征阈值配置。
+
 ## [v0.5.6] - 2026-07-23
 
 ### 修复
@@ -96,6 +105,7 @@
 - AstrBot 的 QQ 官方 API 适配器不支持当前主动发送方式；AIOCQHTTP/NapCat 等通常支持。普通私聊中的健康查询不受此限制。
 - 不同小米账号、区域与设备可能暴露不同的云端 key；缺失或未知字段不会被伪造。
 
+[v0.5.7]: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/releases/tag/v0.5.7
 [v0.5.6]: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/releases/tag/v0.5.6
 [v0.5.5]: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/releases/tag/v0.5.5
 [v0.5.4]: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/releases/tag/v0.5.4
