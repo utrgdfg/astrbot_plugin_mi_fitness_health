@@ -29,7 +29,7 @@ class SyncService:
         """Initialize schema outside AstrBot's event loop."""
         await asyncio.to_thread(self.database.initialize)
 
-    async def sync(self, days: int) -> dict[str, int | str]:
+    async def sync(self, days: int) -> dict[str, object]:
         """Download an overlap window and return exact insert/update counters.
 
         Args:
@@ -44,22 +44,27 @@ class SyncService:
                 raise RuntimeError(self.adapter.last_error or "小米健康云连接失败")
             end = datetime.now(UTC)
             start = end - timedelta(days=days + 2)  # delayed uploads and corrections
-            counters = {"added": 0, "updated": 0}
-            type_count = 0
-            for data_type, iterator, writer in (
-                ("daily_activity", self.adapter.iter_daily_activity(start, end), self.database.upsert_activity),
-                ("heart_rate", self.adapter.iter_heart_rate(start, end), self.database.upsert_heart_rate),
-                ("body_measurements", self.adapter.iter_body_measurements(start, end), self.database.upsert_measurement),
-                ("sleep", self.adapter.iter_sleep(start, end), self.database.upsert_sleep),
-                ("spo2", self.adapter.iter_spo2(start, end), self.database.upsert_spo2),
-                ("stress", self.adapter.iter_stress(start, end), self.database.upsert_stress),
+            counters = {"added": 0, "updated": 0, "errors": 0}
+            details: dict[str, dict[str, object]] = {}
+            for data_type, iterator in (
+                ("daily_activity", self.adapter.iter_daily_activity(start, end)),
+                ("heart_rate", self.adapter.iter_heart_rate(start, end)),
+                ("body_measurements", self.adapter.iter_body_measurements(start, end)),
+                ("sleep", self.adapter.iter_sleep(start, end)),
+                ("spo2", self.adapter.iter_spo2(start, end)),
+                ("stress", self.adapter.iter_stress(start, end)),
             ):
-                latest: datetime | None = None
-                async for record in iterator:
-                    outcome = await asyncio.to_thread(writer, self.user_id, record)
-                    counters[outcome] += 1
-                    timestamp = getattr(record, "timestamp", getattr(record, "collected_at", None))
-                    latest = max(latest, timestamp) if latest and timestamp else timestamp or latest
-                await asyncio.to_thread(self.database.update_sync_state, data_type, latest)
-                type_count += 1
-            return {**counters, "types": type_count, "days": days}
+                try:
+                    records = [record async for record in iterator]
+                    outcome = await asyncio.to_thread(self.database.upsert_many, self.user_id, data_type, records)
+                    latest = max((getattr(record, "timestamp", None) or getattr(record, "collected_at", None) or getattr(record, "end_at", None) for record in records), default=None)
+                    await asyncio.to_thread(self.database.update_sync_state, data_type, latest)
+                    counters["added"] += outcome["added"]
+                    counters["updated"] += outcome["updated"]
+                    details[data_type] = {"fetched": len(records), **outcome}
+                except Exception as error:
+                    # A variant key can fail for one account. Keep the other
+                    # datasets usable and expose only a short safe status.
+                    counters["errors"] += 1
+                    details[data_type] = {"error": str(error)[:120]}
+            return {**counters, "types": len(details), "days": days, "details": details}

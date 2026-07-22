@@ -10,7 +10,7 @@ from typing import Any
 
 from ..models import BodyMeasurement, DailyActivity, HeartRateSample, SleepSession, SpO2Sample, StressSample
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class Database:
@@ -76,6 +76,22 @@ class Database:
                 CREATE TABLE IF NOT EXISTS spo2_samples (user_id TEXT NOT NULL, record_id TEXT NOT NULL, timestamp TEXT NOT NULL, percent INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(user_id,record_id));
                 CREATE TABLE IF NOT EXISTS stress_samples (user_id TEXT NOT NULL, record_id TEXT NOT NULL, timestamp TEXT NOT NULL, score INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(user_id,record_id));
                 """)
+                connection.execute("UPDATE schema_version SET version = 2")
+                current = 2
+            if current < 3:
+                connection.executescript("""
+                CREATE TABLE IF NOT EXISTS private_owner_sessions (
+                    owner_platform_id TEXT PRIMARY KEY,
+                    session TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS care_deliveries (
+                    reminder_type TEXT NOT NULL,
+                    local_date TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(reminder_type, local_date)
+                );
+                """)
                 connection.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
 
     @contextmanager
@@ -112,6 +128,58 @@ class Database:
                  record.collected_at.isoformat(), self._now()),
             )
         return "updated" if exists else "added"
+
+    def upsert_many(self, user_id: str, data_type: str, records: list[object]) -> dict[str, int]:
+        """Persist a cloud data type in one transaction with exact counters.
+
+        A Xiaomi heart-rate upload can contain thousands of samples.  This
+        avoids opening one SQLite connection per sample without changing the
+        unique keys that make delayed cloud uploads safe to re-read.
+        """
+        counters = {"added": 0, "updated": 0}
+        if not records:
+            return counters
+        with self._connect() as c:
+            now = self._now()
+            for record in records:
+                if data_type == "daily_activity":
+                    exists = c.execute("SELECT 1 FROM daily_activity WHERE user_id=? AND date=?", (user_id, record.date)).fetchone()
+                    c.execute("""INSERT INTO daily_activity(user_id,date,steps,distance_m,active_kcal,collected_at,updated_at)
+                        VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,date) DO UPDATE SET steps=excluded.steps,distance_m=excluded.distance_m,
+                        active_kcal=excluded.active_kcal,collected_at=excluded.collected_at,updated_at=excluded.updated_at""",
+                        (user_id, record.date, record.steps, record.distance_m, record.active_kcal, record.collected_at.isoformat(), now))
+                elif data_type == "heart_rate":
+                    exists = c.execute("SELECT 1 FROM heart_rate_samples WHERE user_id=? AND record_id=?", (user_id, record.record_id)).fetchone()
+                    c.execute("""INSERT INTO heart_rate_samples(user_id,record_id,timestamp,bpm,sample_type,is_workout,updated_at)
+                        VALUES(?,?,?,?,?,?,?) ON CONFLICT(user_id,record_id) DO UPDATE SET timestamp=excluded.timestamp,bpm=excluded.bpm,
+                        sample_type=excluded.sample_type,is_workout=excluded.is_workout,updated_at=excluded.updated_at""",
+                        (user_id, record.record_id, record.timestamp.isoformat(), record.bpm, record.sample_type, int(record.is_workout), now))
+                elif data_type == "body_measurements":
+                    exists = c.execute("SELECT 1 FROM body_measurements WHERE user_id=? AND record_id=?", (user_id, record.record_id)).fetchone()
+                    c.execute("""INSERT INTO body_measurements(user_id,record_id,timestamp,weight_kg,bmi,body_fat_pct,muscle_mass_kg,water_pct,
+                        bone_mass_kg,visceral_fat_score,basal_metabolism_kcal,metabolic_age,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(user_id,record_id) DO UPDATE SET timestamp=excluded.timestamp,weight_kg=excluded.weight_kg,bmi=excluded.bmi,
+                        body_fat_pct=excluded.body_fat_pct,muscle_mass_kg=excluded.muscle_mass_kg,water_pct=excluded.water_pct,
+                        bone_mass_kg=excluded.bone_mass_kg,visceral_fat_score=excluded.visceral_fat_score,
+                        basal_metabolism_kcal=excluded.basal_metabolism_kcal,metabolic_age=excluded.metabolic_age,updated_at=excluded.updated_at""",
+                        (user_id, record.record_id, record.timestamp.isoformat(), record.weight_kg, record.bmi, record.body_fat_pct,
+                         record.muscle_mass_kg, record.water_pct, record.bone_mass_kg, record.visceral_fat_score,
+                         record.basal_metabolism_kcal, record.metabolic_age, now))
+                elif data_type == "sleep":
+                    exists = c.execute("SELECT 1 FROM sleep_sessions WHERE user_id=? AND record_id=?", (user_id, record.record_id)).fetchone()
+                    c.execute("""INSERT INTO sleep_sessions VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,record_id) DO UPDATE SET
+                        start_at=excluded.start_at,end_at=excluded.end_at,duration_minutes=excluded.duration_minutes,
+                        asleep_minutes=excluded.asleep_minutes,awake_minutes=excluded.awake_minutes,score=excluded.score,updated_at=excluded.updated_at""",
+                        (user_id, record.record_id, record.start_at.isoformat(), record.end_at.isoformat(), record.duration_minutes,
+                         record.asleep_minutes, record.awake_minutes, record.score, now))
+                elif data_type in ("spo2", "stress"):
+                    table, column, value = ("spo2_samples", "percent", record.percent) if data_type == "spo2" else ("stress_samples", "score", record.score)
+                    exists = c.execute(f"SELECT 1 FROM {table} WHERE user_id=? AND record_id=?", (user_id, record.record_id)).fetchone()
+                    c.execute(f"INSERT INTO {table}(user_id,record_id,timestamp,{column},updated_at) VALUES(?,?,?,?,?) ON CONFLICT(user_id,record_id) DO UPDATE SET timestamp=excluded.timestamp,{column}=excluded.{column},updated_at=excluded.updated_at", (user_id, record.record_id, record.timestamp.isoformat(), value, now))
+                else:
+                    raise ValueError(f"Unsupported data type: {data_type}")
+                counters["updated" if exists else "added"] += 1
+        return counters
 
     def upsert_heart_rate(self, user_id: str, record: HeartRateSample) -> str:
         """Insert or update one heart-rate row and return its exact outcome."""
@@ -192,6 +260,12 @@ class Database:
             row = connection.execute("SELECT * FROM daily_activity WHERE user_id=? AND date=?", (user_id, date)).fetchone()
         return dict(row) if row else None
 
+    def recent_activity(self, user_id: str, end_date: str, limit: int = 2) -> list[dict[str, Any]]:
+        """Return a short local-day activity history for natural conversation."""
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM daily_activity WHERE user_id=? AND date<=? ORDER BY date DESC LIMIT ?", (user_id, end_date, max(1, min(limit, 7)))).fetchall()
+        return [dict(row) for row in rows]
+
     def heart_rates_since(self, user_id: str, timestamp: str, limit: int = 100) -> list[dict[str, Any]]:
         """Return recent heart-rate records in newest-first order."""
         with self._connect() as connection:
@@ -211,6 +285,12 @@ class Database:
         with self._connect() as c:
             row = c.execute("SELECT * FROM sleep_sessions WHERE user_id=? ORDER BY end_at DESC LIMIT 1", (user_id,)).fetchone()
         return dict(row) if row else None
+
+    def recent_sleep(self, user_id: str, limit: int = 3) -> list[dict[str, Any]]:
+        """Return a small sleep history for owner-only natural-language replies."""
+        with self._connect() as c:
+            rows = c.execute("SELECT * FROM sleep_sessions WHERE user_id=? ORDER BY end_at DESC LIMIT ?", (user_id, max(1, min(limit, 7)))).fetchall()
+        return [dict(row) for row in rows]
 
     def latest_metric(self, table: str, user_id: str) -> dict[str, Any] | None:
         with self._connect() as c:
@@ -241,3 +321,22 @@ class Database:
                 "SELECT created_at FROM alerts WHERE alert_type=? ORDER BY id DESC LIMIT 1", (alert_type,)
             ).fetchone()
         return row["created_at"] if row else None
+
+    def save_private_owner_session(self, owner_platform_id: str, session: str) -> None:
+        """Remember an owner-approved private session; group sessions are never saved."""
+        with self._connect() as connection:
+            connection.execute("""INSERT INTO private_owner_sessions(owner_platform_id,session,updated_at) VALUES(?,?,?)
+                ON CONFLICT(owner_platform_id) DO UPDATE SET session=excluded.session,updated_at=excluded.updated_at""",
+                (owner_platform_id, session, self._now()))
+
+    def private_owner_session(self, owner_platform_id: str) -> str | None:
+        """Return the most recently observed private chat for the owner."""
+        with self._connect() as connection:
+            row = connection.execute("SELECT session FROM private_owner_sessions WHERE owner_platform_id=?", (owner_platform_id,)).fetchone()
+        return row["session"] if row else None
+
+    def claim_care_delivery(self, reminder_type: str, local_date: str) -> bool:
+        """Atomically reserve at most one scheduled reminder per local day."""
+        with self._connect() as connection:
+            cursor = connection.execute("INSERT OR IGNORE INTO care_deliveries(reminder_type,local_date,created_at) VALUES(?,?,?)", (reminder_type, local_date, self._now()))
+        return cursor.rowcount == 1

@@ -7,7 +7,7 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 
-from astrbot_plugin_mi_fitness_health.models import DailyActivity
+from astrbot_plugin_mi_fitness_health.models import DailyActivity, HeartRateSample
 from astrbot_plugin_mi_fitness_health.storage import Database
 
 
@@ -23,3 +23,20 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(database.upsert_activity("user", record), "added")
             self.assertEqual(database.upsert_activity("user", record), "updated")
             self.assertEqual(database.today_activity("user", "2026-07-22")["steps"], 1000)
+
+    def test_batch_write_and_private_reminder_state(self) -> None:
+        """Large sample types use one API while private care state stays isolated."""
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            now = datetime.now(UTC)
+            result = database.upsert_many("user", "heart_rate", [
+                HeartRateSample("a", now, 70, "passive", False),
+                HeartRateSample("b", now, 72, "passive", False),
+            ])
+            self.assertEqual(result, {"added": 2, "updated": 0})
+            self.assertEqual(database.upsert_many("user", "heart_rate", [HeartRateSample("a", now, 71, "passive", False)]), {"added": 0, "updated": 1})
+            database.save_private_owner_session("owner", "qq:FriendMessage:123")
+            self.assertEqual(database.private_owner_session("owner"), "qq:FriendMessage:123")
+            self.assertTrue(database.claim_care_delivery("sleep", "2026-07-22"))
+            self.assertFalse(database.claim_care_delivery("sleep", "2026-07-22"))
