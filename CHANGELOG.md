@@ -2,6 +2,13 @@
 
 本项目遵循语义化版本。小米运动健康云数据来自手机端已经上传的历史记录；所有版本均不提供蓝牙实时监护，也不构成医疗诊断。
 
+## [v0.5.2] - 2026-07-22
+
+### 修复
+
+- 将活动、心率、体重、血氧、压力、心率记录、主动提示与“最近同步完成时间”统一按 `user_timezone` 显示，不再直接向用户展示数据库中的 UTC `+00:00` 原始值。
+- 明确区分“数据采集时间”和“最近同步完成时间”，避免把小米云记录的采样时刻误认为插件执行同步的时刻。
+
 ## [v0.5.1] - 2026-07-22
 
 ### 修复
@@ -59,5 +66,6 @@
 - AstrBot 的 QQ 官方 API 适配器不支持当前主动发送方式；AIOCQHTTP/NapCat 等通常支持。普通私聊中的健康查询不受此限制。
 - 不同小米账号、区域与设备可能暴露不同的云端 key；缺失或未知字段不会被伪造。
 
+[v0.5.2]: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/releases/tag/v0.5.2
 [v0.5.1]: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/releases/tag/v0.5.1
 [v0.5.0]: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/releases/tag/v0.5.0

@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from ..storage import Database
+from ..utils import local_timestamp
 
 
 class QueryService:
@@ -76,6 +77,10 @@ class QueryService:
         """Return latest synchronization marker."""
         return await asyncio.to_thread(self.database.latest_sync_at)
 
+    def display_timestamp(self, value: object) -> str:
+        """Format one stored timestamp in the configured user timezone."""
+        return local_timestamp(value, self.timezone)
+
     async def care_snapshot(self, focus: str = "") -> str:
         """Return only health categories relevant to an owner conversation."""
         compact = focus.lower().replace(" ", "")
@@ -133,11 +138,11 @@ class QueryService:
         if requested["heart"] and rates:
             values = [row["bpm"] for row in rates]
             parts.append(
-                f"最近 48 小时心率：最新 {rates[0]['bpm']} bpm（采集 {rates[0]['timestamp']}），平均 {sum(values) / len(values):.0f}，最高 {max(values)}，最低 {min(values)}"
+                f"最近 48 小时心率：最新 {rates[0]['bpm']} bpm（数据采集时间 {self.display_timestamp(rates[0]['timestamp'])}），平均 {sum(values) / len(values):.0f}，最高 {max(values)}，最低 {min(values)}"
             )
         if requested["body"] and measurement:
             parts.append(
-                f"最近体重：{measurement['weight_kg']} kg（采集 {measurement['timestamp']}）"
+                f"最近体重：{measurement['weight_kg']} kg（数据采集时间 {self.display_timestamp(measurement['timestamp'])}）"
             )
         if requested["sleep"] and sleeps:
             values = []
@@ -155,9 +160,11 @@ class QueryService:
                 "睡眠：本地缓存暂无已同步记录；这不代表设备不支持或手机端无法同步"
             )
         if requested["spo2"] and spo2:
-            parts.append(f"最近血氧：{spo2['percent']}%（采集 {spo2['timestamp']}）")
+            parts.append(
+                f"最近血氧：{spo2['percent']}%（数据采集时间 {self.display_timestamp(spo2['timestamp'])}）"
+            )
         if requested["stress"] and stress:
             parts.append(
-                f"最近压力分数：{stress['score']}（采集 {stress['timestamp']}）"
+                f"最近压力分数：{stress['score']}（数据采集时间 {self.display_timestamp(stress['timestamp'])}）"
             )
         return "；".join(parts) or "暂无所查询项目的已同步云端数据"

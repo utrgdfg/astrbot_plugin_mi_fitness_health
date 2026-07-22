@@ -81,6 +81,7 @@ class MiFitnessHealthPlugin(Star):
             int(config.get("stress_high") or 0),
             int(config.get("sleep_min_minutes") or 0),
             int(config.get("alert_data_max_age_minutes") or 180),
+            self.query_service.timezone,
         )
         self.auto_sync_enabled = bool(config.get("enable_auto_sync", True))
         self.health_alerts_enabled = bool(config.get("enable_health_alerts", True))
@@ -386,7 +387,7 @@ class MiFitnessHealthPlugin(Star):
         snapshot = await self.query_service.care_snapshot(focus)
         last_sync = await self.query_service.latest_sync_at()
         return (
-            f"查询重点：{focus}\n{snapshot}\n最近本地同步：{last_sync or '暂无'}\n"
+            f"查询重点：{focus}\n{snapshot}\n最近同步完成时间：{self.query_service.display_timestamp(last_sync) if last_sync else '暂无'}\n"
             "以上为小米健康云已上传的历史数据，并非实时监护；请直接回答用户的问题，不作医疗诊断。"
             "某项目暂无记录不代表设备不支持，也不要声称手机端无法同步。"
         )
@@ -409,7 +410,7 @@ class MiFitnessHealthPlugin(Star):
         text = (
             "<private_health_context>\n"
             + snapshot
-            + f"\n最近本地同步：{last_sync or '暂无'}\n"
+            + f"\n最近同步完成时间：{self.query_service.display_timestamp(last_sync) if last_sync else '暂无'}\n"
             "These are delayed Xiaomi cloud records, not real-time monitoring. Answer the owner's health question directly in Chinese from these records; avoid diagnosis and do not claim medical certainty. Missing cached records do not prove that the device or phone app lacks support.\n</private_health_context>"
         )
         part = TextPart(text=text)
@@ -512,7 +513,7 @@ class MiFitnessHealthPlugin(Star):
             return
         activity, rates, measurement = await self.query_service.today_summary()
         yield event.plain_result(
-            today_text(activity, rates, measurement)
+            today_text(activity, rates, measurement, self.query_service.timezone)
             + "\n"
             + await self.query_service.care_snapshot()
         )
@@ -565,7 +566,7 @@ class MiFitnessHealthPlugin(Star):
             background_status = "开启" if self.auto_sync_enabled else "关闭"
         yield event.plain_result(
             f"健康状态\n连接：{'已连接' if self.adapter.is_connected() else '未连接/待验证'}\n"
-            f"区域：{self.adapter.region or '自动探测'}\n最近同步：{last_sync or '暂无'}\n"
+            f"区域：{self.adapter.region or '自动探测'}\n最近同步完成时间：{self.query_service.display_timestamp(last_sync) if last_sync else '暂无'}\n"
             f"平台实例校验：{'已启用' if self.owner_platform_instance_id else '未配置（健康功能禁用）'}\n"
             f"后台同步：{background_status}\n"
             f"主动健康检查：{'开启（每 ' + str(self.monitor_interval) + ' 分钟）' if self.proactive_monitor_enabled else '关闭'}\n"
@@ -590,7 +591,9 @@ class MiFitnessHealthPlugin(Star):
                 if row["is_workout"]
                 else ("主动" if row["sample_type"] == "active" else "被动")
             )
-            lines.append(f"{row['timestamp']}｜{row['bpm']} bpm｜{kind}")
+            lines.append(
+                f"{self.query_service.display_timestamp(row['timestamp'])}｜{row['bpm']} bpm｜{kind}"
+            )
         yield event.plain_result("\n".join(lines))
 
     @filter.command("身体数据")
@@ -599,7 +602,11 @@ class MiFitnessHealthPlugin(Star):
         async for result in self._guard(event):
             yield result
             return
-        yield event.plain_result(measurement_text(await self.query_service.body()))
+        yield event.plain_result(
+            measurement_text(
+                await self.query_service.body(), self.query_service.timezone
+            )
+        )
 
     @filter.command("健康趋势")
     async def health_trend(self, event: AstrMessageEvent, days: int = 7):

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 
 from ..storage import Database
+from ..utils import local_timestamp
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +34,7 @@ class AlertService:
         stress_high: int = 0,
         sleep_min_minutes: int = 0,
         data_max_age_minutes: int = 180,
+        display_timezone: tzinfo = UTC,
     ):
         """Create an evaluator; a zero threshold disables that metric."""
         self.database, self.user_id = database, user_id
@@ -44,6 +46,11 @@ class AlertService:
         self.consecutive = max(2, consecutive)
         self.cooldown_minutes = max(1, cooldown_minutes)
         self.data_max_age_minutes = max(15, min(data_max_age_minutes, 24 * 60))
+        self.display_timezone = display_timezone
+
+    def _display_timestamp(self, value: object) -> str:
+        """Show a finding's cloud timestamp in the owner's configured timezone."""
+        return local_timestamp(value, self.display_timezone)
 
     @staticmethod
     def _timestamp(value: object) -> datetime | None:
@@ -110,7 +117,7 @@ class AlertService:
                                 alert_type,
                                 event_key,
                                 f"最近连续 {matching} 条非运动被动心率记录{direction}你配置的 {threshold} bpm 阈值"
-                                f"（最新采集：{rows[0]['timestamp']}）。建议先休息并按需复测；这不是医疗诊断。",
+                                f"（最新数据采集时间：{self._display_timestamp(rows[0]['timestamp'])}）。建议先休息并按需复测；这不是医疗诊断。",
                             )
                         )
                     break
@@ -151,7 +158,7 @@ class AlertService:
                             alert_type,
                             event_key,
                             f"最近连续 {matching} 条{label}记录{direction}你配置的 {threshold}{suffix} 阈值"
-                            f"（最新采集：{rows[0]['timestamp']}）。建议结合当时状态复测；这不是医疗诊断。",
+                            f"（最新数据采集时间：{self._display_timestamp(rows[0]['timestamp'])}）。建议结合当时状态复测；这不是医疗诊断。",
                         )
                     )
                 break
@@ -174,7 +181,7 @@ class AlertService:
                 alert_type,
                 event_key,
                 f"最近一段睡眠记录为 {sleep['asleep_minutes']} 分钟，低于你配置的 {self.sleep_min_minutes} 分钟阈值"
-                f"（结束：{sleep['end_at']}）。今天如果方便，可以给自己留些恢复时间；这不是医疗诊断。",
+                f"（结束时间：{self._display_timestamp(sleep['end_at'])}）。今天如果方便，可以给自己留些恢复时间；这不是医疗诊断。",
             )
         )
 
