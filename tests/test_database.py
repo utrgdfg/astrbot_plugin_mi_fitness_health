@@ -24,8 +24,8 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(database.upsert_activity("user", record), "updated")
             self.assertEqual(database.today_activity("user", "2026-07-22")["steps"], 1000)
 
-    def test_batch_write_and_private_reminder_state(self) -> None:
-        """Large sample types use one API while private care state stays isolated."""
+    def test_batch_write(self) -> None:
+        """Large sample types use one transaction-oriented API."""
         with tempfile.TemporaryDirectory() as directory:
             database = Database(Path(directory) / "health.sqlite3")
             database.initialize()
@@ -36,7 +36,3 @@ class DatabaseTest(unittest.TestCase):
             ])
             self.assertEqual(result, {"added": 2, "updated": 0})
             self.assertEqual(database.upsert_many("user", "heart_rate", [HeartRateSample("a", now, 71, "passive", False)]), {"added": 0, "updated": 1})
-            database.save_private_owner_session("owner", "qq:FriendMessage:123")
-            self.assertEqual(database.private_owner_session("owner"), "qq:FriendMessage:123")
-            self.assertTrue(database.claim_care_delivery("sleep", "2026-07-22"))
-            self.assertFalse(database.claim_care_delivery("sleep", "2026-07-22"))

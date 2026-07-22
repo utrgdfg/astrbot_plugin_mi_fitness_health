@@ -321,22 +321,3 @@ class Database:
                 "SELECT created_at FROM alerts WHERE alert_type=? ORDER BY id DESC LIMIT 1", (alert_type,)
             ).fetchone()
         return row["created_at"] if row else None
-
-    def save_private_owner_session(self, owner_platform_id: str, session: str) -> None:
-        """Remember an owner-approved private session; group sessions are never saved."""
-        with self._connect() as connection:
-            connection.execute("""INSERT INTO private_owner_sessions(owner_platform_id,session,updated_at) VALUES(?,?,?)
-                ON CONFLICT(owner_platform_id) DO UPDATE SET session=excluded.session,updated_at=excluded.updated_at""",
-                (owner_platform_id, session, self._now()))
-
-    def private_owner_session(self, owner_platform_id: str) -> str | None:
-        """Return the most recently observed private chat for the owner."""
-        with self._connect() as connection:
-            row = connection.execute("SELECT session FROM private_owner_sessions WHERE owner_platform_id=?", (owner_platform_id,)).fetchone()
-        return row["session"] if row else None
-
-    def claim_care_delivery(self, reminder_type: str, local_date: str) -> bool:
-        """Atomically reserve at most one scheduled reminder per local day."""
-        with self._connect() as connection:
-            cursor = connection.execute("INSERT OR IGNORE INTO care_deliveries(reminder_type,local_date,created_at) VALUES(?,?,?)", (reminder_type, local_date, self._now()))
-        return cursor.rowcount == 1

@@ -6,7 +6,7 @@ import asyncio
 import logging
 import os
 from contextlib import suppress
-from datetime import time, timedelta
+from datetime import timedelta
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -16,7 +16,6 @@ from astrbot.api.platform import MessageType
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.message import TextPart
-from astrbot.core.message.message_event_result import MessageChain
 
 from .adapters import MiFitnessCloudAdapter
 from .services import AlertService, QueryService, SyncService
@@ -56,13 +55,10 @@ class MiFitnessHealthPlugin(Star):
         self.auto_sync_enabled = bool(config.get("enable_auto_sync", True))
         self.health_alerts_enabled = bool(config.get("enable_health_alerts", False))
         self.care_dialogue_enabled = bool(config.get("enable_care_dialogue", True))
-        self.proactive_sleep_reminder_enabled = bool(config.get("enable_proactive_sleep_reminder", True))
         self.natural_query_sync_minutes = max(1, min(int(config.get("natural_query_sync_minutes") or 15), 120))
-        self.sleep_reminder_time = self._parse_reminder_time(str(config.get("sleep_reminder_time") or "23:00"))
         self.sync_days = max(1, min(int(config.get("default_sync_days") or 7), 90))
         self.sync_interval = max(5, int(config.get("sync_interval_minutes") or 60))
         self._auto_task: asyncio.Task[None] | None = None
-        self._care_task: asyncio.Task[None] | None = None
         self._auto_sync_paused = False
 
     async def initialize(self) -> None:
@@ -70,8 +66,6 @@ class MiFitnessHealthPlugin(Star):
         await self.sync_service.initialize()
         if self.auto_sync_enabled and self.user_id and self.pass_token and not self._auto_task:
             self._auto_task = asyncio.create_task(self._auto_sync_loop(), name=f"{self.name}-auto-sync")
-        if self.proactive_sleep_reminder_enabled and self.owner_platform_id and not self._care_task:
-            self._care_task = asyncio.create_task(self._care_reminder_loop(), name=f"{self.name}-care-reminder")
 
     async def terminate(self) -> None:
         """Cancel the periodic task and close plugin-owned HTTP resources."""
@@ -80,11 +74,6 @@ class MiFitnessHealthPlugin(Star):
             with suppress(asyncio.CancelledError):
                 await self._auto_task
             self._auto_task = None
-        if self._care_task:
-            self._care_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._care_task
-            self._care_task = None
         await self.adapter.close()
 
     async def _auto_sync_loop(self) -> None:
@@ -107,64 +96,16 @@ class MiFitnessHealthPlugin(Star):
         if self.health_alerts_enabled:
             alerts = await self.alert_service.evaluate()
             if alerts:
-                logger.warning("Mi Fitness created %d private health reminder(s)", len(alerts))
-                for message in alerts:
-                    await self._send_private_message(message)
+                logger.warning("Mi Fitness persisted %d configured health alert(s)", len(alerts))
         return summary
-
-    @staticmethod
-    def _parse_reminder_time(value: str) -> time:
-        """Parse a local HH:MM configuration without failing plugin startup."""
-        try:
-            hour, minute = (int(item) for item in value.strip().split(":", 1))
-            return time(hour, minute)
-        except (TypeError, ValueError):
-            logger.warning("Invalid sleep_reminder_time; using 23:00")
-            return time(23, 0)
-
-    async def _send_private_message(self, text: str) -> bool:
-        """Send owner-only care text only to a previously observed private chat."""
-        session = await asyncio.to_thread(self.database.private_owner_session, self.owner_platform_id)
-        if not session:
-            return False
-        try:
-            return await self.context.send_message(session, MessageChain().message(text))
-        except Exception as error:
-            logger.warning("Mi Fitness private reminder was not delivered: %s", redact_error(error))
-            return False
-
-    async def _care_reminder_loop(self) -> None:
-        """Issue one optional, private sleep reminder after the configured time."""
-        while True:
-            try:
-                now = datetime.now(self.query_service.timezone)
-                if now.time() >= self.sleep_reminder_time:
-                    session = await asyncio.to_thread(self.database.private_owner_session, self.owner_platform_id)
-                    if session and await asyncio.to_thread(self.database.claim_care_delivery, "sleep", now.date().isoformat()):
-                        snapshot = await self.query_service.care_snapshot()
-                        await self._send_private_message(
-                            "睡前小提醒：已经比较晚了，方便的话可以开始准备休息。"
-                            "小米云端记录有上传延迟，下面仅作生活关怀，不是医疗建议。\n" + snapshot
-                        )
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                logger.warning("Mi Fitness care reminder check failed: %s", redact_error(error))
-            await asyncio.sleep(60)
 
     def _authorized(self, event: AstrMessageEvent) -> bool:
         """Return whether the sender matches the one configured data owner."""
         return bool(self.owner_platform_id) and str(event.get_sender_id()) == self.owner_platform_id
 
     def _is_private_owner_event(self, event: AstrMessageEvent) -> bool:
-        """Health reminders may only target the owner's one-to-one conversation."""
+        """Conversational health data is available only in the owner's private chat."""
         return self._authorized(event) and event.session.message_type == MessageType.FRIEND_MESSAGE
-
-    @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
-    async def remember_private_owner_session(self, event: AstrMessageEvent):
-        """Learn a delivery target only from an incoming private owner message."""
-        if self._is_private_owner_event(event):
-            await asyncio.to_thread(self.database.save_private_owner_session, self.owner_platform_id, event.unified_msg_origin)
 
     @staticmethod
     def _is_health_question(text: str) -> bool:
@@ -207,20 +148,41 @@ class MiFitnessHealthPlugin(Star):
             logger.warning("Mi Fitness natural-query refresh failed: %s", redact_error(error))
             return False
 
+    @filter.llm_tool(name="query_mi_fitness_health")
+    async def query_mi_fitness_health(self, event: AstrMessageEvent, focus: str = "综合概况") -> str:
+        """在自然对话中读取当前用户的小米运动健康云数据。
+
+        当用户询问自己的睡眠、步数、运动消耗、心率、体重、体脂、血氧、压力或身体状态时调用。
+        数据来自小米健康云，可能延迟，不是实时监护；不要据此作医疗诊断。
+
+        Args:
+            focus(string): 用户希望了解的项目或时间范围，例如“昨天睡眠”“今日步数”“最近心率”。
+        """
+        if not self.care_dialogue_enabled or not self._is_private_owner_event(event):
+            return "此工具仅允许已配置的数据所有者在私聊中使用。"
+        await self._refresh_for_natural_question(focus)
+        snapshot = await self.query_service.care_snapshot()
+        last_sync = await self.query_service.latest_sync_at()
+        return (
+            f"查询重点：{focus}\n{snapshot}\n最近本地同步：{last_sync or '暂无'}\n"
+            "以上为小米健康云已上传的历史数据，并非实时监护；请直接回答用户的问题，不作医疗诊断。"
+        )
+
     @filter.on_llm_request()
     async def add_owner_health_context(self, event: AstrMessageEvent, req: ProviderRequest):
-        """Let only the data owner receive gentle, non-diagnostic health-aware dialogue."""
+        """Provide a fallback context when a clear health question reaches the LLM."""
         # LLM context can influence free-form replies, so it is stricter than
         # command authorization and never carries health data into a group.
         if not self.care_dialogue_enabled or not self._is_private_owner_event(event):
             return
         question = event.get_message_str()
-        if self._is_health_question(question):
-            await self._refresh_for_natural_question(question)
+        if not self._is_health_question(question):
+            return
+        await self._refresh_for_natural_question(question)
         snapshot = await self.query_service.care_snapshot()
         last_sync = await self.query_service.latest_sync_at()
         text = ("<private_health_context>\n" + snapshot + f"\n最近本地同步：{last_sync or '暂无'}\n"
-                "These are delayed Xiaomi cloud records, not real-time monitoring. If the owner asks about sleep, heart rate, activity, body data, SpO2, or stress, answer directly from these records in Chinese. Otherwise mention them only when genuinely relevant; be caring, avoid diagnosis and do not claim medical certainty.\n</private_health_context>")
+                "These are delayed Xiaomi cloud records, not real-time monitoring. Answer the owner's health question directly in Chinese from these records; avoid diagnosis and do not claim medical certainty.\n</private_health_context>")
         part = TextPart(text=text)
         req.extra_user_content_parts.append(part.mark_as_temp() if hasattr(part, "mark_as_temp") else part)
 
@@ -318,8 +280,7 @@ class MiFitnessHealthPlugin(Star):
             f"健康状态\n连接：{'已连接' if self.adapter.is_connected() else '未连接/待验证'}\n"
             f"区域：{self.adapter.region or '自动探测'}\n最近同步：{last_sync or '暂无'}\n"
             f"自动同步：{'已暂停（请重新授权后重载）' if self._auto_sync_paused else ('开启' if self.auto_sync_enabled else '关闭')}\n"
-            f"自然语言查询刷新：{self.natural_query_sync_minutes} 分钟\n"
-            f"私聊睡前关怀：{'开启（' + self.sleep_reminder_time.strftime('%H:%M') + '）' if self.proactive_sleep_reminder_enabled else '关闭'}"
+            f"自然语言查询刷新：{self.natural_query_sync_minutes} 分钟"
         )
 
     @filter.command("心率记录")
