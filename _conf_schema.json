@@ -34,7 +34,7 @@
   "enable_health_alerts": {"type": "bool", "description": "启用用户阈值健康提示", "hint": "只评估你配置的连续阈值，默认阈值为 0 时对应指标不提示；不作医疗诊断。", "default": true},
   "enable_care_dialogue": {"type": "bool", "description": "允许在普通对话中调用健康数据", "hint": "仅对 owner_platform_id 的私聊生效；模型可调用插件工具读取数据，不作医疗诊断。", "default": true},
   "natural_query_sync_minutes": {"type": "int", "description": "自然语言查询的最短刷新间隔（分钟）", "hint": "例如直接问“我昨天睡得怎么样”时，缓存超过这个时间会自动向小米云刷新；小米手机端仍需先完成云同步。", "default": 15},
-  "enable_proactive_health_monitor": {"type": "bool", "description": "启用主动健康检查", "hint": "后台按间隔刷新云端并检查；只有出现有依据的情况且不在冷却期才向所有者私聊。", "default": true},
+  "enable_proactive_health_monitor": {"type": "bool", "description": "启用主动健康检查", "hint": "后台按间隔刷新小米云并先判断是否满足提醒条件；命中后由当前 Bot 的聊天模型按其人格写一条简短关心。模型或人格不可用时不会退化为模板消息。", "default": true},
   "health_check_interval_minutes": {"type": "int", "description": "主动健康检查间隔（分钟）", "hint": "默认每 30 分钟。过短会增加小米云请求量，最小按 5 分钟处理。", "default": 30},
   "proactive_daily_limit": {"type": "int", "description": "每天主动消息上限", "hint": "不同异常会合并为一条消息；达到上限后当天不再主动发送。", "default": 3},
   "enable_late_night_activity_check": {"type": "bool", "description": "检查深夜仍有私聊活动", "hint": "只依据所有者最近的私聊活动提示，不会把“云端没有睡眠记录”误判为没睡。", "default": true},

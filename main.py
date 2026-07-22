@@ -193,6 +193,98 @@ class MiFitnessHealthPlugin(Star):
             )
             return False
 
+    async def _owner_persona_prompt(self, session: str) -> str:
+        """Load the configured persona for the owner private conversation.
+
+        A proactive health finding is not a command response.  Resolving the
+        same persona as the owner chat lets the model phrase it in the bot's
+        established voice without exposing or persisting conversation content.
+        """
+        try:
+            conversation_id = await self.context.conversation_manager.get_curr_conversation_id(
+                session
+            )
+            if conversation_id:
+                conversation = await self.context.conversation_manager.get_conversation(
+                    session, conversation_id
+                )
+                persona_id = getattr(conversation, "persona_id", None)
+                if persona_id:
+                    persona = await self.context.persona_manager.get_persona(persona_id)
+                    if persona and getattr(persona, "system_prompt", ""):
+                        return str(persona.system_prompt)
+            default_persona = await self.context.persona_manager.get_default_persona_v3(
+                umo=session
+            )
+            if default_persona:
+                return str(default_persona.get("prompt") or "")
+        except Exception as error:
+            logger.warning(
+                "Mi Fitness could not resolve the owner persona: %s",
+                redact_error(error),
+            )
+        return ""
+
+    @staticmethod
+    def _clean_proactive_reply(value: object) -> str | None:
+        """Keep an LLM notification short and suitable for one chat bubble."""
+        if not isinstance(value, str):
+            return None
+        text = " ".join(value.strip().strip("`").split())
+        if len(text) < 2:
+            return None
+        # A reminder should feel like a small check-in, never a generated
+        # report.  The source facts remain available in the local audit log.
+        return text[:180].rstrip("，、；：")
+
+    async def _compose_proactive_reply(
+        self, session: str, facts: list[str]
+    ) -> str | None:
+        """Ask the current chat model to turn verified findings into a check-in.
+
+        The rule services decide *whether* a message is warranted.  The LLM is
+        deliberately used only after that decision, and only to write in the
+        current bot persona.  If no model reply can be obtained, sending is
+        skipped rather than falling back to a long fixed template.
+        """
+        if not facts:
+            return None
+        persona_prompt = await self._owner_persona_prompt(session)
+        if not persona_prompt:
+            logger.warning("Mi Fitness skipped proactive reply: owner persona unavailable")
+            return None
+        prompt = (
+            "已由健康插件完成后台读取和规则判断；下面是已核实的提醒事实：\n"
+            + "\n".join(f"- {fact}" for fact in facts)
+            + "\n\n请以当前机器人的人格，给这位用户写一条自然、温和的私聊关心。"
+            "只写最终要发送的话，1–2 句、180 字以内。可以提到必要的数字或时间，"
+            "但不要复述技术过程、不要说‘我刚检查/后台/云端/命令/实时监护’，"
+            "不要使用标题、列表、免责声明或医疗诊断，也不要编造未提供的症状或数据。"
+        )
+        try:
+            provider_id = await self.context.get_current_chat_provider_id(session)
+            response = await asyncio.wait_for(
+                self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=prompt,
+                    system_prompt=(
+                        persona_prompt
+                        + "\n\n你正在发送一条主动健康关心。必须只依据用户已确认的事实，"
+                        "语气自然简短，不作诊断。"
+                    ),
+                ),
+                timeout=25,
+            )
+            return self._clean_proactive_reply(
+                getattr(response, "completion_text", None)
+            )
+        except Exception as error:
+            logger.warning(
+                "Mi Fitness proactive wording generation failed; no message sent: %s",
+                redact_error(error),
+            )
+            return None
+
     async def _health_monitor_loop(self) -> None:
         """Refresh and evaluate private findings at the configured bounded interval."""
         failures = 0
@@ -218,9 +310,10 @@ class MiFitnessHealthPlugin(Star):
                 if late_finding:
                     messages.append(late_finding.message)
                 if messages and not await self.monitor_service.proactive_cooling_down():
-                    body = "我刚检查了一次你的近期状态：\n- " + "\n- ".join(messages)
-                    body += "\n小米健康云数据可能延迟，不是实时监护；如果有明显不适，请及时联系医疗专业人员。"
-                    sent = await self._send_private_message(body)
+                    body = await self._compose_proactive_reply(
+                        state["session"], messages
+                    )
+                    sent = bool(body) and await self._send_private_message(body)
                     if sent:
                         for finding in health_findings:
                             await self.alert_service.mark_sent(finding)

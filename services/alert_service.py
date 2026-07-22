@@ -116,8 +116,8 @@ class AlertService:
                             AlertFinding(
                                 alert_type,
                                 event_key,
-                                f"最近连续 {matching} 条非运动被动心率记录{direction}你配置的 {threshold} bpm 阈值"
-                                f"（最新数据采集时间：{self._display_timestamp(rows[0]['timestamp'])}）。建议先休息并按需复测；这不是医疗诊断。",
+                                f"连续 {matching} 条非运动被动心率{direction}{threshold} bpm；"
+                                f"最新采集时间为 {self._display_timestamp(rows[0]['timestamp'])}",
                             )
                         )
                     break
@@ -157,8 +157,8 @@ class AlertService:
                         AlertFinding(
                             alert_type,
                             event_key,
-                            f"最近连续 {matching} 条{label}记录{direction}你配置的 {threshold}{suffix} 阈值"
-                            f"（最新数据采集时间：{self._display_timestamp(rows[0]['timestamp'])}）。建议结合当时状态复测；这不是医疗诊断。",
+                            f"连续 {matching} 条{label}{direction}{threshold}{suffix}；"
+                            f"最新采集时间为 {self._display_timestamp(rows[0]['timestamp'])}",
                         )
                     )
                 break
@@ -180,8 +180,8 @@ class AlertService:
             AlertFinding(
                 alert_type,
                 event_key,
-                f"最近一段睡眠记录为 {sleep['asleep_minutes']} 分钟，低于你配置的 {self.sleep_min_minutes} 分钟阈值"
-                f"（结束时间：{self._display_timestamp(sleep['end_at'])}）。今天如果方便，可以给自己留些恢复时间；这不是医疗诊断。",
+                f"最近一段睡眠为 {sleep['asleep_minutes']} 分钟，低于设置的 {self.sleep_min_minutes} 分钟；"
+                f"结束时间为 {self._display_timestamp(sleep['end_at'])}",
             )
         )
 
