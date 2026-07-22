@@ -36,3 +36,20 @@ class AdapterAndAlertTest(unittest.TestCase):
                 database.upsert_heart_rate("user", HeartRateSample(f"hr{index}", now + timedelta(minutes=index), 150, "passive", workout))
             alerts = asyncio.run(AlertService(database, "user", 120, 0, 2, 10).evaluate())
             self.assertEqual(alerts, [])
+
+    def test_resting_heart_rate_fallback_is_queryable(self) -> None:
+        """Resting-heart-rate data remains available when the sampled key is empty."""
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region):
+                if key == "resting_heart_rate":
+                    return [{"time": 1784692800000, "zone_offset": 28800, "value": '{"heart_rate":68}'}]
+                return []
+
+        async def collect():
+            adapter = FixtureAdapter("user", "token", "cn")
+            return [record async for record in adapter.iter_heart_rate(datetime.now(UTC), datetime.now(UTC))]
+
+        records = asyncio.run(collect())
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].bpm, 68)
+        self.assertEqual(records[0].sample_type, "passive")

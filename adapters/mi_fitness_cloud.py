@@ -227,9 +227,18 @@ class MiFitnessCloudAdapter(DataAdapter):
         """Discover only supported datasets, using a recent bounded probe."""
         now = datetime.now(UTC)
         types: list[str] = []
-        for data_type, key in (("daily_activity", "steps"), ("heart_rate", "heart_rate"), ("body_measurements", "weight")):
+        for data_type, keys in (
+            ("daily_activity", ("steps",)),
+            ("heart_rate", ("heart_rate", "resting_heart_rate")),
+            ("body_measurements", ("weight",)),
+        ):
             try:
-                if await self._fetch_key(key, now - timedelta(days=30), now, self.region):
+                found = False
+                for key in keys:
+                    if await self._fetch_key(key, now - timedelta(days=30), now, self.region):
+                        found = True
+                        break
+                if found:
                     types.append(data_type)
             except RuntimeError:
                 continue
@@ -266,6 +275,8 @@ class MiFitnessCloudAdapter(DataAdapter):
             offset = int(item.get("zone_offset", 0))
         except (TypeError, ValueError):
             return None
+        if timestamp > 100_000_000_000:  # Some cloud records use milliseconds.
+            timestamp //= 1000
         if timestamp <= 0 or abs(offset) > 15 * 3600:
             return None
         utc_time = datetime.fromtimestamp(timestamp, UTC)
@@ -298,19 +309,41 @@ class MiFitnessCloudAdapter(DataAdapter):
             yield DailyActivity(date, int(values["steps"]), values["distance_m"], values["active_kcal"], latest[date])
 
     async def iter_heart_rate(self, start: datetime, end: datetime) -> AsyncIterator[HeartRateSample]:
-        """Yield valid heart-rate samples, preserving active/passive classification."""
-        for item in await self._fetch_key("heart_rate", start, end, self.region):
+        """Yield standard and resting heart-rate records with tolerant field parsing.
+
+        Xiaomi accounts do not all expose sampled heart rates under the same key.
+        The upstream Mi Fitness MCP Chinese implementation also queries
+        ``resting_heart_rate``; it is a fallback source, not fabricated data.
+        """
+        standard = await self._fetch_key("heart_rate", start, end, self.region)
+        resting = await self._fetch_key("resting_heart_rate", start, end, self.region)
+        seen: set[tuple[int, int]] = set()
+        for item, is_resting in [(record, False) for record in standard] + [(record, True) for record in resting]:
             record_time = self._record_time(item)
             if not record_time:
                 continue
             timestamp, _ = record_time
             value = self._value(item)
-            bpm = self._number(value.get("bpm"), 20, 260)
+            bpm = self._number(
+                value.get("bpm")
+                or value.get("heart_rate")
+                or value.get("heartRate")
+                or value.get("hr")
+                or value.get("rate")
+                or value.get("value"),
+                20,
+                260,
+            )
             if bpm is None:
                 continue
-            kind = "passive" if str(value.get("type", "0")) == "0" else "active"
+            identity = (int(timestamp.timestamp()), int(bpm))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            kind = "passive" if is_resting or str(value.get("type", "0")) == "0" else "active"
             is_workout = bool(value.get("workout_id") or value.get("is_workout"))
-            yield HeartRateSample(f"mi_fitness_hr_{int(timestamp.timestamp())}", timestamp, int(bpm), kind, is_workout)
+            source = "resting_hr" if is_resting else "hr"
+            yield HeartRateSample(f"mi_fitness_{source}_{int(timestamp.timestamp())}_{int(bpm)}", timestamp, int(bpm), kind, is_workout)
 
     async def iter_body_measurements(self, start: datetime, end: datetime) -> AsyncIterator[BodyMeasurement]:
         """Yield validated smart-scale records while tolerating missing composition fields."""
