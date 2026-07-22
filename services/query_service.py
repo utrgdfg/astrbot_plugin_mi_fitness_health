@@ -58,3 +58,16 @@ class QueryService:
     async def latest_sync_at(self) -> str | None:
         """Return latest synchronization marker."""
         return await asyncio.to_thread(self.database.latest_sync_at)
+
+    async def care_snapshot(self) -> str:
+        """Return a minimal cached summary suitable for one owner-only LLM turn."""
+        sleep, spo2, stress = await asyncio.gather(
+            asyncio.to_thread(self.database.latest_sleep, self.user_id),
+            asyncio.to_thread(self.database.latest_metric, "spo2_samples", self.user_id),
+            asyncio.to_thread(self.database.latest_metric, "stress_samples", self.user_id),
+        )
+        parts = []
+        if sleep: parts.append(f"最近睡眠：{sleep['asleep_minutes']} 分钟（结束 {sleep['end_at']}，评分 {sleep['score'] if sleep['score'] is not None else '未提供'}）")
+        if spo2: parts.append(f"最近血氧：{spo2['percent']}%（采集 {spo2['timestamp']}）")
+        if stress: parts.append(f"最近压力分数：{stress['score']}（采集 {stress['timestamp']}）")
+        return "；".join(parts) or "暂无睡眠、血氧或压力的已同步云端数据"

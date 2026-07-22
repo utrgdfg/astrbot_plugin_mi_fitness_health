@@ -30,6 +30,7 @@
   "owner_platform_id": {"type": "string", "description": "健康数据所有者平台 ID", "hint": "只有此 ID 可执行健康查询与数据管理。", "default": ""},
   "enable_auto_sync": {"type": "bool", "description": "启用自动同步", "default": true},
   "enable_health_alerts": {"type": "bool", "description": "启用非医疗健康提醒", "default": false},
+  "enable_care_dialogue": {"type": "bool", "description": "在所有者正常对话中提供健康关怀上下文", "hint": "仅对 owner_platform_id 生效；模型只在话题相关时引用，不作医疗诊断。", "default": true},
   "heart_rate_high": {"type": "int", "description": "个人高心率提醒阈值", "default": 0},
   "heart_rate_low": {"type": "int", "description": "个人低心率提醒阈值", "default": 0},
   "alert_consecutive_count": {"type": "int", "description": "连续样本数", "default": 3},

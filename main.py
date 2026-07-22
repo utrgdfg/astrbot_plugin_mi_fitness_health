@@ -12,6 +12,8 @@ from pathlib import Path
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
+from astrbot.api.provider import ProviderRequest
+from astrbot.core.agent.message import TextPart
 
 from .adapters import MiFitnessCloudAdapter
 from .services import AlertService, QueryService, SyncService
@@ -50,6 +52,7 @@ class MiFitnessHealthPlugin(Star):
         )
         self.auto_sync_enabled = bool(config.get("enable_auto_sync", True))
         self.health_alerts_enabled = bool(config.get("enable_health_alerts", False))
+        self.care_dialogue_enabled = bool(config.get("enable_care_dialogue", True))
         self.sync_days = max(1, min(int(config.get("default_sync_days") or 7), 90))
         self.sync_interval = max(5, int(config.get("sync_interval_minutes") or 60))
         self._auto_task: asyncio.Task[None] | None = None
@@ -96,6 +99,17 @@ class MiFitnessHealthPlugin(Star):
     def _authorized(self, event: AstrMessageEvent) -> bool:
         """Return whether the sender matches the one configured data owner."""
         return bool(self.owner_platform_id) and str(event.get_sender_id()) == self.owner_platform_id
+
+    @filter.on_llm_request()
+    async def add_owner_health_context(self, event: AstrMessageEvent, req: ProviderRequest):
+        """Let only the data owner receive gentle, non-diagnostic health-aware dialogue."""
+        if not self.care_dialogue_enabled or not self._authorized(event):
+            return
+        snapshot = await self.query_service.care_snapshot()
+        text = ("<private_health_context>\n" + snapshot + "\n"
+                "These are delayed Xiaomi cloud records, not real-time monitoring. Only mention them when relevant to the owner's message; be caring, avoid diagnosis and do not claim medical certainty.\n</private_health_context>")
+        part = TextPart(text=text)
+        req.extra_user_content_parts.append(part.mark_as_temp() if hasattr(part, "mark_as_temp") else part)
 
     async def _guard(self, event: AstrMessageEvent):
         """Yield a refusal if the request does not belong to the configured owner."""

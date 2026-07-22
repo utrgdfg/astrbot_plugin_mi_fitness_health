@@ -17,7 +17,7 @@ from urllib.parse import urlencode
 import httpx
 
 from .base import DataAdapter
-from ..models import BodyMeasurement, DailyActivity, HeartRateSample
+from ..models import BodyMeasurement, DailyActivity, HeartRateSample, SleepSession, SpO2Sample, StressSample
 from ..utils.privacy import redact_error
 
 logger = logging.getLogger(__name__)
@@ -367,6 +367,44 @@ class MiFitnessCloudAdapter(DataAdapter):
                 optional("bone_mass", 0, 30), int(visceral) if visceral is not None else None,
                 int(metabolism) if metabolism is not None else None, int(age) if age is not None else None,
             )
+
+    async def iter_sleep(self, start: datetime, end: datetime) -> AsyncIterator[SleepSession]:
+        """Yield validated cloud sleep sessions when the account exposes the sleep key."""
+        for item in await self._fetch_key("sleep", start, end, self.region):
+            value = self._value(item)
+            try:
+                begin = int(value.get("bedtime") or value.get("device_bedtime") or value.get("bed_timestamp"))
+                finish = int(value.get("wake_up_time") or value.get("device_wake_up_time") or value.get("out_bed_timestamp") or item.get("time"))
+            except (TypeError, ValueError):
+                continue
+            if begin > 100_000_000_000: begin //= 1000
+            if finish > 100_000_000_000: finish //= 1000
+            duration = max(0, (finish - begin) // 60)
+            if not 30 <= duration <= 24 * 60:
+                continue
+            awake = self._number(value.get("awake_duration") or value.get("sleep_awake_duration") or 0, 0, duration)
+            score = self._number(value.get("score") or value.get("sleep_score"), 0, 100)
+            yield SleepSession(f"mi_fitness_sleep_{begin}", datetime.fromtimestamp(begin, UTC), datetime.fromtimestamp(finish, UTC), duration, duration - int(awake or 0), int(awake or 0), int(score) if score is not None else None)
+
+    async def iter_spo2(self, start: datetime, end: datetime) -> AsyncIterator[SpO2Sample]:
+        """Yield validated blood-oxygen records; unsupported keys simply return no rows."""
+        for item in await self._fetch_key("spo2", start, end, self.region):
+            time = self._record_time(item)
+            value = self._value(item)
+            percent = self._number(value.get("spo2") or value.get("value"), 70, 100)
+            if time and percent is not None:
+                timestamp, _ = time
+                yield SpO2Sample(f"mi_fitness_spo2_{int(timestamp.timestamp())}", timestamp, int(percent))
+
+    async def iter_stress(self, start: datetime, end: datetime) -> AsyncIterator[StressSample]:
+        """Yield validated stress scores; no medical inference is made here."""
+        for item in await self._fetch_key("stress", start, end, self.region):
+            time = self._record_time(item)
+            value = self._value(item)
+            score = self._number(value.get("stress") or value.get("score") or value.get("value"), 0, 100)
+            if time and score is not None:
+                timestamp, _ = time
+                yield StressSample(f"mi_fitness_stress_{int(timestamp.timestamp())}", timestamp, int(score))
 
     async def close(self) -> None:
         """Close the plugin-owned async HTTP client."""

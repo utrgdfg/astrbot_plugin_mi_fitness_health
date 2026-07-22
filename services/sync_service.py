@@ -50,6 +50,9 @@ class SyncService:
                 ("daily_activity", self.adapter.iter_daily_activity(start, end), self.database.upsert_activity),
                 ("heart_rate", self.adapter.iter_heart_rate(start, end), self.database.upsert_heart_rate),
                 ("body_measurements", self.adapter.iter_body_measurements(start, end), self.database.upsert_measurement),
+                ("sleep", self.adapter.iter_sleep(start, end), self.database.upsert_sleep),
+                ("spo2", self.adapter.iter_spo2(start, end), self.database.upsert_spo2),
+                ("stress", self.adapter.iter_stress(start, end), self.database.upsert_stress),
             ):
                 latest: datetime | None = None
                 async for record in iterator:

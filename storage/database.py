@@ -8,9 +8,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ..models import BodyMeasurement, DailyActivity, HeartRateSample
+from ..models import BodyMeasurement, DailyActivity, HeartRateSample, SleepSession, SpO2Sample, StressSample
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class Database:
@@ -68,6 +68,14 @@ class Database:
                         ON body_measurements(user_id, timestamp);
                     """
                 )
+                connection.execute("UPDATE schema_version SET version = 1")
+                current = 1
+            if current < 2:
+                connection.executescript("""
+                CREATE TABLE IF NOT EXISTS sleep_sessions (user_id TEXT NOT NULL, record_id TEXT NOT NULL, start_at TEXT NOT NULL, end_at TEXT NOT NULL, duration_minutes INTEGER NOT NULL, asleep_minutes INTEGER NOT NULL, awake_minutes INTEGER NOT NULL, score INTEGER, updated_at TEXT NOT NULL, PRIMARY KEY(user_id,record_id));
+                CREATE TABLE IF NOT EXISTS spo2_samples (user_id TEXT NOT NULL, record_id TEXT NOT NULL, timestamp TEXT NOT NULL, percent INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(user_id,record_id));
+                CREATE TABLE IF NOT EXISTS stress_samples (user_id TEXT NOT NULL, record_id TEXT NOT NULL, timestamp TEXT NOT NULL, score INTEGER NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(user_id,record_id));
+                """)
                 connection.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
 
     @contextmanager
@@ -151,6 +159,27 @@ class Database:
                 (data_type, self._now(), last_record_at.isoformat() if last_record_at else None),
             )
 
+    def upsert_sleep(self, user_id: str, record: SleepSession) -> str:
+        """Insert or update a sleep session."""
+        with self._connect() as c:
+            old = c.execute("SELECT 1 FROM sleep_sessions WHERE user_id=? AND record_id=?", (user_id, record.record_id)).fetchone()
+            c.execute("INSERT INTO sleep_sessions VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(user_id,record_id) DO UPDATE SET start_at=excluded.start_at,end_at=excluded.end_at,duration_minutes=excluded.duration_minutes,asleep_minutes=excluded.asleep_minutes,awake_minutes=excluded.awake_minutes,score=excluded.score,updated_at=excluded.updated_at", (user_id,record.record_id,record.start_at.isoformat(),record.end_at.isoformat(),record.duration_minutes,record.asleep_minutes,record.awake_minutes,record.score,self._now()))
+        return "updated" if old else "added"
+
+    def upsert_spo2(self, user_id: str, record: SpO2Sample) -> str:
+        """Insert or update a blood-oxygen sample."""
+        return self._upsert_metric("spo2_samples", user_id, record.record_id, record.timestamp.isoformat(), record.percent, "percent")
+
+    def upsert_stress(self, user_id: str, record: StressSample) -> str:
+        """Insert or update a stress sample."""
+        return self._upsert_metric("stress_samples", user_id, record.record_id, record.timestamp.isoformat(), record.score, "score")
+
+    def _upsert_metric(self, table: str, user_id: str, record_id: str, timestamp: str, value: int, column: str) -> str:
+        with self._connect() as c:
+            old = c.execute(f"SELECT 1 FROM {table} WHERE user_id=? AND record_id=?", (user_id,record_id)).fetchone()
+            c.execute(f"INSERT INTO {table}(user_id,record_id,timestamp,{column},updated_at) VALUES(?,?,?,?,?) ON CONFLICT(user_id,record_id) DO UPDATE SET timestamp=excluded.timestamp,{column}=excluded.{column},updated_at=excluded.updated_at", (user_id,record_id,timestamp,value,self._now()))
+        return "updated" if old else "added"
+
     def latest_sync_at(self) -> str | None:
         """Return the most recent completed synchronization timestamp."""
         with self._connect() as connection:
@@ -176,6 +205,16 @@ class Database:
         """Return the newest body measurement."""
         with self._connect() as connection:
             row = connection.execute("SELECT * FROM body_measurements WHERE user_id=? ORDER BY timestamp DESC LIMIT 1", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+    def latest_sleep(self, user_id: str) -> dict[str, Any] | None:
+        with self._connect() as c:
+            row = c.execute("SELECT * FROM sleep_sessions WHERE user_id=? ORDER BY end_at DESC LIMIT 1", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+    def latest_metric(self, table: str, user_id: str) -> dict[str, Any] | None:
+        with self._connect() as c:
+            row = c.execute(f"SELECT * FROM {table} WHERE user_id=? ORDER BY timestamp DESC LIMIT 1", (user_id,)).fetchone()
         return dict(row) if row else None
 
     def trend(self, user_id: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
