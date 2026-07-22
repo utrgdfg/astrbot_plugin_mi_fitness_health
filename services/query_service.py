@@ -102,7 +102,8 @@ class QueryService:
             "spo2": any(word in compact for word in ("血氧", "spo2")),
             "stress": any(word in compact for word in ("压力", "焦虑", "stress")),
         }
-        if not any(requested.values()):
+        explicitly_requested = any(requested.values())
+        if not explicitly_requested:
             requested = {key: True for key in requested}
         activities, rates, measurement, sleeps, spo2, stress = await asyncio.gather(
             asyncio.to_thread(
@@ -149,6 +150,10 @@ class QueryService:
                     f"{ended.date()} 睡眠 {sleep['asleep_minutes']} 分钟（结束 {ended.strftime('%H:%M')}，评分 {score}）"
                 )
             parts.append("；".join(values))
+        elif requested["sleep"] and explicitly_requested:
+            parts.append(
+                "睡眠：本地缓存暂无已同步记录；这不代表设备不支持或手机端无法同步"
+            )
         if requested["spo2"] and spo2:
             parts.append(f"最近血氧：{spo2['percent']}%（采集 {spo2['timestamp']}）")
         if requested["stress"] and stress:

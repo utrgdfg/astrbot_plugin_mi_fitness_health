@@ -103,6 +103,7 @@ class MiFitnessCloudAdapter(DataAdapter):
         self._connected = False
         self._available_types: list[str] = []
         self.last_error: str | None = None
+        self.authentication_failed = False
 
     def get_available_data_types(self) -> list[str]:
         """Return discovered data types."""
@@ -119,6 +120,7 @@ class MiFitnessCloudAdapter(DataAdapter):
             True when authentication and connection setup succeed.
         """
         self.last_error = None
+        self.authentication_failed = False
         if not self.user_id or not self.pass_token:
             self.last_error = "缺少 userId 或 passToken。"
             return False
@@ -133,6 +135,7 @@ class MiFitnessCloudAdapter(DataAdapter):
             self._connected = True
             return True
         except MiFitnessAuthenticationError as error:
+            self.authentication_failed = True
             self.last_error = redact_error(error)
         except (httpx.HTTPError, ValueError, KeyError, RuntimeError) as error:
             self.last_error = redact_error(error)
@@ -148,6 +151,10 @@ class MiFitnessCloudAdapter(DataAdapter):
             "https://account.xiaomi.com/pass/serviceLogin?_json=true&sid=miothealth",
             headers={"Cookie": f"userId={self.user_id}; passToken={self.pass_token}"},
         )
+        if response.status_code in (401, 403):
+            raise MiFitnessAuthenticationError(
+                "小米登录授权已失效；请重新获取 Cookie。"
+            )
         response.raise_for_status()
         raw = response.content
         if not raw.startswith(LOGIN_PREFIX):
@@ -161,6 +168,10 @@ class MiFitnessCloudAdapter(DataAdapter):
         self.pass_token = str(payload.get("passToken") or self.pass_token)
         self._ssecurity = base64.b64decode(payload["ssecurity"])
         redirected = await self._client.get(str(payload["location"]))
+        if redirected.status_code in (401, 403):
+            raise MiFitnessAuthenticationError(
+                "小米健康云会话授权失败；请重新获取 Cookie。"
+            )
         redirected.raise_for_status()
         self._cookies = "; ".join(
             value.split(";", 1)[0]
@@ -206,6 +217,7 @@ class MiFitnessCloudAdapter(DataAdapter):
                 )
                 if response.status_code in (401, 403):
                     self._connected = False
+                    self.authentication_failed = True
                     raise MiFitnessAuthenticationError(
                         "小米健康云授权已失效；请重新获取 Cookie。"
                     )
@@ -230,6 +242,7 @@ class MiFitnessCloudAdapter(DataAdapter):
                         )
                     ):
                         self._connected = False
+                        self.authentication_failed = True
                         raise MiFitnessAuthenticationError(
                             "小米健康云授权已失效；请重新获取 Cookie。"
                         )
@@ -263,6 +276,7 @@ class MiFitnessCloudAdapter(DataAdapter):
         )
         cursor: str | None = None
         seen_cursors: set[str] = set()
+        seen_records: set[str] = set()
         records: list[dict] = []
         for _ in range(100):
             payload: dict[str, object] = {
@@ -277,7 +291,26 @@ class MiFitnessCloudAdapter(DataAdapter):
             )
             data = result.get("data_list")
             if isinstance(data, list):
-                records.extend(item for item in data if isinstance(item, dict))
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    normalized_item = dict(item)
+                    raw_value = normalized_item.get("value")
+                    if isinstance(raw_value, str):
+                        try:
+                            normalized_item["value"] = json.loads(raw_value)
+                        except json.JSONDecodeError:
+                            pass
+                    fingerprint = json.dumps(
+                        normalized_item,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=str,
+                    )
+                    if fingerprint not in seen_records:
+                        seen_records.add(fingerprint)
+                        records.append(item)
             next_cursor = (
                 result.get("next_key")
                 if isinstance(result.get("next_key"), str)
@@ -286,10 +319,28 @@ class MiFitnessCloudAdapter(DataAdapter):
             if not result.get("has_more") or not next_cursor:
                 return records
             if next_cursor in seen_cursors:
-                raise RuntimeError("小米健康云返回了重复的分页游标。")
+                if key in {"steps", "calories"}:
+                    raise RuntimeError(
+                        f"小米健康云 {key} 数据分页游标重复；已拒绝不完整的每日汇总。"
+                    )
+                logger.warning(
+                    "Mi Fitness pagination stopped at a repeated cursor for key %s; keeping %d unique records",
+                    key,
+                    len(records),
+                )
+                return records
             seen_cursors.add(next_cursor)
             cursor = next_cursor
-        raise RuntimeError("小米健康云分页超过安全上限。")
+        if key in {"steps", "calories"}:
+            raise RuntimeError(
+                f"小米健康云 {key} 数据分页超过安全上限；已拒绝不完整的每日汇总。"
+            )
+        logger.warning(
+            "Mi Fitness pagination reached the safety limit for key %s; keeping %d unique records",
+            key,
+            len(records),
+        )
+        return records
 
     async def _discover_region(self) -> str:
         """Probe up to the recent 30-day window instead of hard-coded historic dates."""
@@ -546,7 +597,10 @@ class MiFitnessCloudAdapter(DataAdapter):
                 0,
                 duration,
             )
-            score = self._number(value.get("score") or value.get("sleep_score"), 0, 100)
+            score_value = value.get("score")
+            if score_value is None:
+                score_value = value.get("sleep_score")
+            score = self._number(score_value, 0, 100)
             yield SleepSession(
                 f"mi_fitness_sleep_{begin}",
                 datetime.fromtimestamp(begin, UTC),
@@ -580,9 +634,12 @@ class MiFitnessCloudAdapter(DataAdapter):
         for item in await self._fetch_key("stress", start, end, self.region):
             time = self._record_time(item)
             value = self._value(item)
-            score = self._number(
-                value.get("stress") or value.get("score") or value.get("value"), 0, 100
-            )
+            stress_value = value.get("stress")
+            if stress_value is None:
+                stress_value = value.get("score")
+            if stress_value is None:
+                stress_value = value.get("value")
+            score = self._number(stress_value, 0, 100)
             if time and score is not None:
                 timestamp, _ = time
                 yield StressSample(
