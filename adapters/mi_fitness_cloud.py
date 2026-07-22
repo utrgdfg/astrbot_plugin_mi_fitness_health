@@ -9,12 +9,22 @@ import json
 import logging
 import os
 import struct
+from collections import defaultdict
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 
 import httpx
 
 from .base import DataAdapter
+from ..models import (
+    BodyMeasurement,
+    DailyActivity,
+    HeartRateSample,
+    SleepSession,
+    SpO2Sample,
+    StressSample,
+)
 from ..utils.privacy import redact_error
 
 logger = logging.getLogger(__name__)
@@ -52,7 +62,9 @@ def _nonce() -> bytes:
     return os.urandom(8) + struct.pack(">I", int(datetime.now(UTC).timestamp() // 60))
 
 
-def _signature(method: str, path: str, values: dict[str, str], signed_nonce: bytes) -> str:
+def _signature(
+    method: str, path: str, values: dict[str, str], signed_nonce: bytes
+) -> str:
     """Build the request signature used by Mi Fitness MCP.
 
     Args:
@@ -111,7 +123,9 @@ class MiFitnessCloudAdapter(DataAdapter):
             self.last_error = "缺少 userId 或 passToken。"
             return False
         await self.close()
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(30.0), follow_redirects=False)
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(30.0), follow_redirects=False
+        )
         try:
             await self._login_with_token()
             self.region = await self._discover_region()
@@ -140,17 +154,22 @@ class MiFitnessCloudAdapter(DataAdapter):
             raise MiFitnessAuthenticationError("小米登录响应无效；请重新获取 Cookie。")
         payload = json.loads(raw[len(LOGIN_PREFIX) :].decode())
         if not payload.get("ssecurity") or not payload.get("location"):
-            raise MiFitnessAuthenticationError("凭证已失效、需要验证或账号受到风控；请在浏览器重新登录后更新 Cookie。")
+            raise MiFitnessAuthenticationError(
+                "凭证已失效、需要验证或账号受到风控；请在浏览器重新登录后更新 Cookie。"
+            )
         self.user_id = str(payload.get("userId") or self.user_id)
         self.pass_token = str(payload.get("passToken") or self.pass_token)
         self._ssecurity = base64.b64decode(payload["ssecurity"])
         redirected = await self._client.get(str(payload["location"]))
         redirected.raise_for_status()
         self._cookies = "; ".join(
-            value.split(";", 1)[0] for value in redirected.headers.get_list("set-cookie")
+            value.split(";", 1)[0]
+            for value in redirected.headers.get_list("set-cookie")
         )
         if not self._cookies:
-            raise MiFitnessAuthenticationError("未取得小米健康云会话；请重新登录后更新 Cookie。")
+            raise MiFitnessAuthenticationError(
+                "未取得小米健康云会话；请重新登录后更新 Cookie。"
+            )
 
     async def _request(self, host: str, path: str, payload: dict[str, object]) -> dict:
         """Send one encrypted request with capped exponential retries."""
@@ -161,36 +180,91 @@ class MiFitnessCloudAdapter(DataAdapter):
             try:
                 nonce = _nonce()
                 signed_nonce = hashlib.sha256(self._ssecurity + nonce).digest()
-                form = {"data": json.dumps(payload, separators=(",", ":"), ensure_ascii=False)}
+                form = {
+                    "data": json.dumps(
+                        payload, separators=(",", ":"), ensure_ascii=False
+                    )
+                }
                 form["rc4_hash__"] = _signature("POST", path, form, signed_nonce)
                 encrypted = {
-                    key: base64.b64encode(_rc4_crypt(signed_nonce, value.encode())).decode()
+                    key: base64.b64encode(
+                        _rc4_crypt(signed_nonce, value.encode())
+                    ).decode()
                     for key, value in form.items()
                 }
-                encrypted["signature"] = _signature("POST", path, encrypted, signed_nonce)
+                encrypted["signature"] = _signature(
+                    "POST", path, encrypted, signed_nonce
+                )
                 encrypted["_nonce"] = base64.b64encode(nonce).decode()
                 response = await self._client.post(
                     host + path,
-                    headers={"Cookie": self._cookies, "Content-Type": "application/x-www-form-urlencoded"},
+                    headers={
+                        "Cookie": self._cookies,
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
                     content=urlencode(encrypted),
                 )
+                if response.status_code in (401, 403):
+                    self._connected = False
+                    raise MiFitnessAuthenticationError(
+                        "小米健康云授权已失效；请重新获取 Cookie。"
+                    )
                 response.raise_for_status()
-                body = json.loads(_rc4_crypt(signed_nonce, base64.b64decode(response.text)))
+                body = json.loads(
+                    _rc4_crypt(signed_nonce, base64.b64decode(response.text))
+                )
                 if body.get("code") != 0:
-                    raise RuntimeError(str(body.get("message") or "Mi Fitness request failed"))
-                return body.get("result") if isinstance(body.get("result"), dict) else {}
-            except (httpx.HTTPError, ValueError, UnicodeDecodeError, RuntimeError) as error:
+                    message = str(body.get("message") or "Mi Fitness request failed")
+                    if any(
+                        marker in message.lower()
+                        for marker in (
+                            "auth",
+                            "login",
+                            "token",
+                            "session",
+                            "401",
+                            "403",
+                            "登录",
+                            "授权",
+                            "凭证",
+                        )
+                    ):
+                        self._connected = False
+                        raise MiFitnessAuthenticationError(
+                            "小米健康云授权已失效；请重新获取 Cookie。"
+                        )
+                    raise RuntimeError(message)
+                return (
+                    body.get("result") if isinstance(body.get("result"), dict) else {}
+                )
+            except MiFitnessAuthenticationError:
+                raise
+            except (
+                httpx.HTTPError,
+                ValueError,
+                UnicodeDecodeError,
+                RuntimeError,
+            ) as error:
                 last_error = error
                 if attempt < 2:
                     await asyncio.sleep(0.5 * (2**attempt))
-        raise RuntimeError(f"小米健康云请求失败：{redact_error(last_error or 'unknown error')}")
+        raise RuntimeError(
+            f"小米健康云请求失败：{redact_error(last_error or 'unknown error')}"
+        )
 
-    async def _fetch_key(self, key: str, start: datetime, end: datetime, region: str) -> list[dict]:
+    async def _fetch_key(
+        self, key: str, start: datetime, end: datetime, region: str
+    ) -> list[dict]:
         """Fetch every paginated record for an upstream key in a bounded date range."""
-        host = "https://hlth.io.mi.com" if region in ("", "cn") else f"https://{region}.hlth.io.mi.com"
+        host = (
+            "https://hlth.io.mi.com"
+            if region in ("", "cn")
+            else f"https://{region}.hlth.io.mi.com"
+        )
         cursor: str | None = None
+        seen_cursors: set[str] = set()
         records: list[dict] = []
-        while True:
+        for _ in range(100):
             payload: dict[str, object] = {
                 "start_time": int(start.replace(tzinfo=UTC).timestamp()),
                 "end_time": int(end.replace(tzinfo=UTC).timestamp()),
@@ -198,13 +272,24 @@ class MiFitnessCloudAdapter(DataAdapter):
             }
             if cursor:
                 payload["next_key"] = cursor
-            result = await self._request(host, "/app/v1/data/get_fitness_data_by_time", payload)
+            result = await self._request(
+                host, "/app/v1/data/get_fitness_data_by_time", payload
+            )
             data = result.get("data_list")
             if isinstance(data, list):
                 records.extend(item for item in data if isinstance(item, dict))
-            cursor = result.get("next_key") if isinstance(result.get("next_key"), str) else None
-            if not result.get("has_more") or not cursor:
+            next_cursor = (
+                result.get("next_key")
+                if isinstance(result.get("next_key"), str)
+                else None
+            )
+            if not result.get("has_more") or not next_cursor:
                 return records
+            if next_cursor in seen_cursors:
+                raise RuntimeError("小米健康云返回了重复的分页游标。")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        raise RuntimeError("小米健康云分页超过安全上限。")
 
     async def _discover_region(self) -> str:
         """Probe up to the recent 30-day window instead of hard-coded historic dates."""
@@ -214,8 +299,12 @@ class MiFitnessCloudAdapter(DataAdapter):
         ]
         for region in candidates:
             try:
-                if await self._fetch_key("steps", now - timedelta(days=30), now, region):
+                if await self._fetch_key(
+                    "steps", now - timedelta(days=30), now, region
+                ):
                     return region
+            except MiFitnessAuthenticationError:
+                raise
             except RuntimeError:
                 continue
         return self.region or "cn"
@@ -224,13 +313,283 @@ class MiFitnessCloudAdapter(DataAdapter):
         """Discover only supported datasets, using a recent bounded probe."""
         now = datetime.now(UTC)
         types: list[str] = []
-        for data_type, key in (("daily_activity", "steps"), ("heart_rate", "heart_rate"), ("body_measurements", "weight")):
-            try:
-                if await self._fetch_key(key, now - timedelta(days=30), now, self.region):
-                    types.append(data_type)
-            except RuntimeError:
-                continue
+        for data_type, keys in (
+            ("daily_activity", ("steps",)),
+            ("heart_rate", ("heart_rate", "resting_heart_rate")),
+            ("body_measurements", ("weight",)),
+            ("sleep", ("sleep",)),
+            ("spo2", ("spo2",)),
+            ("stress", ("stress",)),
+        ):
+            found = False
+            for key in keys:
+                try:
+                    if await self._fetch_key(
+                        key, now - timedelta(days=30), now, self.region
+                    ):
+                        found = True
+                        break
+                except MiFitnessAuthenticationError:
+                    raise
+                except RuntimeError:
+                    continue
+            if found:
+                types.append(data_type)
         return types
+
+    @staticmethod
+    def _value(item: dict) -> dict:
+        """Decode a cloud value field without assuming its shape."""
+        value = item.get("value", {})
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                decoded = json.loads(value)
+                return decoded if isinstance(decoded, dict) else {}
+            except json.JSONDecodeError:
+                return {}
+        return {}
+
+    @staticmethod
+    def _number(value: object, minimum: float, maximum: float) -> float | None:
+        """Return a bounded numeric value or None for malformed cloud data."""
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if minimum <= number <= maximum else None
+
+    @staticmethod
+    def _record_time(item: dict) -> tuple[datetime, str] | None:
+        """Return UTC collection time and cloud-zone local calendar date."""
+        try:
+            timestamp = int(item.get("time"))
+            offset = int(item.get("zone_offset", 0))
+        except (TypeError, ValueError):
+            return None
+        if timestamp > 100_000_000_000:  # Some cloud records use milliseconds.
+            timestamp //= 1000
+        if timestamp <= 0 or abs(offset) > 15 * 3600:
+            return None
+        utc_time = datetime.fromtimestamp(timestamp, UTC)
+        return utc_time, (utc_time + timedelta(seconds=offset)).date().isoformat()
+
+    async def iter_daily_activity(
+        self, start: datetime, end: datetime
+    ) -> AsyncIterator[DailyActivity]:
+        """Aggregate validated step and calorie records by their cloud local day."""
+        totals: dict[str, dict[str, float]] = defaultdict(
+            lambda: {"steps": 0.0, "distance_m": 0.0, "active_kcal": 0.0}
+        )
+        latest: dict[str, datetime] = {}
+        calorie_totals: dict[str, float] = defaultdict(float)
+        step_records = await self._fetch_key("steps", start, end, self.region)
+        try:
+            calorie_records = await self._fetch_key("calories", start, end, self.region)
+        except MiFitnessAuthenticationError:
+            raise
+        except RuntimeError:
+            calorie_records = []
+        for key, records in (("steps", step_records), ("calories", calorie_records)):
+            for item in records:
+                record_time = self._record_time(item)
+                if not record_time:
+                    continue
+                timestamp, date = record_time
+                value = self._value(item)
+                if key == "steps":
+                    steps = self._number(value.get("steps"), 0, 200_000)
+                    distance = self._number(value.get("distance"), 0, 500_000)
+                    calories = self._number(value.get("calories"), 0, 50_000)
+                    totals[date]["steps"] += steps or 0
+                    totals[date]["distance_m"] += distance or 0
+                    totals[date]["active_kcal"] += calories or 0
+                else:
+                    calories = self._number(value.get("calories"), 0, 50_000)
+                    if calories is not None:
+                        calorie_totals[date] += calories
+                latest[date] = max(latest.get(date, timestamp), timestamp)
+        for date, calories in calorie_totals.items():
+            totals[date]["active_kcal"] = calories
+        for date, values in sorted(totals.items()):
+            yield DailyActivity(
+                date,
+                int(values["steps"]),
+                values["distance_m"],
+                values["active_kcal"],
+                latest[date],
+            )
+
+    async def iter_heart_rate(
+        self, start: datetime, end: datetime
+    ) -> AsyncIterator[HeartRateSample]:
+        """Yield standard and resting heart-rate records with tolerant field parsing.
+
+        Xiaomi accounts do not all expose sampled heart rates under the same key.
+        ``resting_heart_rate`` is treated as an optional account-specific
+        fallback and cannot invalidate records returned by ``heart_rate``.
+        """
+        records: list[tuple[dict, bool]] = []
+        successful_keys = 0
+        errors: list[RuntimeError] = []
+        for key, is_resting in (("heart_rate", False), ("resting_heart_rate", True)):
+            try:
+                records.extend(
+                    (item, is_resting)
+                    for item in await self._fetch_key(key, start, end, self.region)
+                )
+                successful_keys += 1
+            except MiFitnessAuthenticationError:
+                raise
+            except RuntimeError as error:
+                errors.append(error)
+        if not successful_keys and errors:
+            raise errors[-1]
+        seen: set[tuple[int, int]] = set()
+        for item, is_resting in records:
+            record_time = self._record_time(item)
+            if not record_time:
+                continue
+            timestamp, _ = record_time
+            value = self._value(item)
+            bpm = self._number(
+                value.get("bpm")
+                or value.get("heart_rate")
+                or value.get("heartRate")
+                or value.get("hr")
+                or value.get("rate")
+                or value.get("value"),
+                20,
+                260,
+            )
+            if bpm is None:
+                continue
+            identity = (int(timestamp.timestamp()), int(bpm))
+            if identity in seen:
+                continue
+            seen.add(identity)
+            kind = (
+                "passive"
+                if is_resting or str(value.get("type", "0")) == "0"
+                else "active"
+            )
+            is_workout = bool(value.get("workout_id") or value.get("is_workout"))
+            source = "resting_hr" if is_resting else "hr"
+            yield HeartRateSample(
+                f"mi_fitness_{source}_{int(timestamp.timestamp())}_{int(bpm)}",
+                timestamp,
+                int(bpm),
+                kind,
+                is_workout,
+            )
+
+    async def iter_body_measurements(
+        self, start: datetime, end: datetime
+    ) -> AsyncIterator[BodyMeasurement]:
+        """Yield validated smart-scale records while tolerating missing composition fields."""
+        for item in await self._fetch_key("weight", start, end, self.region):
+            record_time = self._record_time(item)
+            if not record_time:
+                continue
+            timestamp, _ = record_time
+            value = self._value(item)
+            weight = self._number(value.get("weight"), 10, 400)
+            if weight is None:
+                continue
+            visceral = self._number(value.get("visceral_fat"), 0, 100)
+            metabolism = self._number(value.get("basal_metabolism"), 0, 20_000)
+            age = self._number(value.get("body_age"), 0, 150)
+            yield BodyMeasurement(
+                f"mi_fitness_weight_{int(timestamp.timestamp())}",
+                timestamp,
+                weight,
+                self._number(value.get("bmi"), 5, 100),
+                self._number(value.get("body_fat_rate"), 0, 100),
+                self._number(value.get("muscle_rate"), 0, 300),
+                self._number(value.get("moisture_rate"), 0, 100),
+                self._number(value.get("bone_mass"), 0, 30),
+                int(visceral) if visceral is not None else None,
+                int(metabolism) if metabolism is not None else None,
+                int(age) if age is not None else None,
+            )
+
+    async def iter_sleep(
+        self, start: datetime, end: datetime
+    ) -> AsyncIterator[SleepSession]:
+        """Yield validated cloud sleep sessions when the account exposes the sleep key."""
+        for item in await self._fetch_key("sleep", start, end, self.region):
+            value = self._value(item)
+            try:
+                begin = int(
+                    value.get("bedtime")
+                    or value.get("device_bedtime")
+                    or value.get("bed_timestamp")
+                )
+                finish = int(
+                    value.get("wake_up_time")
+                    or value.get("device_wake_up_time")
+                    or value.get("out_bed_timestamp")
+                    or item.get("time")
+                )
+            except (TypeError, ValueError):
+                continue
+            if begin > 100_000_000_000:
+                begin //= 1000
+            if finish > 100_000_000_000:
+                finish //= 1000
+            duration = max(0, (finish - begin) // 60)
+            if not 30 <= duration <= 24 * 60:
+                continue
+            awake = self._number(
+                value.get("awake_duration") or value.get("sleep_awake_duration") or 0,
+                0,
+                duration,
+            )
+            score = self._number(value.get("score") or value.get("sleep_score"), 0, 100)
+            yield SleepSession(
+                f"mi_fitness_sleep_{begin}",
+                datetime.fromtimestamp(begin, UTC),
+                datetime.fromtimestamp(finish, UTC),
+                duration,
+                duration - int(awake or 0),
+                int(awake or 0),
+                int(score) if score is not None else None,
+            )
+
+    async def iter_spo2(
+        self, start: datetime, end: datetime
+    ) -> AsyncIterator[SpO2Sample]:
+        """Yield validated blood-oxygen records; unsupported keys simply return no rows."""
+        for item in await self._fetch_key("spo2", start, end, self.region):
+            time = self._record_time(item)
+            value = self._value(item)
+            percent = self._number(value.get("spo2") or value.get("value"), 70, 100)
+            if time and percent is not None:
+                timestamp, _ = time
+                yield SpO2Sample(
+                    f"mi_fitness_spo2_{int(timestamp.timestamp())}",
+                    timestamp,
+                    int(percent),
+                )
+
+    async def iter_stress(
+        self, start: datetime, end: datetime
+    ) -> AsyncIterator[StressSample]:
+        """Yield validated stress scores; no medical inference is made here."""
+        for item in await self._fetch_key("stress", start, end, self.region):
+            time = self._record_time(item)
+            value = self._value(item)
+            score = self._number(
+                value.get("stress") or value.get("score") or value.get("value"), 0, 100
+            )
+            if time and score is not None:
+                timestamp, _ = time
+                yield StressSample(
+                    f"mi_fitness_stress_{int(timestamp.timestamp())}",
+                    timestamp,
+                    int(score),
+                )
 
     async def close(self) -> None:
         """Close the plugin-owned async HTTP client."""
@@ -238,3 +597,34 @@ class MiFitnessCloudAdapter(DataAdapter):
         if self._client:
             await self._client.aclose()
             self._client = None
+
+    async def probe_data_keys(self, start: datetime, end: datetime) -> dict[str, str]:
+        """Return safe key-level availability diagnostics without returning raw records.
+
+        Args:
+            start: Probe window start.
+            end: Probe window end.
+
+        Returns:
+            Mapping of candidate key to count or a sanitized error category.
+        """
+        result: dict[str, str] = {}
+        for key in (
+            "steps",
+            "heart_rate",
+            "resting_heart_rate",
+            "heartrate",
+            "hr",
+            "sleep",
+            "spo2",
+            "blood_oxygen",
+            "stress",
+            "weight",
+        ):
+            try:
+                result[key] = str(
+                    len(await self._fetch_key(key, start, end, self.region))
+                )
+            except Exception as error:
+                result[key] = f"错误：{redact_error(error)}"
+        return result

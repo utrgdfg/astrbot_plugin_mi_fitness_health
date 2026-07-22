@@ -15,7 +15,9 @@ def redact_error(error: Exception | str) -> str:
         A message safe to show to the owner.
     """
     message = str(error).replace("\n", " ")
-    message = re.sub(r"(?i)(passToken|userId|ssecurity|cookie)=?[^\s;,&]+", r"\1=***", message)
+    message = re.sub(
+        r"(?i)(passToken|userId|ssecurity|cookie)=?[^\s;,&]+", r"\1=***", message
+    )
     message = re.sub(r"https?://\S+", "[remote URL]", message)
     return message[:180] or type(error).__name__
 
