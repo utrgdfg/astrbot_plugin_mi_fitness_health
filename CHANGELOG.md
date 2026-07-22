@@ -2,6 +2,14 @@
 
 本项目遵循语义化版本。小米运动健康云数据来自手机端已经上传的历史记录；所有版本均不提供蓝牙实时监护，也不构成医疗诊断。
 
+## [v0.5.3] - 2026-07-22
+
+### 修复
+
+- 修复“今日健康”和自然语言中的当日/昨日心率统计：按 `user_timezone` 的本地自然日（`00:00–24:00`）读取完整心率样本，不再误用滚动 24 小时窗口或默认 100 条记录上限。
+- 修复“健康趋势”的日均心率按 UTC 日期归类的问题，改为按用户本地日期计算，并继续排除运动心率样本以保持趋势口径。
+- 明确输出“今日心率（本地自然日）”，便于与小米运动健康 App 当日页面对照。
+
 ## [v0.5.2] - 2026-07-22
 
 ### 修复
@@ -66,6 +74,7 @@
 - AstrBot 的 QQ 官方 API 适配器不支持当前主动发送方式；AIOCQHTTP/NapCat 等通常支持。普通私聊中的健康查询不受此限制。
 - 不同小米账号、区域与设备可能暴露不同的云端 key；缺失或未知字段不会被伪造。
 
+[v0.5.3]: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/releases/tag/v0.5.3
 [v0.5.2]: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/releases/tag/v0.5.2
 [v0.5.1]: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/releases/tag/v0.5.1
 [v0.5.0]: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/releases/tag/v0.5.0

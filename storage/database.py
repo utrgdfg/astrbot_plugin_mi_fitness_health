@@ -472,6 +472,26 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def heart_rates_between(
+        self, user_id: str, start_timestamp: str, end_timestamp: str
+    ) -> list[dict[str, Any]]:
+        """Return every heart-rate sample in a half-open UTC time range.
+
+        Xiaomi stores samples with UTC timestamps, while a health "day" is
+        defined by the user's local calendar.  Callers calculate local
+        midnight boundaries first and pass their UTC values here.  There is
+        intentionally no record cap: a full day must not be silently
+        truncated before calculating its average or range.
+        """
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM heart_rate_samples
+                   WHERE user_id=? AND timestamp>=? AND timestamp<?
+                   ORDER BY timestamp DESC""",
+                (user_id, start_timestamp, end_timestamp),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def latest_measurement(self, user_id: str) -> dict[str, Any] | None:
         """Return the newest body measurement."""
         with self._connect() as connection:

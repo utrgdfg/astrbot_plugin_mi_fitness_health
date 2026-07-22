@@ -67,9 +67,9 @@ def today_text(
     if heart_rates:
         values = [item["bpm"] for item in heart_rates]
         lines.append(
-            f"心率：最新 {heart_rates[0]['bpm']} bpm（数据采集时间：{local_timestamp(heart_rates[0]['timestamp'], user_timezone)}），平均 {sum(values) / len(values):.0f}，最高 {max(values)}，最低 {min(values)}"
+            f"今日心率（本地自然日）：最新 {heart_rates[0]['bpm']} bpm（数据采集时间：{local_timestamp(heart_rates[0]['timestamp'], user_timezone)}），平均 {sum(values) / len(values):.0f}，最高 {max(values)}，最低 {min(values)}"
         )
     else:
-        lines.append("心率：暂无最近 24 小时数据")
+        lines.append("今日心率（本地自然日）：暂无数据")
     lines.append(measurement_text(measurement, user_timezone))
     return "\n".join(lines)
