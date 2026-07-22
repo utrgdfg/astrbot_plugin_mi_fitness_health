@@ -63,8 +63,19 @@ class QueryService:
         """Return latest synchronization marker."""
         return await asyncio.to_thread(self.database.latest_sync_at)
 
-    async def care_snapshot(self) -> str:
-        """Return a minimal cached summary suitable for one owner-only LLM turn."""
+    async def care_snapshot(self, focus: str = "") -> str:
+        """Return only health categories relevant to an owner conversation."""
+        compact = focus.lower().replace(" ", "")
+        requested = {
+            "activity": any(word in compact for word in ("步", "走", "运动", "活动", "距离", "热量", "卡路里")),
+            "heart": any(word in compact for word in ("心率", "心跳", "bpm")),
+            "body": any(word in compact for word in ("体重", "体脂", "bmi", "肌肉", "水分", "骨量", "代谢", "身体年龄")),
+            "sleep": any(word in compact for word in ("睡", "失眠", "入睡", "醒")),
+            "spo2": any(word in compact for word in ("血氧", "spo2")),
+            "stress": any(word in compact for word in ("压力", "焦虑", "stress")),
+        }
+        if not any(requested.values()):
+            requested = {key: True for key in requested}
         activities, rates, measurement, sleeps, spo2, stress = await asyncio.gather(
             asyncio.to_thread(self.database.recent_activity, self.user_id, self.today()),
             asyncio.to_thread(self.database.heart_rates_since, self.user_id, (datetime.now(UTC) - timedelta(hours=48)).isoformat(), 100),
@@ -74,20 +85,21 @@ class QueryService:
             asyncio.to_thread(self.database.latest_metric, "stress_samples", self.user_id),
         )
         parts = []
-        for activity in activities:
-            parts.append(f"{activity['date']} 活动：{activity['steps']} 步，{activity['distance_m']:.0f} m，活动消耗 {activity['active_kcal']:.0f} kcal")
-        if rates:
+        if requested["activity"]:
+            for activity in activities:
+                parts.append(f"{activity['date']} 活动：{activity['steps']} 步，{activity['distance_m']:.0f} m，活动消耗 {activity['active_kcal']:.0f} kcal")
+        if requested["heart"] and rates:
             values = [row["bpm"] for row in rates]
             parts.append(f"最近 48 小时心率：最新 {rates[0]['bpm']} bpm（采集 {rates[0]['timestamp']}），平均 {sum(values) / len(values):.0f}，最高 {max(values)}，最低 {min(values)}")
-        if measurement:
+        if requested["body"] and measurement:
             parts.append(f"最近体重：{measurement['weight_kg']} kg（采集 {measurement['timestamp']}）")
-        if sleeps:
+        if requested["sleep"] and sleeps:
             values = []
             for sleep in sleeps:
                 ended = datetime.fromisoformat(sleep["end_at"]).astimezone(self.timezone)
                 score = sleep["score"] if sleep["score"] is not None else "未提供"
                 values.append(f"{ended.date()} 睡眠 {sleep['asleep_minutes']} 分钟（结束 {ended.strftime('%H:%M')}，评分 {score}）")
             parts.append("；".join(values))
-        if spo2: parts.append(f"最近血氧：{spo2['percent']}%（采集 {spo2['timestamp']}）")
-        if stress: parts.append(f"最近压力分数：{stress['score']}（采集 {stress['timestamp']}）")
-        return "；".join(parts) or "暂无睡眠、血氧或压力的已同步云端数据"
+        if requested["spo2"] and spo2: parts.append(f"最近血氧：{spo2['percent']}%（采集 {spo2['timestamp']}）")
+        if requested["stress"] and stress: parts.append(f"最近压力分数：{stress['score']}（采集 {stress['timestamp']}）")
+        return "；".join(parts) or "暂无所查询项目的已同步云端数据"

@@ -11,14 +11,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.platform import MessageType
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.message import TextPart
 
 from .adapters import MiFitnessCloudAdapter
-from .services import AlertService, QueryService, SyncService
+from .services import AlertService, HealthMonitorService, QueryService, SyncService
 from .storage import Database
 from .utils import measurement_text, today_text
 from .utils.privacy import redact_error
@@ -43,6 +43,7 @@ class MiFitnessHealthPlugin(Star):
         self.user_id = str(config.get("user_id") or os.getenv("MI_FITNESS_USER_ID", "")).strip()
         self.pass_token = str(config.get("pass_token") or os.getenv("MI_FITNESS_PASS_TOKEN", "")).strip()
         self.owner_platform_id = str(config.get("owner_platform_id") or "").strip()
+        self.owner_platform_instance_id = str(config.get("owner_platform_instance_id") or "").strip()
         database_path = str(config.get("database_path") or "").strip()
         self.database = Database(Path(database_path) if database_path else self.data_dir / "mi_fitness_health.sqlite3")
         self.adapter = MiFitnessCloudAdapter(self.user_id, self.pass_token, str(config.get("region") or "").strip())
@@ -51,20 +52,39 @@ class MiFitnessHealthPlugin(Star):
         self.alert_service = AlertService(
             self.database, self.user_id, int(config.get("heart_rate_high") or 0), int(config.get("heart_rate_low") or 0),
             int(config.get("alert_consecutive_count") or 3), int(config.get("alert_cooldown_minutes") or 120),
+            int(config.get("spo2_low") or 0), int(config.get("stress_high") or 0), int(config.get("sleep_min_minutes") or 0),
+            int(config.get("alert_data_max_age_minutes") or 180),
         )
         self.auto_sync_enabled = bool(config.get("enable_auto_sync", True))
-        self.health_alerts_enabled = bool(config.get("enable_health_alerts", False))
+        self.health_alerts_enabled = bool(config.get("enable_health_alerts", True))
         self.care_dialogue_enabled = bool(config.get("enable_care_dialogue", True))
+        self.proactive_monitor_enabled = bool(config.get("enable_proactive_health_monitor", True))
+        self.monitor_interval = max(5, min(int(config.get("health_check_interval_minutes") or 30), 1440))
         self.natural_query_sync_minutes = max(1, min(int(config.get("natural_query_sync_minutes") or 15), 120))
         self.sync_days = max(1, min(int(config.get("default_sync_days") or 7), 90))
         self.sync_interval = max(5, int(config.get("sync_interval_minutes") or 60))
+        self.monitor_service = HealthMonitorService(
+            self.database,
+            self.owner_platform_id,
+            self.query_service.timezone,
+            bool(config.get("enable_late_night_activity_check", True)),
+            str(config.get("late_night_start") or "00:30"),
+            str(config.get("late_night_end") or "06:00"),
+            int(config.get("late_night_activity_window_minutes") or 45),
+            int(config.get("alert_cooldown_minutes") or 120),
+            int(config.get("proactive_daily_limit") or 3),
+        )
         self._auto_task: asyncio.Task[None] | None = None
+        self._monitor_task: asyncio.Task[None] | None = None
         self._auto_sync_paused = False
 
     async def initialize(self) -> None:
         """Migrate the database and schedule one guarded background loop."""
         await self.sync_service.initialize()
-        if self.auto_sync_enabled and self.user_id and self.pass_token and not self._auto_task:
+        monitor_ready = self.proactive_monitor_enabled and self.owner_platform_id and self.user_id and self.pass_token
+        if monitor_ready and not self._monitor_task:
+            self._monitor_task = asyncio.create_task(self._health_monitor_loop(), name=f"{self.name}-health-monitor")
+        elif self.auto_sync_enabled and self.user_id and self.pass_token and not self._auto_task:
             self._auto_task = asyncio.create_task(self._auto_sync_loop(), name=f"{self.name}-auto-sync")
 
     async def terminate(self) -> None:
@@ -74,6 +94,11 @@ class MiFitnessHealthPlugin(Star):
             with suppress(asyncio.CancelledError):
                 await self._auto_task
             self._auto_task = None
+        if self._monitor_task:
+            self._monitor_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._monitor_task
+            self._monitor_task = None
         await self.adapter.close()
 
     async def _auto_sync_loop(self) -> None:
@@ -91,21 +116,89 @@ class MiFitnessHealthPlugin(Star):
             await asyncio.sleep(self.sync_interval * 60)
 
     async def _sync(self) -> dict[str, object]:
-        """Run one sync and persist eligible non-diagnostic health alerts."""
-        summary = await self.sync_service.sync(self.sync_days)
-        if self.health_alerts_enabled:
-            alerts = await self.alert_service.evaluate()
-            if alerts:
-                logger.warning("Mi Fitness persisted %d configured health alert(s)", len(alerts))
-        return summary
+        """Run one synchronized Xiaomi cloud refresh."""
+        return await self.sync_service.sync(self.sync_days)
+
+    async def _send_private_message(self, text: str) -> bool:
+        """Send a proactive result only to the last observed owner private chat."""
+        state = await asyncio.to_thread(self.database.private_owner_session, self.owner_platform_id)
+        if not state:
+            return False
+        if self.owner_platform_instance_id and not state["session"].startswith(self.owner_platform_instance_id + ":"):
+            logger.warning("Mi Fitness proactive target does not match configured platform instance")
+            return False
+        try:
+            return await self.context.send_message(state["session"], MessageChain().message(text))
+        except Exception as error:
+            logger.warning("Mi Fitness proactive message was not delivered: %s", redact_error(error))
+            return False
+
+    async def _health_monitor_loop(self) -> None:
+        """Refresh and evaluate private findings at the configured bounded interval."""
+        failures = 0
+        while not self._auto_sync_paused:
+            try:
+                state = await asyncio.to_thread(self.database.private_owner_session, self.owner_platform_id)
+                if not state:
+                    failures = 0
+                    await asyncio.sleep(self.monitor_interval * 60)
+                    continue
+                # Monitoring only needs a short recent range; SyncService adds
+                # its normal 48-hour overlap for delayed Xiaomi uploads.
+                await self.sync_service.sync(1)
+                health_findings = await self.alert_service.evaluate() if self.health_alerts_enabled else []
+                messages = [finding.message for finding in health_findings]
+                late_finding = await self.monitor_service.evaluate_late_activity()
+                if late_finding:
+                    messages.append(late_finding.message)
+                if messages and not await self.monitor_service.proactive_cooling_down():
+                    body = "我刚检查了一次你的近期状态：\n- " + "\n- ".join(messages)
+                    body += "\n小米健康云数据可能延迟，不是实时监护；如果有明显不适，请及时联系医疗专业人员。"
+                    sent = await self._send_private_message(body)
+                    if sent:
+                        for finding in health_findings:
+                            await self.alert_service.mark_sent(finding)
+                        if late_finding:
+                            await self.monitor_service.mark_sent(late_finding)
+                        await self.monitor_service.mark_proactive_sent(body)
+                failures = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                failures += 1
+                reason = redact_error(error)
+                auth_markers = ("凭证已失效", "重新获取 Cookie", "重新登录", "需要验证", "风控")
+                if any(marker in reason for marker in auth_markers):
+                    logger.warning("Mi Fitness health monitor paused for reauthorization: %s", reason)
+                    self._auto_sync_paused = True
+                    break
+                retry_seconds = min(self.monitor_interval * 60, 30 * (2 ** min(failures - 1, 5)))
+                logger.warning("Mi Fitness health monitor retrying after a temporary error: %s", reason)
+                await asyncio.sleep(retry_seconds)
+                continue
+            await asyncio.sleep(self.monitor_interval * 60)
 
     def _authorized(self, event: AstrMessageEvent) -> bool:
         """Return whether the sender matches the one configured data owner."""
-        return bool(self.owner_platform_id) and str(event.get_sender_id()) == self.owner_platform_id
+        sender_matches = bool(self.owner_platform_id) and str(event.get_sender_id()) == self.owner_platform_id
+        platform_matches = not self.owner_platform_instance_id or event.get_platform_id() == self.owner_platform_instance_id
+        return sender_matches and platform_matches
 
     def _is_private_owner_event(self, event: AstrMessageEvent) -> bool:
         """Conversational health data is available only in the owner's private chat."""
         return self._authorized(event) and event.session.message_type == MessageType.FRIEND_MESSAGE
+
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
+    async def remember_owner_private_activity(self, event: AstrMessageEvent):
+        """Remember private owner activity as the only evidence for being awake."""
+        if self._is_private_owner_event(event):
+            await asyncio.to_thread(
+                self.database.touch_private_owner_session,
+                self.owner_platform_id,
+                event.unified_msg_origin,
+                None,
+                bool(self.owner_platform_instance_id),
+            )
 
     @staticmethod
     def _is_health_question(text: str) -> bool:
@@ -161,7 +254,7 @@ class MiFitnessHealthPlugin(Star):
         if not self.care_dialogue_enabled or not self._is_private_owner_event(event):
             return "此工具仅允许已配置的数据所有者在私聊中使用。"
         await self._refresh_for_natural_question(focus)
-        snapshot = await self.query_service.care_snapshot()
+        snapshot = await self.query_service.care_snapshot(focus)
         last_sync = await self.query_service.latest_sync_at()
         return (
             f"查询重点：{focus}\n{snapshot}\n最近本地同步：{last_sync or '暂无'}\n"
@@ -179,7 +272,7 @@ class MiFitnessHealthPlugin(Star):
         if not self._is_health_question(question):
             return
         await self._refresh_for_natural_question(question)
-        snapshot = await self.query_service.care_snapshot()
+        snapshot = await self.query_service.care_snapshot(question)
         last_sync = await self.query_service.latest_sync_at()
         text = ("<private_health_context>\n" + snapshot + f"\n最近本地同步：{last_sync or '暂无'}\n"
                 "These are delayed Xiaomi cloud records, not real-time monitoring. Answer the owner's health question directly in Chinese from these records; avoid diagnosis and do not claim medical certainty.\n</private_health_context>")
@@ -187,10 +280,15 @@ class MiFitnessHealthPlugin(Star):
         req.extra_user_content_parts.append(part.mark_as_temp() if hasattr(part, "mark_as_temp") else part)
 
     async def _guard(self, event: AstrMessageEvent):
-        """Yield a refusal if the request does not belong to the configured owner."""
-        if self._authorized(event):
+        """Require the configured owner and a private chat for all health commands."""
+        if self._is_private_owner_event(event):
             return
-        message = "健康数据所有者尚未配置，请由管理员设置 owner_platform_id。" if not self.owner_platform_id else "此健康数据仅允许已配置的所有者查询。"
+        if not self.owner_platform_id:
+            message = "健康数据所有者尚未配置，请由管理员设置 owner_platform_id。"
+        elif self._authorized(event):
+            message = "为避免健康数据公开，健康查询只能在与机器人的私聊中使用。"
+        else:
+            message = "此健康数据仅允许已配置的所有者查询。"
         yield event.plain_result(message)
 
     @filter.command("健康帮助")
@@ -200,6 +298,7 @@ class MiFitnessHealthPlugin(Star):
             "小米运动健康（仅所有者可用）\n"
             "健康连接｜健康同步｜健康状态｜今日健康｜心率记录 [小时]｜身体数据｜健康趋势 [天]\n"
             "也可以直接说“我昨天睡得怎么样”或“我今天走了多少步”：机器人会按配置自动刷新云端缓存。\n"
+            f"主动健康检查：{'每 ' + str(self.monitor_interval) + ' 分钟' if self.proactive_monitor_enabled else '关闭'}；只在有依据且冷却结束时私聊一次。\n"
             "数据是小米健康云已同步的历史记录，所有展示均含采集时间；不是实时监护，也不构成医疗诊断。"
         )
 
@@ -276,10 +375,19 @@ class MiFitnessHealthPlugin(Star):
             yield result
             return
         last_sync = await self.query_service.latest_sync_at()
+        private_state = await asyncio.to_thread(self.database.private_owner_session, self.owner_platform_id)
+        if self._auto_sync_paused:
+            background_status = "已暂停（请检查授权）"
+        elif self.proactive_monitor_enabled:
+            background_status = f"主动检查接管（每 {self.monitor_interval} 分钟）"
+        else:
+            background_status = "开启" if self.auto_sync_enabled else "关闭"
         yield event.plain_result(
             f"健康状态\n连接：{'已连接' if self.adapter.is_connected() else '未连接/待验证'}\n"
             f"区域：{self.adapter.region or '自动探测'}\n最近同步：{last_sync or '暂无'}\n"
-            f"自动同步：{'已暂停（请重新授权后重载）' if self._auto_sync_paused else ('开启' if self.auto_sync_enabled else '关闭')}\n"
+            f"后台同步：{background_status}\n"
+            f"主动健康检查：{'开启（每 ' + str(self.monitor_interval) + ' 分钟）' if self.proactive_monitor_enabled else '关闭'}\n"
+            f"主动私聊目标：{'已记录' if private_state else '待所有者先私聊一次'}\n"
             f"自然语言查询刷新：{self.natural_query_sync_minutes} 分钟"
         )
 

@@ -10,7 +10,7 @@ from typing import Any
 
 from ..models import BodyMeasurement, DailyActivity, HeartRateSample, SleepSession, SpO2Sample, StressSample
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class Database:
@@ -28,6 +28,7 @@ class Database:
         """Create the schema and apply forward-only migrations."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
+            connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")
             row = connection.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
             if row is None:
@@ -92,13 +93,23 @@ class Database:
                     PRIMARY KEY(reminder_type, local_date)
                 );
                 """)
+                connection.execute("UPDATE schema_version SET version = 3")
+                current = 3
+            if current < 4:
+                alert_columns = {row[1] for row in connection.execute("PRAGMA table_info(alerts)").fetchall()}
+                if "event_key" not in alert_columns:
+                    connection.execute("ALTER TABLE alerts ADD COLUMN event_key TEXT")
+                connection.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_event ON alerts(alert_type,event_key) WHERE event_key IS NOT NULL"
+                )
                 connection.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
 
     @contextmanager
     def _connect(self):
         """Yield a transaction connection and always close its Windows file handle."""
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, timeout=30.0)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=30000")
         try:
             yield connection
             connection.commit()
@@ -293,9 +304,22 @@ class Database:
         return [dict(row) for row in rows]
 
     def latest_metric(self, table: str, user_id: str) -> dict[str, Any] | None:
+        if table not in {"spo2_samples", "stress_samples"}:
+            raise ValueError("Unsupported metric table")
         with self._connect() as c:
             row = c.execute(f"SELECT * FROM {table} WHERE user_id=? ORDER BY timestamp DESC LIMIT 1", (user_id,)).fetchone()
         return dict(row) if row else None
+
+    def metric_samples_since(self, table: str, user_id: str, timestamp: str, limit: int = 100) -> list[dict[str, Any]]:
+        """Return recent validated SpO2 or stress rows in newest-first order."""
+        if table not in {"spo2_samples", "stress_samples"}:
+            raise ValueError("Unsupported metric table")
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM {table} WHERE user_id=? AND timestamp>=? ORDER BY timestamp DESC LIMIT ?",
+                (user_id, timestamp, max(1, min(limit, 500))),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def trend(self, user_id: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
         """Return per-day activity and average passive heart rate for a date span."""
@@ -309,10 +333,13 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def add_alert(self, alert_type: str, message: str) -> None:
+    def add_alert(self, alert_type: str, message: str, event_key: str | None = None, created_at: datetime | None = None) -> None:
         """Persist a non-diagnostic alert audit record."""
         with self._connect() as connection:
-            connection.execute("INSERT INTO alerts(alert_type,created_at,message) VALUES(?,?,?)", (alert_type, self._now(), message))
+            connection.execute(
+                "INSERT OR IGNORE INTO alerts(alert_type,created_at,message,event_key) VALUES(?,?,?,?)",
+                (alert_type, (created_at or datetime.now(UTC)).astimezone(UTC).isoformat(), message, event_key),
+            )
 
     def last_alert_at(self, alert_type: str) -> str | None:
         """Return the latest alert timestamp for cooldown enforcement."""
@@ -321,3 +348,52 @@ class Database:
                 "SELECT created_at FROM alerts WHERE alert_type=? ORDER BY id DESC LIMIT 1", (alert_type,)
             ).fetchone()
         return row["created_at"] if row else None
+
+    def alert_event_sent(self, alert_type: str, event_key: str) -> bool:
+        """Return whether one exact cloud record sequence was already delivered."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM alerts WHERE alert_type=? AND event_key=? LIMIT 1",
+                (alert_type, event_key),
+            ).fetchone()
+        return row is not None
+
+    def alert_count_since(self, alert_type: str, timestamp: str) -> int:
+        """Count successfully delivered proactive messages in a bounded period."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS value FROM alerts WHERE alert_type=? AND created_at>=?",
+                (alert_type, timestamp),
+            ).fetchone()
+        return int(row["value"]) if row else 0
+
+    def touch_private_owner_session(
+        self,
+        owner_platform_id: str,
+        session: str,
+        seen_at: datetime | None = None,
+        allow_rebind: bool = False,
+    ) -> bool:
+        """Bind the first owner private session and reject cross-session replacement."""
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT session FROM private_owner_sessions WHERE owner_platform_id=?",
+                (owner_platform_id,),
+            ).fetchone()
+            if existing and existing["session"] != session and not allow_rebind:
+                return False
+            connection.execute(
+                """INSERT INTO private_owner_sessions(owner_platform_id,session,updated_at) VALUES(?,?,?)
+                   ON CONFLICT(owner_platform_id) DO UPDATE SET session=excluded.session,updated_at=excluded.updated_at""",
+                (owner_platform_id, session, (seen_at or datetime.now(UTC)).astimezone(UTC).isoformat()),
+            )
+        return True
+
+    def private_owner_session(self, owner_platform_id: str) -> dict[str, Any] | None:
+        """Return the last private delivery target observed from the configured owner."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT session,updated_at FROM private_owner_sessions WHERE owner_platform_id=?",
+                (owner_platform_id,),
+            ).fetchone()
+        return dict(row) if row else None
