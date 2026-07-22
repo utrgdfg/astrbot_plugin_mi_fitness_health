@@ -1,6 +1,6 @@
 name: astrbot_plugin_mi_fitness_health
 display_name: 小米运动健康
-version: v0.3.0
+version: v0.3.1
 author: AstrBot community
 desc: 读取小米运动健康云端已同步数据，并提供私有健康数据查询与提醒。
 astrbot_version: ">=4.13,<5"
