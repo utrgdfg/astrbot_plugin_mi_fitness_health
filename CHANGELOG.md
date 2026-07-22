@@ -2,6 +2,12 @@
 
 本项目遵循语义化版本。小米运动健康云数据来自手机端已经上传的历史记录；所有版本均不提供蓝牙实时监护，也不构成医疗诊断。
 
+## [v0.5.6] - 2026-07-23
+
+### 修复
+
+- 依据 AstrBot 插件配置手册，为四项模型/人格配置增加 `_special: select_provider` 与 `_special: select_persona`。插件配置页现在直接下拉展示已配置的聊天模型和人格，不再要求手动复制 Provider ID 或 `persona_id`。
+
 ## [v0.5.5] - 2026-07-23
 
 ### 新增
@@ -90,6 +96,7 @@
 - AstrBot 的 QQ 官方 API 适配器不支持当前主动发送方式；AIOCQHTTP/NapCat 等通常支持。普通私聊中的健康查询不受此限制。
 - 不同小米账号、区域与设备可能暴露不同的云端 key；缺失或未知字段不会被伪造。
 
+[v0.5.6]: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/releases/tag/v0.5.6
 [v0.5.5]: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/releases/tag/v0.5.5
 [v0.5.4]: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/releases/tag/v0.5.4
 [v0.5.3]: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/releases/tag/v0.5.3
