@@ -86,6 +86,18 @@ class MiFitnessHealthPlugin(Star):
         self.auto_sync_enabled = bool(config.get("enable_auto_sync", True))
         self.health_alerts_enabled = bool(config.get("enable_health_alerts", True))
         self.care_dialogue_enabled = bool(config.get("enable_care_dialogue", True))
+        self.health_dialogue_provider_id = str(
+            config.get("health_dialogue_provider_id") or ""
+        ).strip()
+        self.health_dialogue_persona_id = str(
+            config.get("health_dialogue_persona_id") or ""
+        ).strip()
+        self.proactive_reminder_provider_id = str(
+            config.get("proactive_reminder_provider_id") or ""
+        ).strip()
+        self.proactive_reminder_persona_id = str(
+            config.get("proactive_reminder_persona_id") or ""
+        ).strip()
         self.proactive_monitor_enabled = bool(
             config.get("enable_proactive_health_monitor", True)
         )
@@ -193,7 +205,9 @@ class MiFitnessHealthPlugin(Star):
             )
             return False
 
-    async def _owner_persona_prompt(self, session: str) -> str:
+    async def _owner_persona_prompt(
+        self, session: str, preferred_persona_id: str = ""
+    ) -> str:
         """Load the configured persona for the owner private conversation.
 
         A proactive health finding is not a command response.  Resolving the
@@ -201,6 +215,16 @@ class MiFitnessHealthPlugin(Star):
         established voice without exposing or persisting conversation content.
         """
         try:
+            if preferred_persona_id:
+                persona = await self.context.persona_manager.get_persona(
+                    preferred_persona_id
+                )
+                if persona and getattr(persona, "system_prompt", ""):
+                    return str(persona.system_prompt)
+                logger.warning(
+                    "Mi Fitness configured persona was not found: %s",
+                    preferred_persona_id,
+                )
             conversation_id = await self.context.conversation_manager.get_curr_conversation_id(
                 session
             )
@@ -224,6 +248,10 @@ class MiFitnessHealthPlugin(Star):
                 redact_error(error),
             )
         return ""
+
+    async def _health_provider_id(self, session: str, configured_id: str) -> str:
+        """Use an explicit provider ID when configured, else retain session routing."""
+        return configured_id or await self.context.get_current_chat_provider_id(session)
 
     @staticmethod
     def _clean_proactive_reply(value: object) -> str | None:
@@ -249,7 +277,9 @@ class MiFitnessHealthPlugin(Star):
         """
         if not facts:
             return None
-        persona_prompt = await self._owner_persona_prompt(session)
+        persona_prompt = await self._owner_persona_prompt(
+            session, self.proactive_reminder_persona_id
+        )
         if not persona_prompt:
             logger.warning("Mi Fitness skipped proactive reply: owner persona unavailable")
             return None
@@ -262,7 +292,9 @@ class MiFitnessHealthPlugin(Star):
             "不要使用标题、列表、免责声明或医疗诊断，也不要编造未提供的症状或数据。"
         )
         try:
-            provider_id = await self.context.get_current_chat_provider_id(session)
+            provider_id = await self._health_provider_id(
+                session, self.proactive_reminder_provider_id
+            )
             response = await asyncio.wait_for(
                 self.context.llm_generate(
                     chat_provider_id=provider_id,
@@ -281,6 +313,58 @@ class MiFitnessHealthPlugin(Star):
         except Exception as error:
             logger.warning(
                 "Mi Fitness proactive wording generation failed; no message sent: %s",
+                redact_error(error),
+            )
+            return None
+
+    async def _compose_health_dialogue(
+        self, session: str, focus: str, snapshot: str, last_sync: str | None
+    ) -> str | None:
+        """Optionally use a configured model/persona to interpret health facts.
+
+        The outer chat pipeline remains responsible for the normal reply.  This
+        adds a carefully constrained health-analysis draft only when the user
+        selected a dedicated health provider or persona in this plugin.
+        """
+        if not (
+            self.health_dialogue_provider_id or self.health_dialogue_persona_id
+        ):
+            return None
+        persona_prompt = await self._owner_persona_prompt(
+            session, self.health_dialogue_persona_id
+        )
+        if not persona_prompt:
+            return None
+        prompt = (
+            f"用户关注：{focus}\n\n已核实的小米健康云记录：\n{snapshot}\n"
+            f"最近同步完成时间：{last_sync or '暂无'}\n\n"
+            "请以当前指定人格写一段中文健康对话草稿，直接回应用户关注的内容，"
+            "最多三句。只可使用上述事实；不要声称实时监护、不要作医疗诊断、"
+            "不要解释插件、模型、云端或配置，也不要编造缺失数据。"
+        )
+        try:
+            provider_id = await self._health_provider_id(
+                session, self.health_dialogue_provider_id
+            )
+            response = await asyncio.wait_for(
+                self.context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=prompt,
+                    system_prompt=(
+                        persona_prompt
+                        + "\n\n你正在根据已核实的个人健康记录回答问题。"
+                        "不得编造数据或做医疗诊断。"
+                    ),
+                ),
+                timeout=35,
+            )
+            reply = self._clean_proactive_reply(
+                getattr(response, "completion_text", None)
+            )
+            return reply
+        except Exception as error:
+            logger.warning(
+                "Mi Fitness configured health dialogue generation failed: %s",
                 redact_error(error),
             )
             return None
@@ -479,9 +563,16 @@ class MiFitnessHealthPlugin(Star):
         await self._refresh_for_natural_question(focus)
         snapshot = await self.query_service.care_snapshot(focus)
         last_sync = await self.query_service.latest_sync_at()
+        dialogue = await self._compose_health_dialogue(
+            event.unified_msg_origin,
+            focus,
+            snapshot,
+            self.query_service.display_timestamp(last_sync) if last_sync else None,
+        )
         return (
             f"查询重点：{focus}\n{snapshot}\n最近同步完成时间：{self.query_service.display_timestamp(last_sync) if last_sync else '暂无'}\n"
-            "以上为小米健康云已上传的历史数据，并非实时监护；请直接回答用户的问题，不作医疗诊断。"
+            + (f"健康对话草稿：{dialogue}\n" if dialogue else "")
+            + "以上为小米健康云已上传的历史数据，并非实时监护；请直接回答用户的问题，不作医疗诊断。"
             "某项目暂无记录不代表设备不支持，也不要声称手机端无法同步。"
         )
 
@@ -500,11 +591,18 @@ class MiFitnessHealthPlugin(Star):
         await self._refresh_for_natural_question(question)
         snapshot = await self.query_service.care_snapshot(question)
         last_sync = await self.query_service.latest_sync_at()
+        dialogue = await self._compose_health_dialogue(
+            event.unified_msg_origin,
+            question,
+            snapshot,
+            self.query_service.display_timestamp(last_sync) if last_sync else None,
+        )
         text = (
             "<private_health_context>\n"
             + snapshot
             + f"\n最近同步完成时间：{self.query_service.display_timestamp(last_sync) if last_sync else '暂无'}\n"
-            "These are delayed Xiaomi cloud records, not real-time monitoring. Answer the owner's health question directly in Chinese from these records; avoid diagnosis and do not claim medical certainty. Missing cached records do not prove that the device or phone app lacks support.\n</private_health_context>"
+            + (f"配置的健康对话草稿：{dialogue}\n" if dialogue else "")
+            + "These are delayed Xiaomi cloud records, not real-time monitoring. Answer the owner's health question directly in Chinese from these records; avoid diagnosis and do not claim medical certainty. Missing cached records do not prove that the device or phone app lacks support.\n</private_health_context>"
         )
         part = TextPart(text=text)
         req.extra_user_content_parts.append(
