@@ -19,6 +19,12 @@
     "hint": "常用值 cn、ru、de、i2、sg、us；留空时按最近 30 天数据探测。",
     "default": ""
   },
+  "user_timezone": {
+    "type": "string",
+    "description": "用户时区",
+    "hint": "用于“今日”和趋势的日期边界，例如 Asia/Shanghai。云端 zone_offset 仍会用于数据原始日期。",
+    "default": "Asia/Shanghai"
+  },
   "sync_interval_minutes": {"type": "int", "description": "自动同步间隔（分钟）", "default": 60},
   "default_sync_days": {"type": "int", "description": "默认同步天数", "default": 7},
   "owner_platform_id": {"type": "string", "description": "健康数据所有者平台 ID", "hint": "只有此 ID 可执行健康查询与数据管理。", "default": ""},

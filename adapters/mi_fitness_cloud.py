@@ -9,12 +9,15 @@ import json
 import logging
 import os
 import struct
+from collections import defaultdict
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 
 import httpx
 
 from .base import DataAdapter
+from ..models import BodyMeasurement, DailyActivity, HeartRateSample
 from ..utils.privacy import redact_error
 
 logger = logging.getLogger(__name__)
@@ -231,6 +234,106 @@ class MiFitnessCloudAdapter(DataAdapter):
             except RuntimeError:
                 continue
         return types
+
+    @staticmethod
+    def _value(item: dict) -> dict:
+        """Decode a cloud value field without assuming its shape."""
+        value = item.get("value", {})
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                decoded = json.loads(value)
+                return decoded if isinstance(decoded, dict) else {}
+            except json.JSONDecodeError:
+                return {}
+        return {}
+
+    @staticmethod
+    def _number(value: object, minimum: float, maximum: float) -> float | None:
+        """Return a bounded numeric value or None for malformed cloud data."""
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if minimum <= number <= maximum else None
+
+    @staticmethod
+    def _record_time(item: dict) -> tuple[datetime, str] | None:
+        """Return UTC collection time and cloud-zone local calendar date."""
+        try:
+            timestamp = int(item.get("time"))
+            offset = int(item.get("zone_offset", 0))
+        except (TypeError, ValueError):
+            return None
+        if timestamp <= 0 or abs(offset) > 15 * 3600:
+            return None
+        utc_time = datetime.fromtimestamp(timestamp, UTC)
+        return utc_time, (utc_time + timedelta(seconds=offset)).date().isoformat()
+
+    async def iter_daily_activity(self, start: datetime, end: datetime) -> AsyncIterator[DailyActivity]:
+        """Aggregate validated step and calorie records by their cloud local day."""
+        totals: dict[str, dict[str, float]] = defaultdict(lambda: {"steps": 0.0, "distance_m": 0.0, "active_kcal": 0.0})
+        latest: dict[str, datetime] = {}
+        for key in ("steps", "calories"):
+            for item in await self._fetch_key(key, start, end, self.region):
+                record_time = self._record_time(item)
+                if not record_time:
+                    continue
+                timestamp, date = record_time
+                value = self._value(item)
+                if key == "steps":
+                    steps = self._number(value.get("steps"), 0, 200_000)
+                    distance = self._number(value.get("distance"), 0, 500_000)
+                    calories = self._number(value.get("calories"), 0, 50_000)
+                    totals[date]["steps"] += steps or 0
+                    totals[date]["distance_m"] += distance or 0
+                    totals[date]["active_kcal"] += calories or 0
+                else:
+                    calories = self._number(value.get("calories"), 0, 50_000)
+                    if calories is not None:
+                        totals[date]["active_kcal"] += calories
+                latest[date] = max(latest.get(date, timestamp), timestamp)
+        for date, values in sorted(totals.items()):
+            yield DailyActivity(date, int(values["steps"]), values["distance_m"], values["active_kcal"], latest[date])
+
+    async def iter_heart_rate(self, start: datetime, end: datetime) -> AsyncIterator[HeartRateSample]:
+        """Yield valid heart-rate samples, preserving active/passive classification."""
+        for item in await self._fetch_key("heart_rate", start, end, self.region):
+            record_time = self._record_time(item)
+            if not record_time:
+                continue
+            timestamp, _ = record_time
+            value = self._value(item)
+            bpm = self._number(value.get("bpm"), 20, 260)
+            if bpm is None:
+                continue
+            kind = "passive" if str(value.get("type", "0")) == "0" else "active"
+            is_workout = bool(value.get("workout_id") or value.get("is_workout"))
+            yield HeartRateSample(f"mi_fitness_hr_{int(timestamp.timestamp())}", timestamp, int(bpm), kind, is_workout)
+
+    async def iter_body_measurements(self, start: datetime, end: datetime) -> AsyncIterator[BodyMeasurement]:
+        """Yield validated smart-scale records while tolerating missing composition fields."""
+        for item in await self._fetch_key("weight", start, end, self.region):
+            record_time = self._record_time(item)
+            if not record_time:
+                continue
+            timestamp, _ = record_time
+            value = self._value(item)
+            weight = self._number(value.get("weight"), 10, 400)
+            if weight is None:
+                continue
+            optional = lambda name, low, high: self._number(value.get(name), low, high)
+            visceral = optional("visceral_fat", 0, 100)
+            metabolism = optional("basal_metabolism", 0, 20_000)
+            age = optional("body_age", 0, 150)
+            yield BodyMeasurement(
+                f"mi_fitness_weight_{int(timestamp.timestamp())}", timestamp, weight,
+                optional("bmi", 5, 100), optional("body_fat_rate", 0, 100),
+                optional("muscle_rate", 0, 300), optional("moisture_rate", 0, 100),
+                optional("bone_mass", 0, 30), int(visceral) if visceral is not None else None,
+                int(metabolism) if metabolism is not None else None, int(age) if age is not None else None,
+            )
 
     async def close(self) -> None:
         """Close the plugin-owned async HTTP client."""

@@ -1,26 +1,59 @@
-# AstrBot 小米运动健康插件
+# AstrBot 小米运动健康
 
-这是一个原生 AstrBot 插件，计划读取已同步到小米运动健康云的数据；它不连接手环蓝牙，也不提供实时监护或医疗诊断。
+原生 AstrBot 插件，从小米运动健康云读取**已同步的历史数据**并缓存到本地 SQLite。它不连接蓝牙设备、不是实时监护，也不构成医疗诊断。
 
-## 当前阶段
+当前支持步数、距离、活动消耗、心率、体重及部分身体成分。睡眠、运动记录、血氧、压力和设备电量会明确返回“当前数据源暂未支持”，不会伪造数据。
 
-阶段 2 已提供可加载的插件入口、配置页、所有者权限守卫和真实的小米云 token 登录、`ssecurity`、nonce、请求签名、RC4 加解密及最近 30 天数据类型探测。SQLite 同步、健康查询与提醒将在后续阶段实现。
+## 安装和配置
 
-## 安全配置
+将插件 ZIP 导入 AstrBot 后，在“插件管理 → 小米运动健康 → 配置”中填写：
 
-在 AstrBot 的“插件管理 → 小米运动健康 → 配置”中填写 `user_id`、`pass_token` 和 `owner_platform_id`。保存后重新加载插件，并由数据所有者发送 `/健康连接` 验证连接。
+- `user_id`：小米 Cookies 中的 `userId`
+- `pass_token`：小米 Cookies 中的 `passToken`
+- `owner_platform_id`：唯一允许查询健康数据的消息平台用户 ID
+- 可选设置：区域、时区、默认同步天数、自动同步和个人心率提醒阈值
 
-### 获取 `userId` 与 `passToken`
+`passToken` 等同账号登录凭证。仅应由受信任管理员在 AstrBot 配置页面填写，绝不可发送到聊天、日志、截图、Issue 或模型。插件不支持明文密码登录。
 
-1. 在浏览器打开 [account.xiaomi.com](https://account.xiaomi.com)，自行完成小米账号登录和任何验证步骤。
-2. 打开浏览器开发工具，进入 Storage/Application（或“应用”）中的 Cookies，选择 `account.xiaomi.com`。
-3. 找到并复制 Cookies 表中名为 `userId` 和 `passToken` 的**值**，分别粘贴到插件配置页相应字段。
-4. 保存配置后重新加载插件，使用 `/健康连接`。连接响应不会显示任何凭证。
+### 获取凭证
 
-`pass_token` 是登录凭证，绝不能发到聊天、日志、截图、Issue 或交给模型。插件仅支持用户自行获取的 `userId` 与 `passToken`，不支持明文账号密码登录。若触发验证码、二次验证或账号风控，插件不会尝试绕过，须由用户在浏览器处理后重新获取 Cookie。
+1. 在浏览器打开 [account.xiaomi.com](https://account.xiaomi.com)，自行完成登录和必要验证。
+2. 打开浏览器开发工具，进入 Storage/Application（或“应用”）→ Cookies → `account.xiaomi.com`。
+3. 复制名为 `userId` 与 `passToken` 的 Cookie **值**，填写进插件配置。
+4. 保存并重新加载插件，再由所有者执行 `/健康连接`。
 
-也可在受控部署环境中使用 `MI_FITNESS_USER_ID` 与 `MI_FITNESS_PASS_TOKEN` 环境变量作为后备；AstrBot 配置优先。
+验证码、二次验证或账号风控必须在浏览器中由用户自行处理。插件不会尝试绕过这些机制；凭证失效后自动同步会暂停。
+
+## 指令
+
+- `/健康连接`：验证云端登录，展示区域和已探测的数据类型（不显示凭证）。
+- `/健康同步`：同步默认天数，额外回看 48 小时以处理延迟上传和历史修正。
+- `/健康状态`：显示连接、缓存和自动同步状态。
+- `/今日健康`：显示当天步数、距离、活动消耗、心率统计和最新身体测量。
+- `/心率记录 24`：显示最近指定小时数的云端心率记录（最大 168 小时）。
+- `/身体数据`：显示最新体重与身体成分。
+- `/健康趋势 7`：显示最近天数的文字趋势（最大 90 天）。
+- `/健康帮助`：显示隐私和数据范围说明。
+
+所有查询默认仅允许 `owner_platform_id`；未设置所有者时会拒绝所有健康查询。展示中的时间均为云端采集时间或同步时间，而非实时数据。
+
+## 数据和提醒
+
+数据库位于 AstrBot 插件数据目录，可由 `database_path` 覆盖。SQLite schema 带版本迁移，更新插件不会主动删除旧数据；活动、心率和体重使用稳定唯一键去重更新。
+
+心率提醒仅评估连续的**非运动、被动**云端心率样本，并遵守用户配置的连续次数和冷却时间。提醒记录写入数据库；它们只是数据提示，不对疾病或健康状态作判断。
+
+## 开发验证
+
+测试不连接真实小米服务：
+
+```powershell
+$env:PYTHONPATH = 'G:\'
+python -m unittest astrbot_plugin_mi_fitness_health.tests.test_database
+```
+
+实际小米云登录和字段兼容性仍需由用户使用自己的账号在受控环境中验证。请不要在测试或 Issue 中提交任何真实 Cookie。
 
 ## 版权
 
-本项目会移植 [Mi Fitness MCP](https://github.com/kubulashvili/mi-fitness-mcp) 的小米云协议数据层，作者为 Aleksej Kubulashvili。其 MIT 许可证和版权说明已保留在 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。
+云端协议层基于 [Mi Fitness MCP](https://github.com/kubulashvili/mi-fitness-mcp) 的实现进行移植，作者 Aleksej Kubulashvili。相关 MIT 许可证与版权说明保留在 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。
