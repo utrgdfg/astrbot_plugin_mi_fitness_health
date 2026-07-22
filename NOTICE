@@ -1,0 +1,8 @@
+This plugin contains planned derivative work based on Mi Fitness MCP.
+
+Upstream project: https://github.com/kubulashvili/mi-fitness-mcp
+Upstream author: Aleksej Kubulashvili
+Upstream license: MIT License, Copyright (c) 2026 Aleksej Kubulashvili
+
+The upstream MIT license is included in LICENSE. The AstrBot integration is
+distributed under the same MIT terms for the copied and derived portions.

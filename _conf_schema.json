@@ -1,0 +1,32 @@
+{
+  "user_id": {
+    "type": "string",
+    "description": "小米 userId",
+    "hint": "打开 https://account.xiaomi.com 登录后，在浏览器开发工具的 Cookies（account.xiaomi.com）中复制 userId。仅用于 token 登录，不支持账号密码登录。",
+    "obvious_hint": true,
+    "default": ""
+  },
+  "pass_token": {
+    "type": "string",
+    "description": "小米 passToken（敏感）",
+    "hint": "在同一 Cookies 列表复制 passToken。它等同登录凭证：只能在此受控插件配置页填写，绝不可发送到聊天、日志、截图、Issue 或模型。",
+    "obvious_hint": true,
+    "default": ""
+  },
+  "region": {
+    "type": "string",
+    "description": "小米健康云区域",
+    "hint": "常用值 cn、ru、de、i2、sg、us；留空时按最近 30 天数据探测。",
+    "default": ""
+  },
+  "sync_interval_minutes": {"type": "int", "description": "自动同步间隔（分钟）", "default": 60},
+  "default_sync_days": {"type": "int", "description": "默认同步天数", "default": 7},
+  "owner_platform_id": {"type": "string", "description": "健康数据所有者平台 ID", "hint": "只有此 ID 可执行健康查询与数据管理。", "default": ""},
+  "enable_auto_sync": {"type": "bool", "description": "启用自动同步", "default": true},
+  "enable_health_alerts": {"type": "bool", "description": "启用非医疗健康提醒", "default": false},
+  "heart_rate_high": {"type": "int", "description": "个人高心率提醒阈值", "default": 0},
+  "heart_rate_low": {"type": "int", "description": "个人低心率提醒阈值", "default": 0},
+  "alert_consecutive_count": {"type": "int", "description": "连续样本数", "default": 3},
+  "alert_cooldown_minutes": {"type": "int", "description": "提醒冷却时间（分钟）", "default": 120},
+  "database_path": {"type": "string", "description": "数据库路径（可选）", "hint": "留空时使用 AstrBot 插件数据目录。", "default": ""}
+}
