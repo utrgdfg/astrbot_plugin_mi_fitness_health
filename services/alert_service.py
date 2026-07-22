@@ -30,6 +30,8 @@ class AlertService:
             matching = 0
             for row in reversed(rows):
                 if row["is_workout"] or row["sample_type"] != "passive":
+                    # A workout or active measurement breaks a passive-resting sequence.
+                    matching = 0
                     continue
                 matching = matching + 1 if compare(row["bpm"], threshold) else 0
                 if matching >= self.consecutive:
