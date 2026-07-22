@@ -1,7 +1,7 @@
 name: astrbot_plugin_mi_fitness_health
 display_name: 小米运动健康
-version: v0.5.3
+version: v0.5.4
 author: AstrBot community
-desc: 在私聊对话中调用小米运动健康云数据，并按配置进行周期性主动健康提示。
+desc: 在私聊对话中调用小米运动健康云数据；后台只在有依据时，以当前 Bot 人格主动关心。
 astrbot_version: ">=4.18.1,<5"
 repo: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health

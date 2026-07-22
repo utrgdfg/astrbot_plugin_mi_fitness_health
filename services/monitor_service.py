@@ -138,8 +138,8 @@ class HealthMonitorService:
         return MonitorFinding(
             "late_night_activity",
             event_key,
-            f"已经 {now.strftime('%H:%M')} 了，刚才还看到你在聊天。要是还没休息，可以考虑先放下手机准备睡觉。"
-            "这个判断只来自你的私聊活动，不是手环实时检测。",
+            f"当前本地时间 {now.strftime('%H:%M')}，并且所有者在最近 "
+            f"{self.activity_window_minutes} 分钟内有私聊活动",
         )
 
     async def mark_sent(

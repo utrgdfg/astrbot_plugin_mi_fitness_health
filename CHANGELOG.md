@@ -2,6 +2,14 @@
 
 本项目遵循语义化版本。小米运动健康云数据来自手机端已经上传的历史记录；所有版本均不提供蓝牙实时监护，也不构成医疗诊断。
 
+## [v0.5.4] - 2026-07-23
+
+### 改进
+
+- 主动健康流程改为“后台同步与规则判定 → 命中条件后调用当前私聊的聊天模型与人格 → 发送一两句自然关心”。不再把原始规则说明、技术免责声明和固定模板直接发给用户；模型或人格不可用时宁可跳过，不会退化为模板消息。
+- 主动判断仍只基于配置阈值、足够新的云端样本、深夜时段和近期私聊活动，并保留事件去重、冷却和每日上限；LLM 仅负责措辞，不能自行触发提醒或编造健康数据。
+- 根据 AstrBot 插件约定加入根目录 `logo.png`，使用用户提供图像制作的方形插件图标。
+
 ## [v0.5.3] - 2026-07-22
 
 ### 修复
@@ -74,6 +82,7 @@
 - AstrBot 的 QQ 官方 API 适配器不支持当前主动发送方式；AIOCQHTTP/NapCat 等通常支持。普通私聊中的健康查询不受此限制。
 - 不同小米账号、区域与设备可能暴露不同的云端 key；缺失或未知字段不会被伪造。
 
+[v0.5.4]: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/releases/tag/v0.5.4
 [v0.5.3]: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/releases/tag/v0.5.3
 [v0.5.2]: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/releases/tag/v0.5.2
 [v0.5.1]: https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/releases/tag/v0.5.1
