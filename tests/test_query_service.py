@@ -43,3 +43,12 @@ class QueryServiceTest(unittest.TestCase):
             snapshot = asyncio.run(service.care_snapshot("我今天走了多少步"))
             self.assertIn("4321 步", snapshot)
             self.assertNotIn("体重", snapshot)
+
+    def test_missing_sleep_does_not_claim_device_is_unsupported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            service = QueryService(database, "user", "Asia/Shanghai")
+            snapshot = asyncio.run(service.care_snapshot("我昨天睡得怎么样"))
+            self.assertIn("暂无已同步记录", snapshot)
+            self.assertIn("不代表设备不支持", snapshot)

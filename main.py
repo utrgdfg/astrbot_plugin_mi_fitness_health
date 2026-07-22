@@ -21,6 +21,11 @@ from .adapters import MiFitnessCloudAdapter
 from .services import AlertService, HealthMonitorService, QueryService, SyncService
 from .storage import Database
 from .utils import measurement_text, today_text
+from .utils.access import (
+    normalize_identifier,
+    owner_access_denial_reason,
+    owner_identifiers_match,
+)
 from .utils.privacy import redact_error
 
 logger = logging.getLogger(__name__)
@@ -46,10 +51,10 @@ class MiFitnessHealthPlugin(Star):
         self.pass_token = str(
             config.get("pass_token") or os.getenv("MI_FITNESS_PASS_TOKEN", "")
         ).strip()
-        self.owner_platform_id = str(config.get("owner_platform_id") or "").strip()
-        self.owner_platform_instance_id = str(
-            config.get("owner_platform_instance_id") or ""
-        ).strip()
+        self.owner_platform_id = normalize_identifier(config.get("owner_platform_id"))
+        self.owner_platform_instance_id = normalize_identifier(
+            config.get("owner_platform_instance_id")
+        )
         database_path = str(config.get("database_path") or "").strip()
         self.database = Database(
             Path(database_path)
@@ -254,22 +259,31 @@ class MiFitnessHealthPlugin(Star):
 
     def _authorized(self, event: AstrMessageEvent) -> bool:
         """Return whether the sender matches the one configured data owner."""
-        sender_matches = (
-            bool(self.owner_platform_id)
-            and str(event.get_sender_id()) == self.owner_platform_id
+        return owner_identifiers_match(
+            self.owner_platform_id,
+            self.owner_platform_instance_id,
+            event.get_sender_id(),
+            event.get_platform_id(),
         )
-        platform_matches = (
-            bool(self.owner_platform_instance_id)
-            and event.get_platform_id() == self.owner_platform_instance_id
+
+    def _access_denial_reason(self, event: AstrMessageEvent) -> str | None:
+        """Explain owner, platform-instance, and private-chat failures separately."""
+        message_type = event.get_message_type()
+        message_type_name = str(
+            getattr(message_type, "value", message_type or "未知")
         )
-        return sender_matches and platform_matches
+        return owner_access_denial_reason(
+            owner_platform_id=self.owner_platform_id,
+            owner_platform_instance_id=self.owner_platform_instance_id,
+            sender_id=event.get_sender_id(),
+            platform_id=event.get_platform_id(),
+            message_type=message_type_name,
+            is_private=message_type == MessageType.FRIEND_MESSAGE,
+        )
 
     def _is_private_owner_event(self, event: AstrMessageEvent) -> bool:
         """Conversational health data is available only in the owner's private chat."""
-        return (
-            self._authorized(event)
-            and event.session.message_type == MessageType.FRIEND_MESSAGE
-        )
+        return self._access_denial_reason(event) is None
 
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     async def remember_owner_private_activity(self, event: AstrMessageEvent):
@@ -363,14 +377,18 @@ class MiFitnessHealthPlugin(Star):
         Args:
             focus(string): 用户希望了解的项目或时间范围，例如“昨天睡眠”“今日步数”“最近心率”。
         """
-        if not self.care_dialogue_enabled or not self._is_private_owner_event(event):
-            return "此工具仅允许已配置的数据所有者在私聊中使用。"
+        if not self.care_dialogue_enabled:
+            return "健康对话工具已在插件配置中关闭。"
+        denial_reason = self._access_denial_reason(event)
+        if denial_reason:
+            return denial_reason
         await self._refresh_for_natural_question(focus)
         snapshot = await self.query_service.care_snapshot(focus)
         last_sync = await self.query_service.latest_sync_at()
         return (
             f"查询重点：{focus}\n{snapshot}\n最近本地同步：{last_sync or '暂无'}\n"
             "以上为小米健康云已上传的历史数据，并非实时监护；请直接回答用户的问题，不作医疗诊断。"
+            "某项目暂无记录不代表设备不支持，也不要声称手机端无法同步。"
         )
 
     @filter.on_llm_request()
@@ -392,7 +410,7 @@ class MiFitnessHealthPlugin(Star):
             "<private_health_context>\n"
             + snapshot
             + f"\n最近本地同步：{last_sync or '暂无'}\n"
-            "These are delayed Xiaomi cloud records, not real-time monitoring. Answer the owner's health question directly in Chinese from these records; avoid diagnosis and do not claim medical certainty.\n</private_health_context>"
+            "These are delayed Xiaomi cloud records, not real-time monitoring. Answer the owner's health question directly in Chinese from these records; avoid diagnosis and do not claim medical certainty. Missing cached records do not prove that the device or phone app lacks support.\n</private_health_context>"
         )
         part = TextPart(text=text)
         req.extra_user_content_parts.append(
@@ -401,17 +419,10 @@ class MiFitnessHealthPlugin(Star):
 
     async def _guard(self, event: AstrMessageEvent):
         """Require the configured owner and a private chat for all health commands."""
-        if self._is_private_owner_event(event):
+        denial_reason = self._access_denial_reason(event)
+        if denial_reason is None:
             return
-        if not self.owner_platform_id:
-            message = "健康数据所有者尚未配置，请由管理员设置 owner_platform_id。"
-        elif not self.owner_platform_instance_id:
-            message = "所有者平台实例尚未配置，请由管理员设置 owner_platform_instance_id 后再查询。"
-        elif self._authorized(event):
-            message = "为避免健康数据公开，健康查询只能在与机器人的私聊中使用。"
-        else:
-            message = "此健康数据仅允许已配置的所有者查询。"
-        yield event.plain_result(message)
+        yield event.plain_result(denial_reason)
 
     @filter.command("健康帮助")
     async def health_help(self, event: AstrMessageEvent):
@@ -482,7 +493,9 @@ class MiFitnessHealthPlugin(Star):
             for key, label in labels.items():
                 item = details.get(key, {})
                 if "error" in item:
-                    lines.append(f"{label}：本次未同步（已保留其他数据）")
+                    lines.append(
+                        f"{label}：本次未同步（{item['error']}；已保留其他数据）"
+                    )
                 else:
                     lines.append(
                         f"{label}：读取 {item.get('fetched', 0)}，新增 {item.get('added', 0)}，更新 {item.get('updated', 0)}"
@@ -553,6 +566,7 @@ class MiFitnessHealthPlugin(Star):
         yield event.plain_result(
             f"健康状态\n连接：{'已连接' if self.adapter.is_connected() else '未连接/待验证'}\n"
             f"区域：{self.adapter.region or '自动探测'}\n最近同步：{last_sync or '暂无'}\n"
+            f"平台实例校验：{'已启用' if self.owner_platform_instance_id else '未配置（健康功能禁用）'}\n"
             f"后台同步：{background_status}\n"
             f"主动健康检查：{'开启（每 ' + str(self.monitor_interval) + ' 分钟）' if self.proactive_monitor_enabled else '关闭'}\n"
             f"主动私聊目标：{'已记录' if private_state else '待所有者先私聊一次'}\n"
