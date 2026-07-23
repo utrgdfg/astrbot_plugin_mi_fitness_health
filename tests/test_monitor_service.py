@@ -8,6 +8,8 @@ import unittest
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
+import astrbot_test_stub  # noqa: F401
+
 from astrbot_plugin_mi_fitness_health.services import HealthMonitorService
 from astrbot_plugin_mi_fitness_health.storage import Database
 

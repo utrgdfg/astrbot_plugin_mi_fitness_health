@@ -9,6 +9,8 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import astrbot_test_stub  # noqa: F401
+
 from astrbot_plugin_mi_fitness_health.adapters.mi_fitness_cloud import (
     MiFitnessAuthenticationError,
     MiFitnessCloudAdapter,
