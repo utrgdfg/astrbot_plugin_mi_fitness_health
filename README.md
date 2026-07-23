@@ -38,7 +38,7 @@ https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health
 
 后台生活数据同步和深夜私聊活动关心默认开启。如果不需要周期性云端请求，请同时关闭 `enable_proactive_health_monitor` 与 `enable_auto_sync`；自然语言对话仍可能按需刷新。
 
-`owner_platform_id` 和 `owner_platform_instance_id` 均必填；任一项为空时，所有健康数据命令、普通对话工具和主动监控都会保持禁用。v0.5.1 修复了直接复制 `/sid` 输出时因标签或括号导致真实私聊被误拒绝的问题：配置兼容 `[1234567890]`、`「示例机器人」`、`UID: [...]`、`Bot ID: [...]` 等常见格式；运行时事件 ID 仍执行精确双重校验。
+`owner_platform_id` 和 `owner_platform_instance_id` 均必填；任一项为空时，所有健康数据命令、普通对话工具和主动监控都会保持禁用。插件会兼容直接复制 `/sid` 输出时附带的标签或成对括号，例如 `[示例 UID]`、`「示例 Bot 名称」`、`UID: [...]`、`Bot ID: [...]`；运行时事件 ID 仍执行精确双重校验。
 
 `passToken` 等同账号登录凭证。仅应由受信任管理员在 AstrBot 配置页面填写，绝不可发送到聊天、日志、截图、Issue 或模型。Schema 已请求密码输入样式，但遮罩不等于加密存储，不同 AstrBot WebUI 版本也可能仍然回显；需要更严格保护时，请将配置页的 `pass_token` 留空并通过进程环境变量 `MI_FITNESS_PASS_TOKEN` 提供。插件不支持明文账号密码登录。
 

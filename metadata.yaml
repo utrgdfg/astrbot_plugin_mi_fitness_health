@@ -1,6 +1,6 @@
 name: astrbot_plugin_mi_fitness_health
 display_name: 小米运动健康
-version: v0.5.7
+version: v0.5.8
 author: utrgdfg
 desc: 在私聊对话中调用小米运动健康云数据，让 Bot 更自然地关心用户近况。
 short_desc: 静默读取已同步的小米生活数据，让 Bot 的日常关心更自然。

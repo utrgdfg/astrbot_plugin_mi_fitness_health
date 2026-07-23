@@ -29,7 +29,7 @@
   "sync_interval_minutes": {"type": "int", "description": "自动同步间隔（分钟）", "default": 60},
   "default_sync_days": {"type": "int", "description": "默认同步天数", "default": 7},
   "owner_platform_id": {"type": "string", "description": "健康数据所有者平台 ID", "hint": "必填。由所有者私聊机器人发送 /sid，复制其中的 UID；只有此 ID 可执行健康查询与数据管理。", "obvious_hint": true, "default": ""},
-  "owner_platform_instance_id": {"type": "string", "description": "所有者平台实例 ID", "hint": "必填。由所有者私聊机器人发送 /sid，复制其中的 Bot ID；它与 UID 一起严格校验，避免跨平台同号越权。可直接粘贴 Bot ID: [示例机器人] 这类结果，插件会去除标签和成对括号。", "obvious_hint": true, "default": ""},
+  "owner_platform_instance_id": {"type": "string", "description": "所有者平台实例 ID", "hint": "必填。由所有者私聊机器人发送 /sid，复制其中的 Bot ID；它与 UID 一起严格校验，避免跨平台同号越权。可直接粘贴 Bot ID: [示例 Bot 名称] 这类结果，插件会去除标签和成对括号。", "obvious_hint": true, "default": ""},
   "enable_auto_sync": {"type": "bool", "description": "启用自动同步", "default": true},
   "enable_care_dialogue": {"type": "bool", "description": "允许在普通对话中调用生活数据", "hint": "仅对 owner_platform_id 的私聊生效；Bot 可在自然聊天中静默读取所需数据，让回复更贴近用户近况。", "default": true},
   "health_dialogue_provider_id": {"type": "string", "description": "关心对话模型（可选）", "hint": "直接从已配置的聊天模型中选择。睡眠、心率等日常关心对话会先由该模型生成一段生活化回复草稿；不选择则完全沿用当前会话的模型流程。该模型会收到已同步的个人生活数据。", "_special": "select_provider", "default": ""},
