@@ -6,7 +6,6 @@ import asyncio
 import base64
 import hashlib
 import json
-import logging
 import os
 import struct
 from collections import defaultdict
@@ -15,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 
 import httpx
+from astrbot.api import logger
 
 from .base import DataAdapter
 from ..models import (
@@ -27,7 +27,6 @@ from ..models import (
 )
 from ..utils.privacy import redact_error
 
-logger = logging.getLogger(__name__)
 LOGIN_PREFIX = b"&&&START&&&"
 KNOWN_REGIONS = ("cn", "ru", "de", "i2", "sg", "us")
 
