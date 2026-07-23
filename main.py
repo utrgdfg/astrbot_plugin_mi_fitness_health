@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 from contextlib import suppress
 from datetime import timedelta
 from datetime import UTC, datetime
 from pathlib import Path
 
-from astrbot.api import AstrBotConfig
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.platform import MessageType
 from astrbot.api.star import Context, Star, StarTools
@@ -27,9 +26,6 @@ from .utils.access import (
     owner_identifiers_match,
 )
 from .utils.privacy import redact_error
-
-logger = logging.getLogger(__name__)
-
 
 class MiFitnessHealthPlugin(Star):
     """Own cloud lifecycle, local storage, and owner-only health commands."""
