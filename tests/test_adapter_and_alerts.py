@@ -15,7 +15,11 @@ from astrbot_plugin_mi_fitness_health.adapters.mi_fitness_cloud import (
     _rc4_crypt,
 )
 from astrbot_plugin_mi_fitness_health.models import HeartRateSample, SpO2Sample
-from astrbot_plugin_mi_fitness_health.services import AlertService, QueryService, SyncService
+from astrbot_plugin_mi_fitness_health.services import (
+    AlertService,
+    QueryService,
+    SyncService,
+)
 from astrbot_plugin_mi_fitness_health.storage import Database
 
 
@@ -323,9 +327,7 @@ class AdapterAndAlertTest(unittest.TestCase):
         adapter = FixtureAdapter("user", "token", "cn")
         with self.assertRaisesRegex(RuntimeError, "不完整的每日汇总"):
             asyncio.run(
-                adapter._fetch_key(
-                    "steps", datetime.now(UTC), datetime.now(UTC), "cn"
-                )
+                adapter._fetch_key("steps", datetime.now(UTC), datetime.now(UTC), "cn")
             )
 
     def test_sleep_flows_from_cloud_parser_to_conversation_snapshot(self) -> None:
@@ -365,9 +367,7 @@ class AdapterAndAlertTest(unittest.TestCase):
             adapter = FixtureAdapter("user", "token", "cn")
             result = asyncio.run(SyncService(adapter, database, "user").sync(1))
             self.assertEqual(result["details"]["sleep"]["fetched"], 1)
-            snapshot = asyncio.run(
-                query_service.care_snapshot("我昨天睡得怎么样")
-            )
+            snapshot = asyncio.run(query_service.care_snapshot("我昨天睡得怎么样"))
             self.assertIn("睡眠 430 分钟", snapshot)
             self.assertIn("评分 82", snapshot)
             self.assertIn(wake_local.date().isoformat(), snapshot)

@@ -9,9 +9,7 @@ def local_timestamp(value: object, user_timezone: tzinfo = UTC) -> str:
     """Format a stored UTC timestamp in the configured user timezone."""
     try:
         parsed = (
-            value
-            if isinstance(value, datetime)
-            else datetime.fromisoformat(str(value))
+            value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
         )
         parsed = parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
         local = parsed.astimezone(user_timezone)

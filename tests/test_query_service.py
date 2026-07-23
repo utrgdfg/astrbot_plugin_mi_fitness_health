@@ -105,15 +105,21 @@ class QueryServiceTest(unittest.TestCase):
             database.upsert_heart_rate(
                 "user",
                 HeartRateSample(
-                    "previous-day", datetime(2026, 7, 21, 15, 59, tzinfo=UTC),
-                    20, "passive", False,
+                    "previous-day",
+                    datetime(2026, 7, 21, 15, 59, tzinfo=UTC),
+                    20,
+                    "passive",
+                    False,
                 ),
             )
             database.upsert_heart_rate(
                 "user",
                 HeartRateSample(
-                    "next-day", datetime(2026, 7, 22, 16, 0, tzinfo=UTC),
-                    200, "passive", False,
+                    "next-day",
+                    datetime(2026, 7, 22, 16, 0, tzinfo=UTC),
+                    200,
+                    "passive",
+                    False,
                 ),
             )
             samples = [51, 135] + [78] * 118
@@ -122,8 +128,11 @@ class QueryServiceTest(unittest.TestCase):
                 database.upsert_heart_rate(
                     "user",
                     HeartRateSample(
-                        f"today-{index}", start + timedelta(minutes=index),
-                        bpm, "passive", False,
+                        f"today-{index}",
+                        start + timedelta(minutes=index),
+                        bpm,
+                        "passive",
+                        False,
                     ),
                 )
 
