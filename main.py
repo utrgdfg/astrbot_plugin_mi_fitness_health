@@ -27,6 +27,7 @@ from .utils.access import (
 )
 from .utils.privacy import redact_error
 
+
 class MiFitnessHealthPlugin(Star):
     """Own cloud lifecycle, local storage, and owner-only health commands."""
 
@@ -207,8 +208,10 @@ class MiFitnessHealthPlugin(Star):
                     "Mi Fitness configured persona was not found: %s",
                     preferred_persona_id,
                 )
-            conversation_id = await self.context.conversation_manager.get_curr_conversation_id(
-                session
+            conversation_id = (
+                await self.context.conversation_manager.get_curr_conversation_id(
+                    session
+                )
             )
             if conversation_id:
                 conversation = await self.context.conversation_manager.get_conversation(
@@ -263,7 +266,9 @@ class MiFitnessHealthPlugin(Star):
             session, self.proactive_reminder_persona_id
         )
         if not persona_prompt:
-            logger.warning("Mi Fitness skipped proactive reply: owner persona unavailable")
+            logger.warning(
+                "Mi Fitness skipped proactive reply: owner persona unavailable"
+            )
             return None
         prompt = (
             "已由生活数据插件完成后台读取和关心时机判断；下面是已核实的事实：\n"
@@ -308,9 +313,7 @@ class MiFitnessHealthPlugin(Star):
         adds a carefully constrained care-dialogue draft only when the user
         selected a dedicated health provider or persona in this plugin.
         """
-        if not (
-            self.health_dialogue_provider_id or self.health_dialogue_persona_id
-        ):
+        if not (self.health_dialogue_provider_id or self.health_dialogue_persona_id):
             return None
         persona_prompt = await self._owner_persona_prompt(
             session, self.health_dialogue_persona_id
@@ -333,8 +336,7 @@ class MiFitnessHealthPlugin(Star):
                     chat_provider_id=provider_id,
                     prompt=prompt,
                     system_prompt=(
-                        persona_prompt
-                        + "\n\n你正在根据已核实的个人生活数据回答问题。"
+                        persona_prompt + "\n\n你正在根据已核实的个人生活数据回答问题。"
                         "不得编造数据或做医疗诊断。"
                     ),
                 ),
@@ -422,9 +424,7 @@ class MiFitnessHealthPlugin(Star):
     def _access_denial_reason(self, event: AstrMessageEvent) -> str | None:
         """Explain owner, platform-instance, and private-chat failures separately."""
         message_type = event.get_message_type()
-        message_type_name = str(
-            getattr(message_type, "value", message_type or "未知")
-        )
+        message_type_name = str(getattr(message_type, "value", message_type or "未知"))
         return owner_access_denial_reason(
             owner_platform_id=self.owner_platform_id,
             owner_platform_instance_id=self.owner_platform_instance_id,

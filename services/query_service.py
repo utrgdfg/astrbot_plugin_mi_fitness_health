@@ -48,9 +48,7 @@ class QueryService:
             self.database.heart_rates_between, self.user_id, start, end
         )
 
-    async def heart_rates_for_range(
-        self, start_day: date, end_day: date
-    ) -> list[dict]:
+    async def heart_rates_for_range(self, start_day: date, end_day: date) -> list[dict]:
         """Return all samples from local ``start_day`` up to ``end_day``."""
         start, _ = self.local_day_bounds(start_day)
         end, _ = self.local_day_bounds(end_day)
