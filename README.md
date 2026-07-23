@@ -6,7 +6,23 @@
 
 ## 安装和配置
 
-将插件 ZIP 导入 AstrBot 4.18.1 或更高的 4.x 版本后，在“插件管理 → 小米运动健康 → 配置”中填写：
+插件支持 AstrBot 4.18.1 及以上的 4.x 版本。按照 AstrBot WebUI 当前提供的两个官方手动安装入口，任选一种即可：
+
+### 方式一：从链接安装（推荐）
+
+进入 AstrBot WebUI 的“插件 → AstrBot 插件”，点击“安装插件”，切换到“从链接安装”，粘贴以下 GitHub 仓库链接并安装：
+
+```text
+https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health
+```
+
+通过仓库链接安装后，AstrBot 可以保留插件来源，后续更新更方便。插件正式上架 AstrBot 插件市场后，也可以直接在“插件市场”中搜索“小米运动健康”并安装。
+
+### 方式二：从文件安装
+
+从本仓库的 GitHub Releases 下载发布用 ZIP；没有单独发布包时，也可以在仓库页面选择“Code → Download ZIP”。不要解压，进入 AstrBot WebUI 的“插件 → AstrBot 插件”，点击“安装插件 → 从文件安装”，选择该 ZIP 上传。
+
+安装完成后，进入“小米运动健康 → 配置”并填写：
 
 - `user_id`：小米 Cookies 中的 `userId`
 - `pass_token`：小米 Cookies 中的 `passToken`
