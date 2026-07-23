@@ -15,7 +15,7 @@ from astrbot_plugin_mi_fitness_health.adapters.mi_fitness_cloud import (
     _rc4_crypt,
 )
 from astrbot_plugin_mi_fitness_health.models import HeartRateSample, SpO2Sample
-from astrbot_plugin_mi_fitness_health.services import AlertService, SyncService
+from astrbot_plugin_mi_fitness_health.services import AlertService, QueryService, SyncService
 from astrbot_plugin_mi_fitness_health.storage import Database
 
 
@@ -244,18 +244,134 @@ class AdapterAndAlertTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "steps unavailable"):
             asyncio.run(collect())
 
-    def test_repeated_pagination_cursor_is_rejected(self) -> None:
-        """A malformed cloud cursor cannot keep one synchronization alive forever."""
+    def test_repeated_pagination_cursor_keeps_unique_records(self) -> None:
+        """A malformed cloud cursor cannot discard an otherwise usable first page."""
+
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            calls = 0
+
+            async def _request(self, host, path, payload):
+                self.calls += 1
+                value = (
+                    '{"bedtime":1784664000,"wake_up_time":1784692800}'
+                    if self.calls == 1
+                    else {
+                        "bedtime": 1784664000,
+                        "wake_up_time": 1784692800,
+                    }
+                )
+                return {
+                    "data_list": [
+                        {
+                            "time": 1784692800,
+                            "value": value,
+                        }
+                    ],
+                    "has_more": True,
+                    "next_key": "same",
+                }
+
+        adapter = FixtureAdapter("user", "token", "cn")
+        records = asyncio.run(
+            adapter._fetch_key("sleep", datetime.now(UTC), datetime.now(UTC), "cn")
+        )
+        self.assertEqual(len(records), 1)
+
+    def test_zero_sleep_and_stress_scores_are_preserved(self) -> None:
+        """Valid zero scores must not be treated as missing by truthiness fallbacks."""
+
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region):
+                now = int(datetime.now(UTC).timestamp())
+                if key == "sleep":
+                    return [
+                        {
+                            "time": now,
+                            "value": {
+                                "bedtime": now - 8 * 60 * 60,
+                                "wake_up_time": now,
+                                "score": 0,
+                            },
+                        }
+                    ]
+                if key == "stress":
+                    return [{"time": now, "value": {"stress": 0}}]
+                return []
+
+        async def collect():
+            adapter = FixtureAdapter("user", "token", "cn")
+            now = datetime.now(UTC)
+            sleeps = [row async for row in adapter.iter_sleep(now, now)]
+            stress = [row async for row in adapter.iter_stress(now, now)]
+            return sleeps, stress
+
+        sleeps, stress = asyncio.run(collect())
+        self.assertEqual(sleeps[0].score, 0)
+        self.assertEqual(stress[0].score, 0)
+
+    def test_repeated_steps_cursor_rejects_partial_daily_total(self) -> None:
+        """A partial steps page must never overwrite a complete cached daily total."""
 
         class FixtureAdapter(MiFitnessCloudAdapter):
             async def _request(self, host, path, payload):
-                return {"data_list": [], "has_more": True, "next_key": "same"}
+                return {
+                    "data_list": [{"time": 1784692800, "value": '{"steps":12}'}],
+                    "has_more": True,
+                    "next_key": "same",
+                }
 
         adapter = FixtureAdapter("user", "token", "cn")
-        with self.assertRaisesRegex(RuntimeError, "重复"):
+        with self.assertRaisesRegex(RuntimeError, "不完整的每日汇总"):
             asyncio.run(
-                adapter._fetch_key("steps", datetime.now(UTC), datetime.now(UTC), "cn")
+                adapter._fetch_key(
+                    "steps", datetime.now(UTC), datetime.now(UTC), "cn"
+                )
             )
+
+    def test_sleep_flows_from_cloud_parser_to_conversation_snapshot(self) -> None:
+        """Sleep survives parsing, synchronization, SQLite, and natural-language query."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            query_service = QueryService(database, "user", "Asia/Shanghai")
+            wake_local = datetime.now(query_service.timezone).replace(
+                hour=7, minute=30, second=0, microsecond=0
+            ) - timedelta(days=1)
+            wake = int(wake_local.astimezone(UTC).timestamp())
+            bedtime = wake - 7 * 60 * 60 - 30 * 60
+
+            class FixtureAdapter(MiFitnessCloudAdapter):
+                def is_connected(self):
+                    return True
+
+                async def _fetch_key(self, key, start, end, region):
+                    if key != "sleep":
+                        return []
+                    return [
+                        {
+                            "time": wake,
+                            "value": json.dumps(
+                                {
+                                    "bedtime": bedtime,
+                                    "wake_up_time": wake,
+                                    "awake_duration": 20,
+                                    "sleep_score": 82,
+                                }
+                            ),
+                        }
+                    ]
+
+            adapter = FixtureAdapter("user", "token", "cn")
+            result = asyncio.run(SyncService(adapter, database, "user").sync(1))
+            self.assertEqual(result["details"]["sleep"]["fetched"], 1)
+            snapshot = asyncio.run(
+                query_service.care_snapshot("我昨天睡得怎么样")
+            )
+            self.assertIn("睡眠 430 分钟", snapshot)
+            self.assertIn("评分 82", snapshot)
+            self.assertIn(wake_local.date().isoformat(), snapshot)
+            self.assertIn("结束 07:30", snapshot)
 
     def test_sync_propagates_authentication_failure(self) -> None:
         """An expired connected session reaches the monitor pause logic."""
@@ -287,6 +403,44 @@ class AdapterAndAlertTest(unittest.TestCase):
             service = SyncService(FixtureAdapter(), database, "user")
             with self.assertRaises(MiFitnessAuthenticationError):
                 asyncio.run(service.sync(1))
+
+    def test_sync_propagates_initial_login_authentication_failure(self) -> None:
+        """An initial login rejection also reaches the monitor pause logic."""
+
+        class FixtureAdapter:
+            last_error = "凭证已失效"
+            authentication_failed = True
+
+            def is_connected(self):
+                return False
+
+            async def connect(self):
+                return False
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            service = SyncService(FixtureAdapter(), database, "user")
+            with self.assertRaises(MiFitnessAuthenticationError):
+                asyncio.run(service.sync(1))
+
+    def test_login_http_401_is_classified_as_authentication_failure(self) -> None:
+        """The account endpoint's 401 must not be downgraded to a temporary error."""
+
+        class Response:
+            status_code = 401
+
+            def raise_for_status(self):
+                raise AssertionError("401 should be classified before raise_for_status")
+
+        class Client:
+            async def get(self, *args, **kwargs):
+                return Response()
+
+        adapter = MiFitnessCloudAdapter("user", "token", "cn")
+        adapter._client = Client()
+        with self.assertRaises(MiFitnessAuthenticationError):
+            asyncio.run(adapter._login_with_token())
 
     def test_discovery_reports_every_supported_wellness_type(self) -> None:
         """Connection status includes sleep, SpO2, and stress when present."""

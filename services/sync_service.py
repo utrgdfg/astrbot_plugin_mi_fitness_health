@@ -44,7 +44,10 @@ class SyncService:
         days = max(1, min(int(days), 90))
         async with self.lock:
             if not self.adapter.is_connected() and not await self.adapter.connect():
-                raise RuntimeError(self.adapter.last_error or "小米健康云连接失败")
+                reason = self.adapter.last_error or "小米健康云连接失败"
+                if getattr(self.adapter, "authentication_failed", False):
+                    raise MiFitnessAuthenticationError(reason)
+                raise RuntimeError(reason)
             end = datetime.now(UTC)
             start = end - timedelta(days=days + 2)  # delayed uploads and corrections
             counters = {"added": 0, "updated": 0, "errors": 0}
