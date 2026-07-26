@@ -17,6 +17,11 @@ class PrivacyTest(unittest.TestCase):
             )
         )
         self.assertIs(schema["allow_health_data_to_llm"]["default"], False)
+        self.assertEqual(
+            schema["context_decision_provider_id"]["_special"], "select_provider"
+        )
+        self.assertEqual(schema["context_decision_provider_id"]["default"], "")
+        self.assertIs(schema["enable_auto_sync"]["default"], False)
 
     def test_common_xiaomi_and_provider_secrets_are_redacted(self) -> None:
         synthetic_secret = "synthetic-secret-value"

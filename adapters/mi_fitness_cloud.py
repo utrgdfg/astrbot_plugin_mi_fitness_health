@@ -555,18 +555,33 @@ class MiFitnessCloudAdapter(DataAdapter):
         return number if minimum <= number <= maximum else None
 
     @staticmethod
-    def _record_time(item: dict) -> tuple[datetime, str] | None:
-        """Return UTC collection time and cloud-zone local calendar date."""
+    def _timestamp_datetime(value: object) -> datetime | None:
+        """Convert a cloud timestamp only when it falls in a reasonable range."""
         try:
-            timestamp = int(item.get("time"))
-            offset = int(item.get("zone_offset", 0))
-        except (TypeError, ValueError):
+            timestamp = int(value)
+        except (TypeError, ValueError, OverflowError):
             return None
         if timestamp > 100_000_000_000:  # Some cloud records use milliseconds.
             timestamp //= 1000
-        if timestamp <= 0 or abs(offset) > 15 * 3600:
+        earliest = int(datetime(2000, 1, 1, tzinfo=UTC).timestamp())
+        latest = int((datetime.now(UTC) + timedelta(days=2)).timestamp())
+        if not earliest <= timestamp <= latest:
             return None
-        utc_time = datetime.fromtimestamp(timestamp, UTC)
+        try:
+            return datetime.fromtimestamp(timestamp, UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _record_time(item: dict) -> tuple[datetime, str] | None:
+        """Return UTC collection time and cloud-zone local calendar date."""
+        try:
+            offset = int(item.get("zone_offset", 0))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        utc_time = MiFitnessCloudAdapter._timestamp_datetime(item.get("time"))
+        if utc_time is None or abs(offset) > 15 * 3600:
+            return None
         return utc_time, (utc_time + timedelta(seconds=offset)).date().isoformat()
 
     async def iter_daily_activity(
@@ -760,24 +775,21 @@ class MiFitnessCloudAdapter(DataAdapter):
         """Yield validated cloud sleep sessions when the account exposes the sleep key."""
         for item in await self._fetch_key("sleep", start, end, self.region):
             value = self._value(item)
-            try:
-                begin = int(
-                    value.get("bedtime")
-                    or value.get("device_bedtime")
-                    or value.get("bed_timestamp")
-                )
-                finish = int(
-                    value.get("wake_up_time")
-                    or value.get("device_wake_up_time")
-                    or value.get("out_bed_timestamp")
-                    or item.get("time")
-                )
-            except (TypeError, ValueError):
+            begin_time = self._timestamp_datetime(
+                value.get("bedtime")
+                or value.get("device_bedtime")
+                or value.get("bed_timestamp")
+            )
+            finish_time = self._timestamp_datetime(
+                value.get("wake_up_time")
+                or value.get("device_wake_up_time")
+                or value.get("out_bed_timestamp")
+                or item.get("time")
+            )
+            if begin_time is None or finish_time is None:
                 continue
-            if begin > 100_000_000_000:
-                begin //= 1000
-            if finish > 100_000_000_000:
-                finish //= 1000
+            begin = int(begin_time.timestamp())
+            finish = int(finish_time.timestamp())
             duration = max(0, (finish - begin) // 60)
             if not 30 <= duration <= 24 * 60:
                 continue
@@ -792,8 +804,8 @@ class MiFitnessCloudAdapter(DataAdapter):
             score = self._number(score_value, 0, 100)
             yield SleepSession(
                 f"mi_fitness_sleep_{begin}",
-                datetime.fromtimestamp(begin, UTC),
-                datetime.fromtimestamp(finish, UTC),
+                begin_time,
+                finish_time,
                 duration,
                 duration - int(awake or 0),
                 int(awake or 0),
