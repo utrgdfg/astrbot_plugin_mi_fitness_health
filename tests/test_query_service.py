@@ -202,3 +202,28 @@ class QueryServiceTest(unittest.TestCase):
             self.assertEqual(len(rows), 120)
             self.assertEqual((min(values), max(values)), (51, 135))
             self.assertEqual(round(sum(values) / len(values)), 78)
+
+    def test_recent_heart_rate_snapshot_keeps_all_48_hour_samples(self) -> None:
+        """The advertised 48-hour range must not be truncated to 100 rows."""
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            service = QueryService(database, "user", "Asia/Shanghai")
+            start = datetime.now(UTC) - timedelta(hours=2)
+            samples = [51, 135] + [78] * 118
+            for index, bpm in enumerate(samples):
+                database.upsert_heart_rate(
+                    "user",
+                    HeartRateSample(
+                        f"recent-{index}",
+                        start + timedelta(seconds=index),
+                        bpm,
+                        "passive",
+                        False,
+                    ),
+                )
+
+            snapshot = asyncio.run(service.care_snapshot("最近心率"))
+            self.assertIn("最近 48 小时心率", snapshot)
+            self.assertIn("最高 135", snapshot)
+            self.assertIn("最低 51", snapshot)

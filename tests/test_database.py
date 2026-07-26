@@ -76,6 +76,12 @@ class DatabaseTest(unittest.TestCase):
             self.assertEqual(
                 database.last_alert_at("", "legacy"), "2026-01-01T00:00:00+00:00"
             )
+            with closing(sqlite3.connect(path)) as connection:
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='care_deliveries'"
+                    ).fetchone()
+                )
             database.add_alert("owner", "new", "message", "event-1")
             self.assertTrue(database.alert_event_sent("owner", "new", "event-1"))
 
@@ -248,3 +254,16 @@ class DatabaseTest(unittest.TestCase):
             self.assertGreaterEqual(database.purge_user_data("user", "owner"), 3)
             self.assertIsNone(database.private_owner_session("owner"))
             self.assertIsNone(database.latest_sync_at("user"))
+
+    def test_retention_prunes_only_the_selected_owners_alerts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            old = datetime.now(UTC) - timedelta(days=30)
+            database.add_alert("owner-a", "proactive_message", "a", created_at=old)
+            database.add_alert("owner-b", "proactive_message", "b", created_at=old)
+
+            database.prune_user_data("user", 7, UTC, "owner-a")
+
+            self.assertIsNone(database.last_alert_at("owner-a", "proactive_message"))
+            self.assertIsNotNone(database.last_alert_at("owner-b", "proactive_message"))

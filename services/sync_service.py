@@ -31,6 +31,7 @@ class SyncService:
         database: Database,
         user_id: str,
         retention_days: int = 0,
+        owner_platform_id: str = "",
     ):
         """Create a sync service.
 
@@ -39,11 +40,13 @@ class SyncService:
             database: Local persistent store.
             user_id: Single supported Xiaomi account identifier.
             retention_days: Optional local history retention; zero preserves all data.
+            owner_platform_id: AstrBot owner whose reminder audit rows may be pruned.
         """
         self.adapter = adapter
         self.database = database
         self.user_id = user_id
         self.retention_days = max(0, int(retention_days))
+        self.owner_platform_id = owner_platform_id
         self.lock = asyncio.Lock()
 
     async def initialize(self) -> None:
@@ -54,6 +57,7 @@ class SyncService:
             self.user_id,
             self.retention_days,
             getattr(self.adapter, "user_timezone", UTC),
+            self.owner_platform_id,
         )
 
     async def connect(self, *, force: bool = False) -> bool:
@@ -101,21 +105,22 @@ class SyncService:
         if not allowed_types:
             raise ValueError("没有可同步的健康数据类型")
         async with self.lock:
+            deadline = asyncio.get_running_loop().time() + SYNC_TIMEOUT_SECONDS
             try:
-                return await asyncio.wait_for(
-                    self._sync_locked(days, allowed_types),
-                    timeout=SYNC_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError as error:
+                return await self._sync_locked(days, allowed_types, deadline)
+            except TimeoutError as error:
                 raise RuntimeError(
-                    "小米健康云同步超过 5 分钟安全时限，已取消本次操作"
+                    "小米健康云读取超过 5 分钟安全时限，已停止继续下载；"
+                    "已经开始的本地数据库事务均已等待完成"
                 ) from error
 
     async def _sync_locked(
-        self, days: int, allowed_types: set[str]
+        self, days: int, allowed_types: set[str], deadline: float
     ) -> dict[str, object]:
         """Run one bounded sync while the caller owns the operation lock."""
-        if not self.adapter.is_connected() and not await self.adapter.connect():
+        if not self.adapter.is_connected() and not await self._await_cloud(
+            self.adapter.connect(), deadline
+        ):
             reason = self.adapter.last_error or "小米健康云连接失败"
             if getattr(self.adapter, "authentication_failed", False):
                 raise MiFitnessAuthenticationError(reason)
@@ -136,11 +141,9 @@ class SyncService:
             if data_type not in allowed_types:
                 continue
             try:
-                records = []
-                async for record in iterator:
-                    records.append(record)
-                    if len(records) > MAX_RECORDS_PER_DATASET:
-                        raise RuntimeError(f"{data_type} 超过单次同步记录安全上限")
+                records = await self._await_cloud(
+                    self._collect_records(iterator, data_type), deadline
+                )
                 if data_type == "daily_activity":
                     outcome = await asyncio.to_thread(
                         self.database.replace_activity_records,
@@ -181,6 +184,14 @@ class SyncService:
                     "小米健康云授权已失效",
                 )
                 raise
+            except TimeoutError:
+                await asyncio.to_thread(
+                    self.database.update_sync_failure,
+                    self.user_id,
+                    data_type,
+                    "小米健康云读取超时",
+                )
+                raise
             except Exception as error:
                 counters["errors"] += 1
                 reason = redact_error(error)
@@ -201,6 +212,7 @@ class SyncService:
             self.user_id,
             self.retention_days,
             getattr(self.adapter, "user_timezone", UTC),
+            self.owner_platform_id,
         )
         return {
             **counters,
@@ -209,3 +221,23 @@ class SyncService:
             "details": details,
             "pruned": pruned,
         }
+
+    @staticmethod
+    async def _collect_records(iterator, data_type: str) -> list[object]:
+        """Collect one cloud dataset before starting its local transaction."""
+        records = []
+        async for record in iterator:
+            records.append(record)
+            if len(records) > MAX_RECORDS_PER_DATASET:
+                raise RuntimeError(f"{data_type} 超过单次同步记录安全上限")
+        return records
+
+    @staticmethod
+    async def _await_cloud(awaitable, deadline: float):
+        """Bound cancellable cloud work without cancelling SQLite worker threads."""
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            if hasattr(awaitable, "close"):
+                awaitable.close()
+            raise TimeoutError
+        return await asyncio.wait_for(awaitable, timeout=remaining)

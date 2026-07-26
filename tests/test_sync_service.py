@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import time
 import unittest
 from datetime import UTC
 from pathlib import Path
@@ -171,3 +172,27 @@ class SyncServiceTest(unittest.TestCase):
             ):
                 with self.assertRaises(RuntimeError):
                     asyncio.run(service.sync(1, {"sleep"}))
+
+    def test_database_write_finishes_before_the_sync_lock_is_released(self) -> None:
+        """A cloud deadline must not cancel an already-running SQLite thread."""
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            service = SyncService(_RecordingAdapter(), database, "user")
+            original = database.upsert_many
+
+            def slow_write(*args):
+                time.sleep(0.05)
+                return original(*args)
+
+            with (
+                patch.object(database, "upsert_many", side_effect=slow_write),
+                patch(
+                    "astrbot_plugin_mi_fitness_health.services.sync_service.SYNC_TIMEOUT_SECONDS",
+                    0.02,
+                ),
+            ):
+                result = asyncio.run(service.sync(1, {"sleep"}))
+
+            self.assertEqual(result["details"]["sleep"]["fetched"], 0)
+            self.assertIsNotNone(database.latest_sync_at("user", ("sleep",)))

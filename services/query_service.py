@@ -202,14 +202,15 @@ class QueryService:
             # reading.  Use the same local-day boundary as the Mi Fitness app.
             heart_day = today
             heart_label = "今日"
+        now_utc = datetime.now(UTC)
         rate_query = (
             self.heart_rates_for_local_day(heart_day)
             if heart_day is not None
             else asyncio.to_thread(
-                self.database.heart_rates_since,
+                self.database.heart_rates_between,
                 self.user_id,
-                (datetime.now(UTC) - timedelta(hours=48)).isoformat(),
-                100,
+                (now_utc - timedelta(hours=48)).isoformat(),
+                now_utc.isoformat(),
             )
         )
         if target_day is not None:
@@ -310,6 +311,13 @@ class QueryService:
             stress_query,
         )
         parts = []
+        day_label = (
+            "昨日"
+            if target_day == today - timedelta(days=1)
+            else "今日"
+            if target_day == today
+            else "最近"
+        )
         if requested["activity"]:
             for activity in activities:
                 parts.append(
@@ -322,7 +330,7 @@ class QueryService:
             )
         if requested["body"] and measurement:
             parts.append(
-                f"最近体重：{measurement['weight_kg']} kg（数据采集时间 {self.display_timestamp(measurement['timestamp'])}）"
+                f"{day_label}体重：{measurement['weight_kg']} kg（数据采集时间 {self.display_timestamp(measurement['timestamp'])}）"
             )
         if requested["sleep"] and sleeps:
             values = []
@@ -341,10 +349,10 @@ class QueryService:
             )
         if requested["spo2"] and spo2:
             parts.append(
-                f"最近血氧：{spo2['percent']}%（数据采集时间 {self.display_timestamp(spo2['timestamp'])}）"
+                f"{day_label}血氧：{spo2['percent']}%（数据采集时间 {self.display_timestamp(spo2['timestamp'])}）"
             )
         if requested["stress"] and stress:
             parts.append(
-                f"最近压力分数：{stress['score']}（数据采集时间 {self.display_timestamp(stress['timestamp'])}）"
+                f"{day_label}压力分数：{stress['score']}（数据采集时间 {self.display_timestamp(stress['timestamp'])}）"
             )
         return "；".join(parts) or "暂无所查询项目的已同步云端数据"

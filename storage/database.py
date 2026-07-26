@@ -16,7 +16,7 @@ from ..models import (
     SleepSession,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class Database:
@@ -210,6 +210,17 @@ class Database:
                     CREATE UNIQUE INDEX idx_alert_event
                         ON alerts(owner_platform_id,alert_type,event_key)
                         WHERE event_key IS NOT NULL;
+                    """
+                )
+                connection.execute("UPDATE schema_version SET version = 6")
+                current = 6
+            if current < 7:
+                connection.executescript(
+                    """
+                    DROP TABLE IF EXISTS care_deliveries;
+                    DROP INDEX IF EXISTS idx_alert_created;
+                    CREATE INDEX IF NOT EXISTS idx_alert_owner_type_created
+                        ON alerts(owner_platform_id,alert_type,created_at);
                     """
                 )
                 connection.execute(
@@ -802,7 +813,7 @@ class Database:
             row = connection.execute(
                 """SELECT created_at FROM alerts
                    WHERE owner_platform_id=? AND alert_type=?
-                   ORDER BY id DESC LIMIT 1""",
+                   ORDER BY created_at DESC,id DESC LIMIT 1""",
                 (owner_platform_id, alert_type),
             ).fetchone()
         return row["created_at"] if row else None
@@ -867,9 +878,13 @@ class Database:
         return dict(row) if row else None
 
     def prune_user_data(
-        self, user_id: str, retention_days: int, user_timezone: tzinfo = UTC
+        self,
+        user_id: str,
+        retention_days: int,
+        user_timezone: tzinfo = UTC,
+        owner_platform_id: str = "",
     ) -> int:
-        """Delete health/audit rows older than an explicitly configured retention."""
+        """Prune one Xiaomi user's health rows and the selected owner's audit rows."""
         if retention_days <= 0:
             return 0
         cutoff_date_value = datetime.now(user_timezone).date() - timedelta(
@@ -882,7 +897,7 @@ class Database:
             .isoformat()
         )
         deleted = 0
-        statements = (
+        statements = [
             (
                 "DELETE FROM daily_activity WHERE user_id=? AND date<?",
                 (user_id, cutoff_date),
@@ -907,9 +922,14 @@ class Database:
                 "DELETE FROM stress_samples WHERE user_id=? AND timestamp<?",
                 (user_id, cutoff_timestamp),
             ),
-            ("DELETE FROM alerts WHERE created_at<?", (cutoff_timestamp,)),
-            ("DELETE FROM care_deliveries WHERE created_at<?", (cutoff_timestamp,)),
-        )
+        ]
+        if owner_platform_id:
+            statements.append(
+                (
+                    "DELETE FROM alerts WHERE owner_platform_id=? AND created_at<?",
+                    (owner_platform_id, cutoff_timestamp),
+                )
+            )
         with self._connect() as connection:
             for statement, values in statements:
                 deleted += max(0, connection.execute(statement, values).rowcount)
@@ -947,9 +967,6 @@ class Database:
                     "DELETE FROM alerts WHERE owner_platform_id=?",
                     (owner_platform_id,),
                 ).rowcount,
-            )
-            deleted += max(
-                0, connection.execute("DELETE FROM care_deliveries").rowcount
             )
             for table in ("sync_state", "sync_failures"):
                 deleted += max(

@@ -184,6 +184,30 @@ class AdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "steps unavailable"):
             asyncio.run(collect())
 
+    def test_daily_activity_ignores_calorie_only_day_when_steps_are_empty(
+        self,
+    ) -> None:
+        """An optional calorie row cannot create a destructive zero-step day."""
+
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region):
+                if key == "steps":
+                    return []
+                return [
+                    {"time": 1743467400, "zone_offset": 0, "value": '{"calories":7}'}
+                ]
+
+        async def collect():
+            adapter = FixtureAdapter("user", "token", "cn")
+            return [
+                record
+                async for record in adapter.iter_daily_activity(
+                    datetime.now(UTC), datetime.now(UTC)
+                )
+            ]
+
+        self.assertEqual(asyncio.run(collect()), [])
+
     def test_repeated_pagination_cursor_keeps_unique_records(self) -> None:
         """A malformed cloud cursor cannot discard an otherwise usable first page."""
 

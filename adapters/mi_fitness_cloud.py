@@ -598,8 +598,14 @@ class MiFitnessCloudAdapter(DataAdapter):
                     steps = self._number(value.get("steps"), 0, 200_000)
                     distance = self._number(value.get("distance"), 0, 500_000)
                     calories = self._number(value.get("calories"), 0, 50_000)
+                    # A calorie-only or malformed row from the required steps
+                    # endpoint is not a complete daily activity sample.  In
+                    # particular, it must never replace a cached non-zero step
+                    # total with an invented zero.
+                    if steps is None:
+                        continue
                     bucket = step_buckets[bucket_key]
-                    bucket["steps"] = max(bucket["steps"], steps or 0)
+                    bucket["steps"] = max(bucket["steps"], steps)
                     bucket["distance_m"] = max(bucket["distance_m"], distance or 0)
                     bucket["active_kcal"] = max(bucket["active_kcal"], calories or 0)
                 else:
@@ -619,7 +625,10 @@ class MiFitnessCloudAdapter(DataAdapter):
         for (date, _minute), calories in calorie_buckets.items():
             calorie_totals[date] += calories
         for date, calories in calorie_totals.items():
-            totals[date]["active_kcal"] = calories
+            # The optional calorie key may refine a complete steps day, but it
+            # cannot establish an activity day by itself.
+            if date in totals:
+                totals[date]["active_kcal"] = calories
         for date, values in sorted(totals.items()):
             yield DailyActivity(
                 date,

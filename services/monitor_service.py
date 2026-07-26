@@ -130,7 +130,12 @@ class HealthMonitorService:
             last_seen = last_seen if last_seen.tzinfo else last_seen.replace(tzinfo=UTC)
         except (KeyError, TypeError, ValueError):
             return None
-        if now_utc - last_seen > timedelta(minutes=self.activity_window_minutes):
+        activity_age = now_utc - last_seen
+        if (
+            not timedelta(0)
+            <= activity_age
+            <= timedelta(minutes=self.activity_window_minutes)
+        ):
             return None
         last_alert = await asyncio.to_thread(
             self.database.last_alert_at,
