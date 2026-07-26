@@ -38,6 +38,48 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(MiFitnessCloudAdapter._value(item)["bpm"], 72)
         self.assertIsNotNone(MiFitnessCloudAdapter._record_time(item))
 
+    def test_extreme_cloud_timestamps_are_safely_rejected(self) -> None:
+        unreasonable_future = int((datetime.now(UTC) + timedelta(days=365)).timestamp())
+        for value in (-1, 10**100, unreasonable_future, "not-a-timestamp"):
+            with self.subTest(value=value):
+                self.assertIsNone(
+                    MiFitnessCloudAdapter._record_time(
+                        {"time": value, "zone_offset": 0}
+                    )
+                )
+
+    def test_malformed_sleep_timestamps_skip_only_bad_records(self) -> None:
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region):
+                now = int(datetime.now(UTC).timestamp())
+                return [
+                    {
+                        "time": now,
+                        "value": {"bedtime": -1, "wake_up_time": now},
+                    },
+                    {
+                        "time": now,
+                        "value": {"bedtime": 10**100, "wake_up_time": now},
+                    },
+                    {
+                        "time": now,
+                        "value": {
+                            "bedtime": now - 8 * 60 * 60,
+                            "wake_up_time": now,
+                            "score": 88,
+                        },
+                    },
+                ]
+
+        async def collect():
+            adapter = FixtureAdapter("user", "token", "cn")
+            now = datetime.now(UTC)
+            return [row async for row in adapter.iter_sleep(now, now)]
+
+        records = asyncio.run(collect())
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].score, 88)
+
     def test_resting_heart_rate_fallback_is_queryable(self) -> None:
         """Resting-heart-rate data remains available when the sampled key is empty."""
 

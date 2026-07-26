@@ -83,8 +83,8 @@
   },
   "enable_proactive_health_monitor": {
     "type": "bool",
-    "description": "开启后台生活数据同步与主动关心",
-    "hint": "开启后定期更新小米云数据，并只在合适的日常时机私聊关心。还需要开启“允许聊天模型接收生活数据摘要”。",
+    "description": "开启主动关心检查",
+    "hint": "开启后定期检查已有的本地数据与近期私聊活动，只在合适的日常时机私聊关心；此项不会定期读取小米云。还需要开启“允许聊天模型接收生活数据摘要”。",
     "default": true
   },
   "proactive_reminder_provider_id": {
@@ -103,8 +103,8 @@
   },
   "health_check_interval_minutes": {
     "type": "int",
-    "description": "后台更新间隔（分钟）",
-    "hint": "默认每 30 分钟更新一次。设置太短会增加小米云请求次数。",
+    "description": "主动关心检查间隔（分钟）",
+    "hint": "默认每 30 分钟检查一次本地数据与近期私聊活动，不会因此读取小米云。",
     "default": 30
   },
   "enable_late_night_activity_check": {
@@ -147,7 +147,7 @@
     "type": "bool",
     "description": "开启普通自动同步",
     "hint": "开启后，插件会定期从小米云更新本地数据。",
-    "default": true
+    "default": false
   },
   "sync_interval_minutes": {
     "type": "int",

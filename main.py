@@ -96,7 +96,7 @@ class MiFitnessHealthPlugin(Star):
             self.data_retention_days,
             self.owner_platform_id,
         )
-        self.auto_sync_enabled = bool(config.get("enable_auto_sync", True))
+        self.auto_sync_enabled = bool(config.get("enable_auto_sync", False))
         self.care_dialogue_enabled = bool(config.get("enable_care_dialogue", True))
         self.allow_health_data_to_llm = bool(
             config.get("allow_health_data_to_llm", False)
@@ -144,34 +144,29 @@ class MiFitnessHealthPlugin(Star):
         self._pending_refresh_types: set[str] = set()
         self._active_refresh_types: set[str] = set()
         self._auto_sync_paused = False
+        self._context_decision_failures = 0
+        self._context_decision_retry_at: datetime | None = None
 
     async def initialize(self) -> None:
-        """Migrate the database and schedule one guarded background loop."""
+        """Migrate the database and schedule the configured background loops."""
         await self.sync_service.initialize()
         self._ensure_background_task()
 
     def _ensure_background_task(self) -> None:
-        """Start one eligible background loop, including after a recovered failure."""
-        if self._auto_sync_paused:
-            return
+        """Start each eligible background loop without creating duplicates."""
         monitor_ready = (
             self.proactive_monitor_enabled
             and self.allow_health_data_to_llm
             and self.owner_platform_id
             and self.owner_platform_instance_id
-            and self.user_id
-            and self.pass_token
         )
         if monitor_ready and (self._monitor_task is None or self._monitor_task.done()):
             self._monitor_task = asyncio.create_task(
                 self._health_monitor_loop(), name=f"{self.name}-health-monitor"
             )
-        if monitor_ready:
-            # The monitor loop already performs periodic cloud sync. Returning
-            # here prevents repeated commands from starting a second loop.
-            return
         if (
-            self.auto_sync_enabled
+            not self._auto_sync_paused
+            and self.auto_sync_enabled
             and self.user_id
             and self.pass_token
             and (self._auto_task is None or self._auto_task.done())
@@ -438,9 +433,9 @@ class MiFitnessHealthPlugin(Star):
             return None
 
     async def _health_monitor_loop(self) -> None:
-        """Refresh and evaluate private findings at the configured bounded interval."""
+        """Evaluate cached private findings at the configured bounded interval."""
         failures = 0
-        while not self._auto_sync_paused:
+        while True:
             try:
                 state = await asyncio.to_thread(
                     self.database.private_owner_session, self.owner_platform_id
@@ -449,9 +444,6 @@ class MiFitnessHealthPlugin(Star):
                     failures = 0
                     await asyncio.sleep(self.monitor_interval * 60)
                     continue
-                # Monitoring only needs a short recent range; SyncService adds
-                # its normal 48-hour overlap for delayed Xiaomi uploads.
-                await self._sync(days=1)
                 messages: list[str] = []
                 late_finding = await self.monitor_service.evaluate_late_activity()
                 if late_finding:
@@ -468,13 +460,6 @@ class MiFitnessHealthPlugin(Star):
                 failures = 0
             except asyncio.CancelledError:
                 raise
-            except MiFitnessAuthenticationError as error:
-                logger.warning(
-                    "Mi Fitness health monitor paused for reauthorization: %s",
-                    redact_error(error),
-                )
-                self._auto_sync_paused = True
-                break
             except Exception as error:
                 failures += 1
                 reason = redact_error(error)
@@ -681,6 +666,25 @@ class MiFitnessHealthPlugin(Star):
             return True, self._care_focus(message)
         return False, ""
 
+    def _context_decision_is_backing_off(self) -> bool:
+        """Return whether recent classifier failures should bypass the provider."""
+        retry_at = getattr(self, "_context_decision_retry_at", None)
+        return bool(retry_at and datetime.now(UTC) < retry_at)
+
+    def _record_context_decision_failure(self) -> None:
+        """Apply bounded 1/5/15-minute backoff after classifier failures."""
+        failures = getattr(self, "_context_decision_failures", 0) + 1
+        delay_seconds = (60, 300, 900)[min(failures - 1, 2)]
+        self._context_decision_failures = failures
+        self._context_decision_retry_at = datetime.now(UTC) + timedelta(
+            seconds=delay_seconds
+        )
+
+    def _reset_context_decision_backoff(self) -> None:
+        """Make the classifier immediately available after one valid response."""
+        self._context_decision_failures = 0
+        self._context_decision_retry_at = None
+
     async def _decide_context_focus(
         self, session: str, message: str
     ) -> tuple[bool, str]:
@@ -690,6 +694,8 @@ class MiFitnessHealthPlugin(Star):
             return fallback
         provider_id = getattr(self, "context_decision_provider_id", "")
         if not provider_id:
+            return fallback
+        if self._context_decision_is_backing_off():
             return fallback
         escaped_message = html.escape(self._sanitize_focus(message), quote=True)
         prompt = (
@@ -729,12 +735,15 @@ class MiFitnessHealthPlugin(Star):
                 getattr(response, "completion_text", None)
             )
             if decision is not None:
+                self._reset_context_decision_backoff()
                 return decision
+            self._record_context_decision_failure()
             logger.warning(
                 "Mi Fitness context decision model returned an invalid response; "
                 "using local cues"
             )
         except Exception as error:
+            self._record_context_decision_failure()
             logger.warning(
                 "Mi Fitness context decision model failed; using local cues: %s",
                 redact_error(error),
@@ -780,7 +789,12 @@ class MiFitnessHealthPlugin(Star):
         return refreshed
 
     async def _refresh_for_natural_question(
-        self, text: str, *, wait_for_result: bool
+        self,
+        text: str,
+        *,
+        wait_for_result: bool,
+        force_refresh: bool = False,
+        wait_timeout: float = 5.0,
     ) -> bool:
         """Refresh stale cloud cache before an owner asks a health question.
 
@@ -790,7 +804,7 @@ class MiFitnessHealthPlugin(Star):
         """
         data_types = set(self.query_service.sync_types_for_focus(text))
         last_sync = await self.query_service.latest_sync_at(tuple(sorted(data_types)))
-        force_refresh = self._wants_fresh_cloud_data(text)
+        force_refresh = force_refresh or self._wants_fresh_cloud_data(text)
         if last_sync and not force_refresh:
             try:
                 parsed = datetime.fromisoformat(last_sync)
@@ -829,7 +843,7 @@ class MiFitnessHealthPlugin(Star):
             return False
         try:
             return await asyncio.wait_for(
-                asyncio.shield(self._natural_refresh_task), timeout=20
+                asyncio.shield(self._natural_refresh_task), timeout=wait_timeout
             )
         except asyncio.TimeoutError:
             logger.warning(
@@ -860,7 +874,13 @@ class MiFitnessHealthPlugin(Star):
         if denial_reason:
             return denial_reason
         focus = self._sanitize_focus(focus)
-        await self._refresh_for_natural_question(focus, wait_for_result=True)
+        original_message = self._sanitize_focus(event.get_message_str())
+        await self._refresh_for_natural_question(
+            focus,
+            wait_for_result=True,
+            force_refresh=self._wants_fresh_cloud_data(original_message),
+            wait_timeout=5.0,
+        )
         snapshot = await self.query_service.care_snapshot(focus)
         last_sync = await self.query_service.sync_at_for_focus(focus)
         dialogue = await self._compose_health_dialogue(
@@ -896,7 +916,12 @@ class MiFitnessHealthPlugin(Star):
         if not use_data:
             return
         health_question = self._is_health_question(question)
-        await self._refresh_for_natural_question(focus, wait_for_result=False)
+        await self._refresh_for_natural_question(
+            focus,
+            wait_for_result=True,
+            force_refresh=self._wants_fresh_cloud_data(question),
+            wait_timeout=5.0,
+        )
         snapshot = await self.query_service.care_snapshot(focus)
         last_sync = await self.query_service.sync_at_for_focus(focus)
         instruction = (
@@ -927,13 +952,17 @@ class MiFitnessHealthPlugin(Star):
     @filter.command("健康帮助")
     async def health_help(self, event: AstrMessageEvent):
         """Show commands and privacy boundaries."""
+        async for result in self._guard(event):
+            yield result
+            return
         yield event.plain_result(
             "小米运动健康（仅所有者可用）\n"
             "健康连接｜健康同步｜健康状态｜今日健康｜心率记录 [小时]｜身体数据｜健康趋势 [天]\n"
             "平时只需正常聊天；出现作息、疲劳、运动或早晚问候等线索时，插件会在后台准备相关生活数据，让机器人按当前人格自然回应。\n"
             f"生活数据调用判断：{'使用已选模型' if self.context_decision_provider_id else '使用本地规则'}。\n"
             "直接查询和以上命令主要用于核对数据或排查连接问题。\n"
-            f"后台生活数据同步：{'每 ' + str(self.monitor_interval) + ' 分钟' if self.proactive_monitor_enabled else '关闭'}；只在自然时机且冷却结束时私聊一次。\n"
+            f"主动关心检查：{'每 ' + str(self.monitor_interval) + ' 分钟检查本地状态' if self.proactive_monitor_enabled else '关闭'}；只在自然时机且冷却结束时私聊一次。\n"
+            f"普通自动同步：{'每 ' + str(self.sync_interval) + ' 分钟读取小米云' if self.auto_sync_enabled else '关闭（使用对话按需同步）'}。\n"
             f"对话生活数据授权：{'已开启' if self.allow_health_data_to_llm else '未开启（仅命令查询）'}。\n"
             "数据用于让日常对话更贴近你；它不是实时监护，也不用于医疗诊断。"
         )
@@ -1066,24 +1095,14 @@ class MiFitnessHealthPlugin(Star):
         )
         monitor_running = bool(self._monitor_task and not self._monitor_task.done())
         auto_running = bool(self._auto_task and not self._auto_task.done())
-        if self._auto_sync_paused:
-            background_status = "已暂停（请检查授权）"
-        elif monitor_running:
-            background_status = f"后台生活数据同步（每 {self.monitor_interval} 分钟）"
-        elif auto_running:
+        if auto_running:
             background_status = f"自动同步（每 {self.sync_interval} 分钟）"
+        elif self._auto_sync_paused:
+            background_status = "已暂停（请检查授权）"
         elif not self.user_id or not self.pass_token:
             background_status = "未运行（缺少小米凭证）"
-        elif not self.owner_platform_id or not self.owner_platform_instance_id:
-            background_status = "未运行（所有者身份未完整配置）"
-        elif (
-            self.auto_sync_enabled
-            and self.proactive_monitor_enabled
-            and not self.allow_health_data_to_llm
-        ):
-            background_status = "普通自动同步（模型数据授权未开启）"
-        elif self.proactive_monitor_enabled and not self.allow_health_data_to_llm:
-            background_status = "未运行（模型数据授权未开启，自动同步已关闭）"
+        elif not self.auto_sync_enabled:
+            background_status = "未开启（按需同步）"
         else:
             background_status = "未运行"
         yield event.plain_result(
@@ -1091,7 +1110,8 @@ class MiFitnessHealthPlugin(Star):
             f"区域：{self.adapter.region or '自动探测'}\n最近同步完成时间：{self.query_service.display_timestamp(last_sync) if last_sync else '暂无'}\n"
             f"平台实例校验：{'已启用' if self.owner_platform_instance_id else '未配置（健康功能禁用）'}\n"
             f"后台同步：{background_status}\n"
-            f"主动关心任务：{'运行中' if monitor_running else '未运行'}\n"
+            f"主动关心检查：{'运行中' if monitor_running else '未运行'}"
+            f"（每 {self.monitor_interval} 分钟，仅检查本地数据）\n"
             f"主动私聊目标：{'已记录' if private_state else '待所有者先私聊一次'}\n"
             f"对话触发的数据刷新间隔：{self.natural_query_sync_minutes} 分钟\n"
             f"生活数据调用判断：{'已选模型' if self.context_decision_provider_id else '内置规则'}\n"
@@ -1116,8 +1136,8 @@ class MiFitnessHealthPlugin(Star):
             return
         if self.auto_sync_enabled or self.proactive_monitor_enabled:
             yield event.plain_result(
-                "为避免清除后立即重新同步，请先在插件配置中关闭"
-                "“自动同步”和“后台生活数据同步与主动关心”，重载插件后再执行清除。"
+                "为避免清除后立即重新产生本地记录，请先在插件配置中关闭"
+                "“普通自动同步”和“主动关心检查”，重载插件后再执行清除。"
             )
             return
         if self._natural_refresh_task and not self._natural_refresh_task.done():
