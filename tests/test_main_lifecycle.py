@@ -487,6 +487,49 @@ class MainLifecycleTest(unittest.TestCase):
         self.assertTrue(still_running)
         self.assertTrue(completed)
 
+    def test_natural_refresh_logs_one_start_and_success_per_batch(self) -> None:
+        plugin = self._bare_plugin()
+        plugin._pending_refresh_types = {"sleep", "heart_rate"}
+        plugin._active_refresh_types = set()
+        plugin._sync = AsyncMock(return_value={"errors": 0})
+
+        with patch("astrbot_plugin_mi_fitness_health.main.logger") as log:
+            refreshed = asyncio.run(plugin._natural_refresh_worker())
+
+        self.assertTrue(refreshed)
+        plugin._sync.assert_awaited_once_with(data_types={"sleep", "heart_rate"})
+        self.assertEqual(log.info.call_count, 2)
+        start_message = log.info.call_args_list[0].args
+        success_message = log.info.call_args_list[1].args
+        self.assertIn("正在拉取小米云数据", start_message[0])
+        self.assertEqual(start_message[1], "心率、睡眠")
+        self.assertIn("拉取成功", success_message[0])
+        self.assertEqual(success_message[1], "心率、睡眠")
+        log.warning.assert_not_called()
+
+    def test_natural_refresh_logs_partial_completion_without_health_values(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        plugin._pending_refresh_types = {"sleep"}
+        plugin._active_refresh_types = set()
+        plugin._sync = AsyncMock(
+            return_value={
+                "errors": 1,
+                "details": {"sleep": {"error": "synthetic"}},
+            }
+        )
+
+        with patch("astrbot_plugin_mi_fitness_health.main.logger") as log:
+            refreshed = asyncio.run(plugin._natural_refresh_worker())
+
+        self.assertTrue(refreshed)
+        self.assertEqual(log.info.call_count, 1)
+        warning = log.warning.call_args.args
+        self.assertIn("部分完成", warning[0])
+        self.assertEqual(warning[1], "睡眠")
+        self.assertNotIn("synthetic", str(warning))
+
     def test_original_just_synced_intent_forces_model_selected_refresh(self) -> None:
         plugin = self._bare_plugin()
         plugin.care_dialogue_enabled = True

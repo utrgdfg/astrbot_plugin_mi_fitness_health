@@ -66,6 +66,14 @@ class MiFitnessHealthPlugin(Star):
         "recent": "最近",
         "none": "",
     }
+    _SYNC_TYPE_LOG_LABELS = {
+        "daily_activity": "活动",
+        "heart_rate": "心率",
+        "body_measurements": "身体数据",
+        "sleep": "睡眠",
+        "spo2": "血氧",
+        "stress": "压力",
+    }
 
     def __init__(self, context: Context, config: AstrBotConfig):
         """Configure one Xiaomi account and one AstrBot data owner.
@@ -962,14 +970,35 @@ class MiFitnessHealthPlugin(Star):
             data_types = set(self._pending_refresh_types)
             self._pending_refresh_types.difference_update(data_types)
             self._active_refresh_types.update(data_types)
+            data_label = "、".join(
+                label
+                for data_type, label in self._SYNC_TYPE_LOG_LABELS.items()
+                if data_type in data_types
+            )
+            logger.info(
+                "[小米运动健康] 对话需要最新生活数据，正在拉取小米云数据（%s）",
+                data_label or "相关数据",
+            )
             try:
-                await self._sync(data_types=data_types)
+                summary = await self._sync(data_types=data_types)
                 refreshed = True
+                if int(summary.get("errors") or 0):
+                    logger.warning(
+                        "[小米运动健康] 小米云数据拉取部分完成，"
+                        "部分数据类别暂时失败（%s）",
+                        data_label or "相关数据",
+                    )
+                else:
+                    logger.info(
+                        "[小米运动健康] 小米云数据拉取成功（%s）",
+                        data_label or "相关数据",
+                    )
             except MiFitnessAuthenticationError as error:
                 self._auto_sync_paused = True
                 self._pending_refresh_types.clear()
                 logger.warning(
-                    "Mi Fitness natural-query refresh paused for reauthorization: %s",
+                    "[小米运动健康] 对话拉取小米云数据失败，"
+                    "账号授权已失效并暂停自动重试：%s",
                     redact_error(error),
                 )
                 return refreshed
@@ -977,7 +1006,8 @@ class MiFitnessHealthPlugin(Star):
                 # A temporary failure in one batch must not discard a
                 # different category queued while that batch was running.
                 logger.warning(
-                    "Mi Fitness natural-query refresh failed: %s",
+                    "[小米运动健康] 对话拉取小米云数据失败，"
+                    "当前回复将继续使用本地缓存：%s",
                     redact_error(error),
                 )
             finally:
@@ -1042,9 +1072,8 @@ class MiFitnessHealthPlugin(Star):
                 asyncio.shield(self._natural_refresh_task), timeout=wait_timeout
             )
         except asyncio.TimeoutError:
-            logger.warning(
-                "Mi Fitness natural-query refresh timed out; using local cache"
-            )
+            # The worker already emits one start line and one terminal line for
+            # the coalesced batch. Avoid one timeout line per waiting request.
             return False
 
     @filter.llm_tool(name="query_mi_fitness_health")
