@@ -17,13 +17,13 @@
   "region": {
     "type": "string",
     "description": "小米健康云区域",
-    "hint": "常用值 cn、ru、de、i2、sg、us；留空时按最近 30 天数据探测。",
+    "hint": "常用值 cn、ru、de、i2、sg、us；留空时按最近 30 天的多类数据探测。若账号近期没有任何记录，必须手动选择。",
     "default": ""
   },
   "user_timezone": {
     "type": "string",
     "description": "用户时区",
-    "hint": "用于“今日”和趋势的日期边界，例如 Asia/Shanghai。云端 zone_offset 仍会用于数据原始日期。",
+    "hint": "用于“今日”、活动汇总和趋势的统一日期边界，例如 Asia/Shanghai。",
     "default": "Asia/Shanghai"
   },
   "sync_interval_minutes": {"type": "int", "description": "自动同步间隔（分钟）", "default": 60},
@@ -32,10 +32,17 @@
   "owner_platform_instance_id": {"type": "string", "description": "所有者平台实例 ID", "hint": "必填。由所有者私聊机器人发送 /sid，复制其中的 Bot ID；它与 UID 一起严格校验，避免跨平台同号越权。可直接粘贴 Bot ID: [示例 Bot 名称] 这类结果，插件会去除标签和成对括号。", "obvious_hint": true, "default": ""},
   "enable_auto_sync": {"type": "bool", "description": "启用自动同步", "default": true},
   "enable_care_dialogue": {"type": "bool", "description": "允许在普通对话中调用生活数据", "hint": "仅对 owner_platform_id 的私聊生效；Bot 可在自然聊天中静默读取所需数据，让回复更贴近用户近况。", "default": true},
+  "allow_health_data_to_llm": {
+    "type": "bool",
+    "description": "允许模型处理健康数据（敏感授权）",
+    "hint": "默认关闭。开启后，当前私聊模型会收到回答所需的最小健康摘要；选择专用关心模型时，该模型和当前会话模型都可能处理数据。第三方模型提供商可能按其政策处理或留存这些内容，请只在理解风险并信任提供商时开启。",
+    "obvious_hint": true,
+    "default": false
+  },
   "health_dialogue_provider_id": {"type": "string", "description": "关心对话模型（可选）", "hint": "直接从已配置的聊天模型中选择。睡眠、心率等日常关心对话会先由该模型生成一段生活化回复草稿；不选择则完全沿用当前会话的模型流程。该模型会收到已同步的个人生活数据。", "_special": "select_provider", "default": ""},
   "health_dialogue_persona_id": {"type": "string", "description": "关心对话人格（可选）", "hint": "直接从 AstrBot 已配置人格中选择；不选择时使用当前私聊的人格。", "_special": "select_persona", "default": ""},
   "natural_query_sync_minutes": {"type": "int", "description": "自然语言查询的最短刷新间隔（分钟）", "hint": "例如直接问“我昨天睡得怎么样”时，缓存超过这个时间会自动向小米云刷新；小米手机端仍需先完成云同步。", "default": 15},
-  "enable_proactive_health_monitor": {"type": "bool", "description": "启用后台生活数据同步与主动关心", "hint": "后台按间隔刷新小米云，为对话准备生活数据；仅在深夜仍有私聊活动等自然时机，才可能由 Bot 主动说一句关心。不会做体征异常检测。", "default": true},
+  "enable_proactive_health_monitor": {"type": "bool", "description": "启用后台生活数据同步与主动关心", "hint": "还需开启“允许模型处理健康数据”。后台按间隔刷新小米云，为对话准备生活数据；仅在深夜仍有私聊活动等自然时机，才可能由 Bot 主动说一句关心。不会做体征异常检测。", "default": true},
   "proactive_reminder_provider_id": {"type": "string", "description": "主动关心模型（可选）", "hint": "直接从已配置的聊天模型中选择。后台出现自然关心时机后由该模型措辞；不选择时使用所有者私聊当前选用的模型。", "_special": "select_provider", "default": ""},
   "proactive_reminder_persona_id": {"type": "string", "description": "主动关心人格（可选）", "hint": "直接从 AstrBot 已配置人格中选择；不选择时使用所有者私聊当前人格。", "_special": "select_persona", "default": ""},
   "health_check_interval_minutes": {"type": "int", "description": "后台同步间隔（分钟）", "hint": "默认每 30 分钟。过短会增加小米云请求量，最小按 5 分钟处理。", "default": 30},
@@ -45,5 +52,6 @@
   "late_night_start": {"type": "string", "description": "深夜检查开始时间", "hint": "按 user_timezone 的 24 小时制，例如 00:30。", "default": "00:30"},
   "late_night_end": {"type": "string", "description": "深夜检查结束时间", "hint": "按 user_timezone 的 24 小时制，例如 06:00。", "default": "06:00"},
   "late_night_activity_window_minutes": {"type": "int", "description": "判定最近仍活跃的窗口（分钟）", "hint": "只有在这段时间内所有者确实发过私聊消息，才可能触发深夜提示。", "default": 45},
-  "database_path": {"type": "string", "description": "数据库路径（可选）", "hint": "留空时使用 AstrBot 插件数据目录。", "default": ""}
+  "data_retention_days": {"type": "int", "description": "本地健康数据保留天数", "hint": "默认 90 天，最小按 7 天处理；设为 0 可关闭自动清理。SQLite/WAL 不提供内容加密，请同时保护 AstrBot 数据目录或使用磁盘加密。", "default": 90},
+  "database_path": {"type": "string", "description": "数据库路径（可选）", "hint": "留空时使用 AstrBot 插件数据目录。自定义路径应仅允许 AstrBot 运行账户访问。", "default": ""}
 }

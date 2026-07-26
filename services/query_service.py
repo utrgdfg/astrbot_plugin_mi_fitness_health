@@ -13,6 +13,15 @@ from ..utils import local_timestamp
 class QueryService:
     """Read cached cloud records without blocking AstrBot's event loop."""
 
+    CATEGORY_SYNC_TYPES = {
+        "activity": "daily_activity",
+        "heart": "heart_rate",
+        "body": "body_measurements",
+        "sleep": "sleep",
+        "spo2": "spo2",
+        "stress": "stress",
+    }
+
     def __init__(self, database: Database, user_id: str, timezone_name: str):
         """Create a query service using a user-local timezone.
 
@@ -111,16 +120,23 @@ class QueryService:
             row["avg_heart_rate"] = sum(values) / len(values) if values else None
         return activities
 
-    async def latest_sync_at(self) -> str | None:
-        """Return latest synchronization marker."""
-        return await asyncio.to_thread(self.database.latest_sync_at)
+    async def latest_sync_at(
+        self, data_types: tuple[str, ...] | None = None
+    ) -> str | None:
+        """Return global latest sync or freshness shared by required datasets."""
+        return await asyncio.to_thread(
+            self.database.latest_sync_at, self.user_id, data_types
+        )
 
-    def display_timestamp(self, value: object) -> str:
-        """Format one stored timestamp in the configured user timezone."""
-        return local_timestamp(value, self.timezone)
+    async def latest_failure_at(self, data_types: tuple[str, ...]) -> str | None:
+        """Return the newest unresolved failure for natural-query backoff."""
+        return await asyncio.to_thread(
+            self.database.latest_sync_failure_at, self.user_id, data_types
+        )
 
-    async def care_snapshot(self, focus: str = "") -> str:
-        """Return only health categories relevant to an owner conversation."""
+    @staticmethod
+    def requested_categories(focus: str) -> tuple[dict[str, bool], bool]:
+        """Map natural wording to the smallest required health categories."""
         compact = focus.lower().replace(" ", "")
         requested = {
             "activity": any(
@@ -148,43 +164,160 @@ class QueryService:
         explicitly_requested = any(requested.values())
         if not explicitly_requested:
             requested = {key: True for key in requested}
+        return requested, explicitly_requested
+
+    def sync_types_for_focus(self, focus: str) -> tuple[str, ...]:
+        """Return storage sync keys needed to answer one natural-language focus."""
+        requested, _ = self.requested_categories(focus)
+        return tuple(
+            self.CATEGORY_SYNC_TYPES[key]
+            for key, enabled in requested.items()
+            if enabled
+        )
+
+    async def sync_at_for_focus(self, focus: str) -> str | None:
+        """Return the oldest valid success among every dataset required by focus."""
+        return await self.latest_sync_at(self.sync_types_for_focus(focus))
+
+    def display_timestamp(self, value: object) -> str:
+        """Format one stored timestamp in the configured user timezone."""
+        return local_timestamp(value, self.timezone)
+
+    async def care_snapshot(self, focus: str = "") -> str:
+        """Return only health categories relevant to an owner conversation."""
+        compact = focus.lower().replace(" ", "")
+        requested, explicitly_requested = self.requested_categories(focus)
         today = datetime.now(self.timezone).date()
         if "昨天" in compact or "昨日" in compact:
-            heart_day = today - timedelta(days=1)
+            target_day = today - timedelta(days=1)
+            heart_day = target_day
             heart_label = "昨日"
         elif "最近" in compact or "近" in compact or "这两天" in compact:
+            target_day = None
             heart_day = None
             heart_label = "最近 48 小时"
         else:
+            target_day = today if "今天" in compact or "今日" in compact else None
             # Questions such as “我心率怎么样” generally mean today's
             # reading.  Use the same local-day boundary as the Mi Fitness app.
             heart_day = today
             heart_label = "今日"
+        now_utc = datetime.now(UTC)
         rate_query = (
             self.heart_rates_for_local_day(heart_day)
             if heart_day is not None
             else asyncio.to_thread(
-                self.database.heart_rates_since,
+                self.database.heart_rates_between,
                 self.user_id,
-                (datetime.now(UTC) - timedelta(hours=48)).isoformat(),
-                100,
+                (now_utc - timedelta(hours=48)).isoformat(),
+                now_utc.isoformat(),
             )
         )
-        activities, rates, measurement, sleeps, spo2, stress = await asyncio.gather(
-            asyncio.to_thread(
-                self.database.recent_activity, self.user_id, self.today()
-            ),
-            rate_query,
-            asyncio.to_thread(self.database.latest_measurement, self.user_id),
-            asyncio.to_thread(self.database.recent_sleep, self.user_id),
-            asyncio.to_thread(
+        if target_day is not None:
+            target_start, target_end = self.local_day_bounds(target_day)
+            activity_query = asyncio.to_thread(
+                self.database.recent_activity_between,
+                self.user_id,
+                target_day.isoformat(),
+                target_day.isoformat(),
+                1,
+            )
+            measurement_query = asyncio.to_thread(
+                self.database.latest_measurement_between,
+                self.user_id,
+                target_start,
+                target_end,
+            )
+            sleep_query = asyncio.to_thread(
+                self.database.sleep_ending_between,
+                self.user_id,
+                target_start,
+                target_end,
+            )
+            spo2_query = asyncio.to_thread(
+                self.database.latest_metric_between,
+                "spo2_samples",
+                self.user_id,
+                target_start,
+                target_end,
+            )
+            stress_query = asyncio.to_thread(
+                self.database.latest_metric_between,
+                "stress_samples",
+                self.user_id,
+                target_start,
+                target_end,
+            )
+        elif "最近" in compact or "近" in compact or "这两天" in compact:
+            recent_start = (datetime.now(UTC) - timedelta(days=7)).isoformat()
+            recent_end = datetime.now(UTC).isoformat()
+            activity_query = asyncio.to_thread(
+                self.database.recent_activity_between,
+                self.user_id,
+                (today - timedelta(days=6)).isoformat(),
+                today.isoformat(),
+                7,
+            )
+            measurement_query = asyncio.to_thread(
+                self.database.latest_measurement_between,
+                self.user_id,
+                recent_start,
+                recent_end,
+            )
+            sleep_query = asyncio.to_thread(
+                self.database.sleep_ending_between,
+                self.user_id,
+                recent_start,
+                recent_end,
+            )
+            spo2_query = asyncio.to_thread(
+                self.database.latest_metric_between,
+                "spo2_samples",
+                self.user_id,
+                recent_start,
+                recent_end,
+            )
+            stress_query = asyncio.to_thread(
+                self.database.latest_metric_between,
+                "stress_samples",
+                self.user_id,
+                recent_start,
+                recent_end,
+            )
+        else:
+            activity_query = asyncio.to_thread(
+                self.database.recent_activity_between,
+                self.user_id,
+                (today - timedelta(days=6)).isoformat(),
+                today.isoformat(),
+                2,
+            )
+            measurement_query = asyncio.to_thread(
+                self.database.latest_measurement, self.user_id
+            )
+            sleep_query = asyncio.to_thread(self.database.recent_sleep, self.user_id)
+            spo2_query = asyncio.to_thread(
                 self.database.latest_metric, "spo2_samples", self.user_id
-            ),
-            asyncio.to_thread(
+            )
+            stress_query = asyncio.to_thread(
                 self.database.latest_metric, "stress_samples", self.user_id
-            ),
+            )
+        activities, rates, measurement, sleeps, spo2, stress = await asyncio.gather(
+            activity_query,
+            rate_query,
+            measurement_query,
+            sleep_query,
+            spo2_query,
+            stress_query,
         )
         parts = []
+        day_label = (
+            "昨日"
+            if target_day == today - timedelta(days=1)
+            else "今日"
+            if target_day == today
+            else "最近"
+        )
         if requested["activity"]:
             for activity in activities:
                 parts.append(
@@ -197,7 +330,7 @@ class QueryService:
             )
         if requested["body"] and measurement:
             parts.append(
-                f"最近体重：{measurement['weight_kg']} kg（数据采集时间 {self.display_timestamp(measurement['timestamp'])}）"
+                f"{day_label}体重：{measurement['weight_kg']} kg（数据采集时间 {self.display_timestamp(measurement['timestamp'])}）"
             )
         if requested["sleep"] and sleeps:
             values = []
@@ -216,10 +349,10 @@ class QueryService:
             )
         if requested["spo2"] and spo2:
             parts.append(
-                f"最近血氧：{spo2['percent']}%（数据采集时间 {self.display_timestamp(spo2['timestamp'])}）"
+                f"{day_label}血氧：{spo2['percent']}%（数据采集时间 {self.display_timestamp(spo2['timestamp'])}）"
             )
         if requested["stress"] and stress:
             parts.append(
-                f"最近压力分数：{stress['score']}（数据采集时间 {self.display_timestamp(stress['timestamp'])}）"
+                f"{day_label}压力分数：{stress['score']}（数据采集时间 {self.display_timestamp(stress['timestamp'])}）"
             )
         return "；".join(parts) or "暂无所查询项目的已同步云端数据"

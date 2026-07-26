@@ -6,7 +6,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 from astrbot_plugin_mi_fitness_health.models import DailyActivity, HeartRateSample
@@ -74,7 +74,196 @@ class DatabaseTest(unittest.TestCase):
             database = Database(path)
             database.initialize()
             self.assertEqual(
-                database.last_alert_at("legacy"), "2026-01-01T00:00:00+00:00"
+                database.last_alert_at("", "legacy"), "2026-01-01T00:00:00+00:00"
             )
-            database.add_alert("new", "message", "event-1")
-            self.assertTrue(database.alert_event_sent("new", "event-1"))
+            with closing(sqlite3.connect(path)) as connection:
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='care_deliveries'"
+                    ).fetchone()
+                )
+            database.add_alert("owner", "new", "message", "event-1")
+            self.assertTrue(database.alert_event_sent("owner", "new", "event-1"))
+
+    def test_v5_migration_keeps_health_rows_and_discards_unowned_sync_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "health.sqlite3"
+            with closing(sqlite3.connect(path)) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE schema_version(version INTEGER NOT NULL);
+                    INSERT INTO schema_version VALUES(5);
+                    CREATE TABLE daily_activity (
+                        user_id TEXT NOT NULL, date TEXT NOT NULL,
+                        steps INTEGER NOT NULL, distance_m REAL NOT NULL,
+                        active_kcal REAL NOT NULL, collected_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL, PRIMARY KEY(user_id,date)
+                    );
+                    CREATE TABLE sync_state (
+                        data_type TEXT PRIMARY KEY, last_sync_at TEXT NOT NULL,
+                        last_record_at TEXT
+                    );
+                    CREATE TABLE sync_failures (
+                        data_type TEXT PRIMARY KEY, last_attempt_at TEXT NOT NULL,
+                        last_error TEXT NOT NULL
+                    );
+                    CREATE TABLE alerts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        alert_type TEXT NOT NULL, created_at TEXT NOT NULL,
+                        message TEXT NOT NULL, event_key TEXT
+                    );
+                    INSERT INTO daily_activity VALUES(
+                        'user','2026-07-22',4321,3000,210,
+                        '2026-07-22T12:00:00+00:00',
+                        '2026-07-22T12:00:00+00:00'
+                    );
+                    INSERT INTO sync_state VALUES(
+                        'daily_activity','2026-07-22T12:00:00+00:00',NULL
+                    );
+                    INSERT INTO sync_failures VALUES(
+                        'sleep','2026-07-22T12:00:00+00:00','legacy failure'
+                    );
+                    INSERT INTO alerts(alert_type,created_at,message,event_key)
+                    VALUES(
+                        'legacy','2026-07-22T12:00:00+00:00','kept','legacy-event'
+                    );
+                    """
+                )
+                connection.commit()
+
+            database = Database(path)
+            database.initialize()
+
+            self.assertEqual(
+                database.today_activity("user", "2026-07-22")["steps"], 4321
+            )
+            self.assertIsNone(database.latest_sync_at("user"))
+            self.assertIsNone(database.latest_sync_failure_at("user", ("sleep",)))
+            self.assertEqual(
+                database.last_alert_at("", "legacy"),
+                "2026-07-22T12:00:00+00:00",
+            )
+            self.assertIsNone(database.last_alert_at("owner", "legacy"))
+
+    def test_required_sync_freshness_tracks_each_dataset_and_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            now = datetime.now(UTC)
+            database.update_sync_state("user", "daily_activity", now)
+            database.update_sync_state("user", "sleep", now)
+            self.assertIsNotNone(
+                database.latest_sync_at("user", ("daily_activity", "sleep"))
+            )
+            self.assertIsNone(
+                database.latest_sync_at("user", ("daily_activity", "heart_rate"))
+            )
+            database.update_sync_failure("user", "sleep", "synthetic temporary failure")
+            self.assertIsNone(
+                database.latest_sync_at("user", ("daily_activity", "sleep"))
+            )
+            database.update_sync_state("user", "sleep", now)
+            self.assertIsNotNone(
+                database.latest_sync_at("user", ("daily_activity", "sleep"))
+            )
+
+    def test_sync_state_is_isolated_between_xiaomi_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            now = datetime.now(UTC)
+            database.update_sync_state("account-a", "sleep", now)
+            database.update_sync_state("account-b", "heart_rate", now)
+
+            self.assertIsNotNone(database.latest_sync_at("account-a", ("sleep",)))
+            self.assertIsNone(database.latest_sync_at("account-a", ("heart_rate",)))
+            self.assertIsNotNone(database.latest_sync_at("account-b", ("heart_rate",)))
+            database.update_sync_failure(
+                "account-a", "sleep", "synthetic temporary failure"
+            )
+            self.assertIsNone(database.latest_sync_at("account-a", ("sleep",)))
+            self.assertIsNotNone(database.latest_sync_at("account-b", ("heart_rate",)))
+
+    def test_sync_freshness_compares_mixed_iso_offsets_chronologically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "health.sqlite3"
+            database = Database(path)
+            database.initialize()
+            with closing(sqlite3.connect(path)) as connection:
+                connection.executemany(
+                    "INSERT INTO sync_state(user_id,data_type,last_sync_at,last_record_at) VALUES(?,?,?,NULL)",
+                    (
+                        ("user", "daily_activity", "2026-01-01T09:00:00+08:00"),
+                        ("user", "sleep", "2026-01-01T02:00:00+00:00"),
+                    ),
+                )
+                connection.commit()
+            self.assertEqual(
+                database.latest_sync_at("user", ("daily_activity", "sleep")),
+                "2026-01-01T01:00:00+00:00",
+            )
+            self.assertEqual(
+                database.latest_sync_at("user"),
+                "2026-01-01T02:00:00+00:00",
+            )
+
+    def test_activity_replacement_removes_legacy_cloud_zone_date(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            collected = datetime(2026, 1, 1, 16, 30, tzinfo=UTC)
+            database.upsert_activity(
+                "user", DailyActivity("2026-01-01", 10, 8, 1, collected)
+            )
+            result = database.replace_activity_records(
+                "user",
+                [DailyActivity("2026-01-02", 20, 16, 2, collected)],
+                timezone(timedelta(hours=8)),
+            )
+            self.assertEqual(result, {"added": 1, "updated": 0})
+            self.assertIsNone(database.today_activity("user", "2026-01-01"))
+            self.assertEqual(database.today_activity("user", "2026-01-02")["steps"], 20)
+
+    def test_retention_and_explicit_purge_remove_only_local_plugin_data(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            old = datetime.now(UTC) - timedelta(days=30)
+            database.upsert_activity(
+                "user", DailyActivity(old.date().isoformat(), 10, 8, 1, old)
+            )
+            database.upsert_heart_rate(
+                "user", HeartRateSample("old", old, 70, "passive", False)
+            )
+            self.assertGreaterEqual(database.prune_user_data("user", 7), 2)
+            self.assertEqual(database.heart_rates_since("user", old.isoformat()), [])
+            database.upsert_activity(
+                "user",
+                DailyActivity(
+                    datetime.now(UTC).date().isoformat(),
+                    20,
+                    16,
+                    2,
+                    datetime.now(UTC),
+                ),
+            )
+            database.touch_private_owner_session("owner", "qq:FriendMessage:123")
+            database.update_sync_state("user", "daily_activity", datetime.now(UTC))
+            self.assertGreaterEqual(database.purge_user_data("user", "owner"), 3)
+            self.assertIsNone(database.private_owner_session("owner"))
+            self.assertIsNone(database.latest_sync_at("user"))
+
+    def test_retention_prunes_only_the_selected_owners_alerts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            old = datetime.now(UTC) - timedelta(days=30)
+            database.add_alert("owner-a", "proactive_message", "a", created_at=old)
+            database.add_alert("owner-b", "proactive_message", "b", created_at=old)
+
+            database.prune_user_data("user", 7, UTC, "owner-a")
+
+            self.assertIsNone(database.last_alert_at("owner-a", "proactive_message"))
+            self.assertIsNotNone(database.last_alert_at("owner-b", "proactive_message"))

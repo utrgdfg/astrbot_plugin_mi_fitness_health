@@ -52,3 +52,20 @@ class MonitorServiceTest(unittest.TestCase):
             )
             now = datetime(2026, 7, 23, 2, 0, tzinfo=local_zone)
             self.assertIsNone(asyncio.run(service.evaluate_late_activity(now)))
+
+    def test_future_private_activity_is_not_treated_as_recent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            local_zone = timezone(timedelta(hours=8))
+            now = datetime(2026, 7, 23, 2, 0, tzinfo=local_zone)
+            database.touch_private_owner_session(
+                "owner",
+                "qq:FriendMessage:123",
+                now.astimezone(UTC) + timedelta(minutes=10),
+            )
+            service = HealthMonitorService(
+                database, "owner", local_zone, True, "00:30", "06:00", 45, 120
+            )
+
+            self.assertIsNone(asyncio.run(service.evaluate_late_activity(now)))

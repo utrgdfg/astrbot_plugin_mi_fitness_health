@@ -12,6 +12,7 @@ from astrbot_plugin_mi_fitness_health.models import (
     BodyMeasurement,
     DailyActivity,
     HeartRateSample,
+    SleepSession,
 )
 from astrbot_plugin_mi_fitness_health.services.query_service import QueryService
 from astrbot_plugin_mi_fitness_health.storage import Database
@@ -35,6 +36,24 @@ class QueryServiceTest(unittest.TestCase):
         asyncio.run(service.heart_rates(24))
         self.assertTrue(database.cutoff.endswith("+00:00"))
 
+    def test_focus_maps_to_only_required_sync_datasets(self) -> None:
+        service = QueryService(_RecordingDatabase(), "user", "Asia/Shanghai")
+        self.assertEqual(
+            service.sync_types_for_focus("昨天睡眠和心率"),
+            ("heart_rate", "sleep"),
+        )
+        self.assertEqual(
+            set(service.sync_types_for_focus("综合概况")),
+            {
+                "daily_activity",
+                "heart_rate",
+                "body_measurements",
+                "sleep",
+                "spo2",
+                "stress",
+            },
+        )
+
     def test_conversation_snapshot_only_returns_requested_category(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Database(Path(directory) / "health.sqlite3")
@@ -57,6 +76,48 @@ class QueryServiceTest(unittest.TestCase):
             snapshot = asyncio.run(service.care_snapshot("我昨天睡得怎么样"))
             self.assertIn("暂无已同步记录", snapshot)
             self.assertIn("不代表设备不支持", snapshot)
+
+    def test_yesterday_sleep_excludes_sessions_ending_today(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            service = QueryService(database, "user", "Asia/Shanghai")
+            local_now = datetime.now(service.timezone)
+            yesterday = local_now.date() - timedelta(days=1)
+            yesterday_end = datetime.combine(
+                yesterday,
+                datetime.min.time(),
+                tzinfo=service.timezone,
+            ) + timedelta(hours=8)
+            today_end = yesterday_end + timedelta(days=1)
+            database.upsert_sleep(
+                "user",
+                SleepSession(
+                    "yesterday",
+                    (yesterday_end - timedelta(minutes=450)).astimezone(UTC),
+                    yesterday_end.astimezone(UTC),
+                    450,
+                    420,
+                    30,
+                    88,
+                ),
+            )
+            database.upsert_sleep(
+                "user",
+                SleepSession(
+                    "today",
+                    (today_end - timedelta(minutes=130)).astimezone(UTC),
+                    today_end.astimezone(UTC),
+                    130,
+                    111,
+                    19,
+                    70,
+                ),
+            )
+
+            snapshot = asyncio.run(service.care_snapshot("昨天睡眠"))
+            self.assertIn("420 分钟", snapshot)
+            self.assertNotIn("111 分钟", snapshot)
 
     def test_display_timestamps_use_configured_user_timezone(self) -> None:
         """UTC storage timestamps must display as local time, not raw +00:00 text."""
@@ -141,3 +202,28 @@ class QueryServiceTest(unittest.TestCase):
             self.assertEqual(len(rows), 120)
             self.assertEqual((min(values), max(values)), (51, 135))
             self.assertEqual(round(sum(values) / len(values)), 78)
+
+    def test_recent_heart_rate_snapshot_keeps_all_48_hour_samples(self) -> None:
+        """The advertised 48-hour range must not be truncated to 100 rows."""
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            service = QueryService(database, "user", "Asia/Shanghai")
+            start = datetime.now(UTC) - timedelta(hours=2)
+            samples = [51, 135] + [78] * 118
+            for index, bpm in enumerate(samples):
+                database.upsert_heart_rate(
+                    "user",
+                    HeartRateSample(
+                        f"recent-{index}",
+                        start + timedelta(seconds=index),
+                        bpm,
+                        "passive",
+                        False,
+                    ),
+                )
+
+            snapshot = asyncio.run(service.care_snapshot("最近心率"))
+            self.assertIn("最近 48 小时心率", snapshot)
+            self.assertIn("最高 135", snapshot)
+            self.assertIn("最低 51", snapshot)

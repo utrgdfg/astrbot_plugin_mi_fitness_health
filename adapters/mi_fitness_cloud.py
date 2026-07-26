@@ -10,7 +10,8 @@ import os
 import struct
 from collections import defaultdict
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlencode
 
 import httpx
@@ -29,10 +30,30 @@ from ..utils.privacy import redact_error
 
 LOGIN_PREFIX = b"&&&START&&&"
 KNOWN_REGIONS = ("cn", "ru", "de", "i2", "sg", "us")
+PRIMARY_HEART_RATE_KEYS = ("heart_rate", "heartrate", "hr")
+RESTING_HEART_RATE_KEYS = ("resting_heart_rate",)
+SPO2_KEYS = ("spo2", "blood_oxygen")
+REGION_PROBE_KEYS = (
+    "steps",
+    "sleep",
+    "heart_rate",
+    "heartrate",
+    "hr",
+    "spo2",
+    "blood_oxygen",
+    "weight",
+    "stress",
+)
+CONNECT_TIMEOUT_SECONDS = 90
+MAX_RECORDS_PER_KEY = 100_000
 
 
 class MiFitnessAuthenticationError(RuntimeError):
     """Authentication requires user action and must pause automatic synchronization."""
+
+
+class MiFitnessResponseError(RuntimeError):
+    """A non-transient remote response that must not be retried."""
 
 
 def _rc4_crypt(key: bytes, payload: bytes) -> bytes:
@@ -85,17 +106,25 @@ def _signature(
 class MiFitnessCloudAdapter(DataAdapter):
     """Authenticate with userId/passToken and safely fetch Mi Fitness cloud records."""
 
-    def __init__(self, user_id: str, pass_token: str, region: str = ""):
+    def __init__(
+        self,
+        user_id: str,
+        pass_token: str,
+        region: str = "",
+        user_timezone: tzinfo = UTC,
+    ):
         """Create an adapter without making a network request.
 
         Args:
             user_id: Xiaomi account userId.
             pass_token: Xiaomi account passToken.
             region: Optional known Mi Fitness region.
+            user_timezone: Calendar timezone used to group daily activity.
         """
         self.user_id = user_id
         self.pass_token = pass_token
         self.region = region.lower()
+        self.user_timezone = user_timezone
         self._client: httpx.AsyncClient | None = None
         self._cookies = ""
         self._ssecurity = b""
@@ -103,6 +132,7 @@ class MiFitnessCloudAdapter(DataAdapter):
         self._available_types: list[str] = []
         self.last_error: str | None = None
         self.authentication_failed = False
+        self._connect_lock = asyncio.Lock()
 
     def get_available_data_types(self) -> list[str]:
         """Return discovered data types."""
@@ -118,29 +148,42 @@ class MiFitnessCloudAdapter(DataAdapter):
         Returns:
             True when authentication and connection setup succeed.
         """
-        self.last_error = None
-        self.authentication_failed = False
-        if not self.user_id or not self.pass_token:
-            self.last_error = "缺少 userId 或 passToken。"
+        async with self._connect_lock:
+            if self.is_connected():
+                return True
+            self.last_error = None
+            self.authentication_failed = False
+            self._available_types = []
+            if not self.user_id or not self.pass_token:
+                self.last_error = "缺少 userId 或 passToken。"
+                return False
+            await self.close()
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0), follow_redirects=False
+            )
+            try:
+                await asyncio.wait_for(
+                    self._establish_session(), timeout=CONNECT_TIMEOUT_SECONDS
+                )
+                self._connected = True
+                return True
+            except MiFitnessAuthenticationError as error:
+                self.authentication_failed = True
+                self.last_error = redact_error(error)
+            except asyncio.TimeoutError:
+                self.last_error = "连接小米健康云超时，请稍后重试或手动指定区域。"
+            except (httpx.HTTPError, ValueError, KeyError, RuntimeError) as error:
+                self.last_error = redact_error(error)
+            await self.close()
+            logger.warning("Mi Fitness connection failed: %s", self.last_error)
             return False
-        await self.close()
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0), follow_redirects=False
-        )
-        try:
-            await self._login_with_token()
+
+    async def _establish_session(self) -> None:
+        """Authenticate and complete bounded region/type discovery."""
+        await self._login_with_token()
+        if self.region not in KNOWN_REGIONS:
             self.region = await self._discover_region()
-            self._available_types = await self._discover_data_types()
-            self._connected = True
-            return True
-        except MiFitnessAuthenticationError as error:
-            self.authentication_failed = True
-            self.last_error = redact_error(error)
-        except (httpx.HTTPError, ValueError, KeyError, RuntimeError) as error:
-            self.last_error = redact_error(error)
-        await self.close()
-        logger.warning("Mi Fitness connection failed: %s", self.last_error)
-        return False
+        self._available_types = await self._discover_data_types()
 
     async def _login_with_token(self) -> None:
         """Exchange the configured login cookies for ssecurity and health session cookies."""
@@ -220,6 +263,23 @@ class MiFitnessCloudAdapter(DataAdapter):
                     raise MiFitnessAuthenticationError(
                         "小米健康云授权已失效；请重新获取 Cookie。"
                     )
+                if response.status_code == 429 and attempt < 2:
+                    retry_after = response.headers.get("Retry-After", "")
+                    delay = self._retry_after_delay(retry_after, attempt)
+                    await asyncio.sleep(delay)
+                    continue
+                if response.status_code >= 400 and response.status_code not in {
+                    408,
+                    425,
+                    429,
+                    500,
+                    502,
+                    503,
+                    504,
+                }:
+                    raise MiFitnessResponseError(
+                        f"小米健康云返回 HTTP {response.status_code}"
+                    )
                 response.raise_for_status()
                 body = json.loads(
                     _rc4_crypt(signed_nonce, base64.b64decode(response.text))
@@ -229,15 +289,27 @@ class MiFitnessCloudAdapter(DataAdapter):
                     if any(
                         marker in message.lower()
                         for marker in (
-                            "auth",
-                            "login",
-                            "token",
-                            "session",
+                            "unauthorized",
+                            "authentication failed",
+                            "authentication expired",
+                            "authorization expired",
+                            "not logged in",
+                            "login required",
+                            "invalid token",
+                            "token expired",
+                            "invalid session",
+                            "session expired",
+                            "invalid credential",
+                            "credentials expired",
                             "401",
                             "403",
-                            "登录",
-                            "授权",
-                            "凭证",
+                            "请登录",
+                            "登录失效",
+                            "登录过期",
+                            "授权失效",
+                            "授权过期",
+                            "凭证失效",
+                            "凭证过期",
                         )
                     ):
                         self._connected = False
@@ -245,11 +317,14 @@ class MiFitnessCloudAdapter(DataAdapter):
                         raise MiFitnessAuthenticationError(
                             "小米健康云授权已失效；请重新获取 Cookie。"
                         )
-                    raise RuntimeError(message)
+                    code = str(body.get("code") or "unknown")
+                    raise MiFitnessResponseError(f"小米健康云返回错误代码 {code}")
                 return (
                     body.get("result") if isinstance(body.get("result"), dict) else {}
                 )
             except MiFitnessAuthenticationError:
+                raise
+            except MiFitnessResponseError:
                 raise
             except (
                 httpx.HTTPError,
@@ -263,6 +338,32 @@ class MiFitnessCloudAdapter(DataAdapter):
         raise RuntimeError(
             f"小米健康云请求失败：{redact_error(last_error or 'unknown error')}"
         )
+
+    @staticmethod
+    def _retry_after_delay(value: str, attempt: int) -> float:
+        """Parse both Retry-After seconds and HTTP-date values with a safe cap."""
+        try:
+            delay = float(value)
+        except (TypeError, ValueError):
+            try:
+                retry_at = parsedate_to_datetime(value)
+                retry_at = (
+                    retry_at.replace(tzinfo=UTC)
+                    if retry_at.tzinfo is None
+                    else retry_at.astimezone(UTC)
+                )
+                delay = (retry_at - datetime.now(UTC)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                delay = 0.5 * (2**attempt)
+        return max(0.5, min(delay, 10.0))
+
+    @staticmethod
+    def _utc_timestamp(value: datetime) -> int:
+        """Convert an aware datetime to UTC without discarding its offset."""
+        normalized = (
+            value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+        )
+        return int(normalized.timestamp())
 
     async def _fetch_key(
         self, key: str, start: datetime, end: datetime, region: str
@@ -279,8 +380,8 @@ class MiFitnessCloudAdapter(DataAdapter):
         records: list[dict] = []
         for _ in range(100):
             payload: dict[str, object] = {
-                "start_time": int(start.replace(tzinfo=UTC).timestamp()),
-                "end_time": int(end.replace(tzinfo=UTC).timestamp()),
+                "start_time": self._utc_timestamp(start),
+                "end_time": self._utc_timestamp(end),
                 "key": key,
             }
             if cursor:
@@ -310,6 +411,10 @@ class MiFitnessCloudAdapter(DataAdapter):
                     if fingerprint not in seen_records:
                         seen_records.add(fingerprint)
                         records.append(item)
+                        if len(records) > MAX_RECORDS_PER_KEY:
+                            raise RuntimeError(
+                                f"小米健康云 {key} 数据超过单次同步安全上限。"
+                            )
             next_cursor = (
                 result.get("next_key")
                 if isinstance(result.get("next_key"), str)
@@ -342,22 +447,35 @@ class MiFitnessCloudAdapter(DataAdapter):
         return records
 
     async def _discover_region(self) -> str:
-        """Probe up to the recent 30-day window instead of hard-coded historic dates."""
+        """Probe several low-cost datasets so accounts without steps still work."""
         now = datetime.now(UTC)
-        candidates = ([self.region] if self.region in KNOWN_REGIONS else []) + [
-            item for item in KNOWN_REGIONS if item != self.region
-        ]
-        for region in candidates:
-            try:
-                if await self._fetch_key(
-                    "steps", now - timedelta(days=30), now, region
-                ):
-                    return region
-            except MiFitnessAuthenticationError:
-                raise
-            except RuntimeError:
-                continue
-        return self.region or "cn"
+        successful_probe = False
+        last_error: Exception | None = None
+        for region in KNOWN_REGIONS:
+            for key in REGION_PROBE_KEYS:
+                try:
+                    records = await asyncio.wait_for(
+                        self._fetch_key(key, now - timedelta(days=30), now, region),
+                        timeout=10,
+                    )
+                    successful_probe = True
+                    if records:
+                        return region
+                except MiFitnessAuthenticationError:
+                    raise
+                except asyncio.TimeoutError as error:
+                    last_error = error
+                    break
+                except RuntimeError as error:
+                    last_error = error
+                    continue
+        if not successful_probe and last_error:
+            raise RuntimeError(
+                f"小米健康云区域探测失败：{redact_error(last_error)}"
+            ) from last_error
+        raise RuntimeError(
+            "最近 30 天没有可用于自动识别区域的云端记录；请在插件配置中手动选择 region。"
+        )
 
     async def _discover_data_types(self) -> list[str]:
         """Discover only supported datasets, using a recent bounded probe."""
@@ -365,12 +483,38 @@ class MiFitnessCloudAdapter(DataAdapter):
         types: list[str] = []
         for data_type, keys in (
             ("daily_activity", ("steps",)),
-            ("heart_rate", ("heart_rate", "resting_heart_rate")),
+            ("heart_rate", PRIMARY_HEART_RATE_KEYS + RESTING_HEART_RATE_KEYS),
             ("body_measurements", ("weight",)),
             ("sleep", ("sleep",)),
-            ("spo2", ("spo2",)),
+            ("spo2", SPO2_KEYS),
             ("stress", ("stress",)),
         ):
+            if data_type == "heart_rate":
+                try:
+                    if [
+                        row
+                        async for row in self.iter_heart_rate(
+                            now - timedelta(days=30), now
+                        )
+                    ]:
+                        types.append(data_type)
+                except MiFitnessAuthenticationError:
+                    raise
+                except RuntimeError:
+                    pass
+                continue
+            if data_type == "spo2":
+                try:
+                    if [
+                        row
+                        async for row in self.iter_spo2(now - timedelta(days=30), now)
+                    ]:
+                        types.append(data_type)
+                except MiFitnessAuthenticationError:
+                    raise
+                except RuntimeError:
+                    pass
+                continue
             found = False
             for key in keys:
                 try:
@@ -428,12 +572,12 @@ class MiFitnessCloudAdapter(DataAdapter):
     async def iter_daily_activity(
         self, start: datetime, end: datetime
     ) -> AsyncIterator[DailyActivity]:
-        """Aggregate validated step and calorie records by their cloud local day."""
-        totals: dict[str, dict[str, float]] = defaultdict(
+        """Aggregate validated records by the configured user-local calendar day."""
+        step_buckets: dict[tuple[str, int], dict[str, float]] = defaultdict(
             lambda: {"steps": 0.0, "distance_m": 0.0, "active_kcal": 0.0}
         )
+        calorie_buckets: dict[tuple[str, int], float] = defaultdict(float)
         latest: dict[str, datetime] = {}
-        calorie_totals: dict[str, float] = defaultdict(float)
         step_records = await self._fetch_key("steps", start, end, self.region)
         try:
             calorie_records = await self._fetch_key("calories", start, end, self.region)
@@ -446,22 +590,45 @@ class MiFitnessCloudAdapter(DataAdapter):
                 record_time = self._record_time(item)
                 if not record_time:
                     continue
-                timestamp, date = record_time
+                timestamp, _ = record_time
+                date = timestamp.astimezone(self.user_timezone).date().isoformat()
+                bucket_key = (date, int(timestamp.timestamp()) // 60)
                 value = self._value(item)
                 if key == "steps":
                     steps = self._number(value.get("steps"), 0, 200_000)
                     distance = self._number(value.get("distance"), 0, 500_000)
                     calories = self._number(value.get("calories"), 0, 50_000)
-                    totals[date]["steps"] += steps or 0
-                    totals[date]["distance_m"] += distance or 0
-                    totals[date]["active_kcal"] += calories or 0
+                    # A calorie-only or malformed row from the required steps
+                    # endpoint is not a complete daily activity sample.  In
+                    # particular, it must never replace a cached non-zero step
+                    # total with an invented zero.
+                    if steps is None:
+                        continue
+                    bucket = step_buckets[bucket_key]
+                    bucket["steps"] = max(bucket["steps"], steps)
+                    bucket["distance_m"] = max(bucket["distance_m"], distance or 0)
+                    bucket["active_kcal"] = max(bucket["active_kcal"], calories or 0)
                 else:
                     calories = self._number(value.get("calories"), 0, 50_000)
                     if calories is not None:
-                        calorie_totals[date] += calories
+                        calorie_buckets[bucket_key] = max(
+                            calorie_buckets[bucket_key], calories
+                        )
                 latest[date] = max(latest.get(date, timestamp), timestamp)
+        totals: dict[str, dict[str, float]] = defaultdict(
+            lambda: {"steps": 0.0, "distance_m": 0.0, "active_kcal": 0.0}
+        )
+        for (date, _minute), values in step_buckets.items():
+            for metric, number in values.items():
+                totals[date][metric] += number
+        calorie_totals: dict[str, float] = defaultdict(float)
+        for (date, _minute), calories in calorie_buckets.items():
+            calorie_totals[date] += calories
         for date, calories in calorie_totals.items():
-            totals[date]["active_kcal"] = calories
+            # The optional calorie key may refine a complete steps day, but it
+            # cannot establish an activity day by itself.
+            if date in totals:
+                totals[date]["active_kcal"] = calories
         for date, values in sorted(totals.items()):
             yield DailyActivity(
                 date,
@@ -480,24 +647,48 @@ class MiFitnessCloudAdapter(DataAdapter):
         ``resting_heart_rate`` is treated as an optional account-specific
         fallback and cannot invalidate records returned by ``heart_rate``.
         """
-        records: list[tuple[dict, bool]] = []
-        successful_keys = 0
+        samples: list[HeartRateSample] = []
         errors: list[RuntimeError] = []
-        for key, is_resting in (("heart_rate", False), ("resting_heart_rate", True)):
+        for key in PRIMARY_HEART_RATE_KEYS:
             try:
-                records.extend(
-                    (item, is_resting)
-                    for item in await self._fetch_key(key, start, end, self.region)
+                samples.extend(
+                    self._parse_heart_rate_records(
+                        await self._fetch_key(key, start, end, self.region),
+                        is_resting=False,
+                    )
                 )
-                successful_keys += 1
             except MiFitnessAuthenticationError:
                 raise
             except RuntimeError as error:
                 errors.append(error)
-        if not successful_keys and errors:
+        for key in RESTING_HEART_RATE_KEYS:
+            try:
+                samples.extend(
+                    self._parse_heart_rate_records(
+                        await self._fetch_key(key, start, end, self.region),
+                        is_resting=True,
+                    )
+                )
+            except MiFitnessAuthenticationError:
+                raise
+            except RuntimeError as error:
+                errors.append(error)
+        if not samples and errors:
             raise errors[-1]
         seen: set[tuple[int, int]] = set()
-        for item, is_resting in records:
+        for sample in samples:
+            identity = (int(sample.timestamp.timestamp()), sample.bpm)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            yield sample
+
+    def _parse_heart_rate_records(
+        self, records: list[dict], *, is_resting: bool
+    ) -> list[HeartRateSample]:
+        """Validate one candidate key before it can suppress another alias."""
+        samples: list[HeartRateSample] = []
+        for item in records:
             record_time = self._record_time(item)
             if not record_time:
                 continue
@@ -515,10 +706,6 @@ class MiFitnessCloudAdapter(DataAdapter):
             )
             if bpm is None:
                 continue
-            identity = (int(timestamp.timestamp()), int(bpm))
-            if identity in seen:
-                continue
-            seen.add(identity)
             kind = (
                 "passive"
                 if is_resting or str(value.get("type", "0")) == "0"
@@ -526,13 +713,16 @@ class MiFitnessCloudAdapter(DataAdapter):
             )
             is_workout = bool(value.get("workout_id") or value.get("is_workout"))
             source = "resting_hr" if is_resting else "hr"
-            yield HeartRateSample(
-                f"mi_fitness_{source}_{int(timestamp.timestamp())}_{int(bpm)}",
-                timestamp,
-                int(bpm),
-                kind,
-                is_workout,
+            samples.append(
+                HeartRateSample(
+                    f"mi_fitness_{source}_{int(timestamp.timestamp())}_{int(bpm)}",
+                    timestamp,
+                    int(bpm),
+                    kind,
+                    is_workout,
+                )
             )
+        return samples
 
     async def iter_body_measurements(
         self, start: datetime, end: datetime
@@ -614,17 +804,53 @@ class MiFitnessCloudAdapter(DataAdapter):
         self, start: datetime, end: datetime
     ) -> AsyncIterator[SpO2Sample]:
         """Yield validated blood-oxygen records; unsupported keys simply return no rows."""
-        for item in await self._fetch_key("spo2", start, end, self.region):
-            time = self._record_time(item)
-            value = self._value(item)
-            percent = self._number(value.get("spo2") or value.get("value"), 70, 100)
-            if time and percent is not None:
-                timestamp, _ = time
-                yield SpO2Sample(
-                    f"mi_fitness_spo2_{int(timestamp.timestamp())}",
-                    timestamp,
-                    int(percent),
+        samples: list[SpO2Sample] = []
+        errors: list[RuntimeError] = []
+        for key in SPO2_KEYS:
+            try:
+                samples.extend(
+                    self._parse_spo2_records(
+                        await self._fetch_key(key, start, end, self.region)
+                    )
                 )
+            except MiFitnessAuthenticationError:
+                raise
+            except RuntimeError as error:
+                errors.append(error)
+        if not samples and errors:
+            raise errors[-1]
+        seen_timestamps: set[int] = set()
+        for sample in samples:
+            timestamp = int(sample.timestamp.timestamp())
+            if timestamp in seen_timestamps:
+                continue
+            seen_timestamps.add(timestamp)
+            yield sample
+
+    def _parse_spo2_records(self, records: list[dict]) -> list[SpO2Sample]:
+        """Return only validated samples from one SpO2 candidate key."""
+        samples: list[SpO2Sample] = []
+        for item in records:
+            record_time = self._record_time(item)
+            value = self._value(item)
+            raw_percent = value.get("spo2")
+            if raw_percent is None:
+                raw_percent = value.get("blood_oxygen")
+            if raw_percent is None:
+                raw_percent = value.get("oxygen")
+            if raw_percent is None:
+                raw_percent = value.get("value")
+            percent = self._number(raw_percent, 70, 100)
+            if record_time and percent is not None:
+                timestamp, _ = record_time
+                samples.append(
+                    SpO2Sample(
+                        f"mi_fitness_spo2_{int(timestamp.timestamp())}",
+                        timestamp,
+                        int(percent),
+                    )
+                )
+        return samples
 
     async def iter_stress(
         self, start: datetime, end: datetime
@@ -653,6 +879,8 @@ class MiFitnessCloudAdapter(DataAdapter):
         if self._client:
             await self._client.aclose()
             self._client = None
+        self._cookies = ""
+        self._ssecurity = b""
 
     async def probe_data_keys(self, start: datetime, end: datetime) -> dict[str, str]:
         """Return safe key-level availability diagnostics without returning raw records.
@@ -665,22 +893,23 @@ class MiFitnessCloudAdapter(DataAdapter):
             Mapping of candidate key to count or a sanitized error category.
         """
         result: dict[str, str] = {}
-        for key in (
-            "steps",
-            "heart_rate",
-            "resting_heart_rate",
-            "heartrate",
-            "hr",
-            "sleep",
-            "spo2",
-            "blood_oxygen",
-            "stress",
-            "weight",
-        ):
+        keys = tuple(
+            dict.fromkeys(
+                ("steps",)
+                + PRIMARY_HEART_RATE_KEYS
+                + RESTING_HEART_RATE_KEYS
+                + ("sleep",)
+                + SPO2_KEYS
+                + ("stress", "weight")
+            )
+        )
+        for key in keys:
             try:
                 result[key] = str(
                     len(await self._fetch_key(key, start, end, self.region))
                 )
+            except MiFitnessAuthenticationError:
+                raise
             except Exception as error:
                 result[key] = f"错误：{redact_error(error)}"
         return result

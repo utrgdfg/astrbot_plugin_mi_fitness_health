@@ -14,23 +14,34 @@ def redact_error(error: Exception | str) -> str:
     Returns:
         A message safe to show to the owner.
     """
-    message = str(error).replace("\n", " ")
+    message = str(error)
     message = re.sub(
-        r"(?i)(passToken|userId|ssecurity|cookie)=?[^\s;,&]+", r"\1=***", message
+        r"(?im)^\s*(authorization|set-cookie|cookie|x-api-key|api-key)\s*:\s*.*$",
+        r"\1: ***",
+        message,
+    )
+    message = re.sub(
+        r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+",
+        "authorization=***",
+        message,
+    )
+    message = re.sub(
+        (
+            r"(?i)\b(passToken|pass_token|serviceToken|accessToken|refreshToken|"
+            r"userId|cUserId|ssecurity|cookie|set-cookie|authorization|_nonce|"
+            r"signature|rc4_hash__|api[_-]?key|x-api-key|client[_-]?secret|"
+            r"secret[_-]?key|private[_-]?key)\b[\"']?\s*(?:=|:)\s*"
+            r"(?:[\"'][^\"']*[\"']|[^\s;,&]+)"
+        ),
+        r"\1=***",
+        message,
+    )
+    message = re.sub(
+        r"(?i)\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{12,})\b",
+        "***",
+        message,
     )
     message = re.sub(r"https?://\S+", "[remote URL]", message)
+    message = re.sub(r"[\x00-\x1f\x7f]+", " ", message)
+    message = " ".join(message.split())
     return message[:180] or type(error).__name__
-
-
-def mask_identifier(value: str) -> str:
-    """Mask an account identifier for user-facing connection status.
-
-    Args:
-        value: Identifier to mask.
-
-    Returns:
-        A short masked identifier.
-    """
-    if len(value) <= 4:
-        return "***"
-    return f"{value[:2]}***{value[-2:]}"

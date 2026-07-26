@@ -77,12 +77,17 @@ class HealthMonitorService:
         )
         sent_today = await asyncio.to_thread(
             self.database.alert_count_since,
+            self.owner_platform_id,
             "proactive_message",
             local_midnight.astimezone(UTC).isoformat(),
         )
         if sent_today >= self.daily_limit:
             return True
-        last = await asyncio.to_thread(self.database.last_alert_at, "proactive_message")
+        last = await asyncio.to_thread(
+            self.database.last_alert_at,
+            self.owner_platform_id,
+            "proactive_message",
+        )
         if not last:
             return False
         try:
@@ -109,7 +114,10 @@ class HealthMonitorService:
             return None
         event_key = self._night_key(now)
         if await asyncio.to_thread(
-            self.database.alert_event_sent, "late_night_activity", event_key
+            self.database.alert_event_sent,
+            self.owner_platform_id,
+            "late_night_activity",
+            event_key,
         ):
             return None
         state = await asyncio.to_thread(
@@ -122,16 +130,27 @@ class HealthMonitorService:
             last_seen = last_seen if last_seen.tzinfo else last_seen.replace(tzinfo=UTC)
         except (KeyError, TypeError, ValueError):
             return None
-        if now_utc - last_seen > timedelta(minutes=self.activity_window_minutes):
+        activity_age = now_utc - last_seen
+        if (
+            not timedelta(0)
+            <= activity_age
+            <= timedelta(minutes=self.activity_window_minutes)
+        ):
             return None
         last_alert = await asyncio.to_thread(
-            self.database.last_alert_at, "late_night_activity"
+            self.database.last_alert_at,
+            self.owner_platform_id,
+            "late_night_activity",
         )
         if last_alert:
             try:
-                if datetime.fromisoformat(last_alert) > now_utc - timedelta(
-                    minutes=self.cooldown_minutes
-                ):
+                parsed_alert = datetime.fromisoformat(last_alert)
+                parsed_alert = (
+                    parsed_alert
+                    if parsed_alert.tzinfo
+                    else parsed_alert.replace(tzinfo=UTC)
+                )
+                if parsed_alert > now_utc - timedelta(minutes=self.cooldown_minutes):
                     return None
             except ValueError:
                 pass
@@ -148,6 +167,7 @@ class HealthMonitorService:
         """Start cooldown only after the proactive message was delivered."""
         await asyncio.to_thread(
             self.database.add_alert,
+            self.owner_platform_id,
             finding.alert_type,
             finding.message,
             finding.event_key,
@@ -159,5 +179,10 @@ class HealthMonitorService:
     ) -> None:
         """Record the global cooldown after one combined message is delivered."""
         await asyncio.to_thread(
-            self.database.add_alert, "proactive_message", message, None, sent_at
+            self.database.add_alert,
+            self.owner_platform_id,
+            "proactive_message",
+            message,
+            None,
+            sent_at,
         )
