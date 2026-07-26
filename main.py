@@ -23,7 +23,6 @@ from .utils import measurement_text, today_text
 from .utils.access import (
     normalize_identifier,
     owner_access_denial_reason,
-    owner_identifiers_match,
 )
 from .utils.privacy import redact_error
 
@@ -456,15 +455,6 @@ class MiFitnessHealthPlugin(Star):
                 await asyncio.sleep(retry_seconds)
                 continue
             await asyncio.sleep(self.monitor_interval * 60)
-
-    def _authorized(self, event: AstrMessageEvent) -> bool:
-        """Return whether the sender matches the one configured data owner."""
-        return owner_identifiers_match(
-            self.owner_platform_id,
-            self.owner_platform_instance_id,
-            event.get_sender_id(),
-            event.get_platform_id(),
-        )
 
     def _access_denial_reason(self, event: AstrMessageEvent) -> str | None:
         """Explain owner, platform-instance, and private-chat failures separately."""

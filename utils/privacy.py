@@ -45,17 +45,3 @@ def redact_error(error: Exception | str) -> str:
     message = re.sub(r"[\x00-\x1f\x7f]+", " ", message)
     message = " ".join(message.split())
     return message[:180] or type(error).__name__
-
-
-def mask_identifier(value: str) -> str:
-    """Mask an account identifier for user-facing connection status.
-
-    Args:
-        value: Identifier to mask.
-
-    Returns:
-        A short masked identifier.
-    """
-    if len(value) <= 4:
-        return "***"
-    return f"{value[:2]}***{value[-2:]}"

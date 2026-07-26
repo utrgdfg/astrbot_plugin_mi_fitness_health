@@ -4,3 +4,7 @@ __pycache__/
 *.sqlite3
 *.db
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/

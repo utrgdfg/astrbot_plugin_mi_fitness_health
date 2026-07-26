@@ -14,8 +14,6 @@ from ..models import (
     DailyActivity,
     HeartRateSample,
     SleepSession,
-    SpO2Sample,
-    StressSample,
 )
 
 SCHEMA_VERSION = 6
@@ -555,48 +553,6 @@ class Database:
             )
         return "updated" if old else "added"
 
-    def upsert_spo2(self, user_id: str, record: SpO2Sample) -> str:
-        """Insert or update a blood-oxygen sample."""
-        return self._upsert_metric(
-            "spo2_samples",
-            user_id,
-            record.record_id,
-            record.timestamp.isoformat(),
-            record.percent,
-            "percent",
-        )
-
-    def upsert_stress(self, user_id: str, record: StressSample) -> str:
-        """Insert or update a stress sample."""
-        return self._upsert_metric(
-            "stress_samples",
-            user_id,
-            record.record_id,
-            record.timestamp.isoformat(),
-            record.score,
-            "score",
-        )
-
-    def _upsert_metric(
-        self,
-        table: str,
-        user_id: str,
-        record_id: str,
-        timestamp: str,
-        value: int,
-        column: str,
-    ) -> str:
-        with self._connect() as c:
-            old = c.execute(
-                f"SELECT 1 FROM {table} WHERE user_id=? AND record_id=?",
-                (user_id, record_id),
-            ).fetchone()
-            c.execute(
-                f"INSERT INTO {table}(user_id,record_id,timestamp,{column},updated_at) VALUES(?,?,?,?,?) ON CONFLICT(user_id,record_id) DO UPDATE SET timestamp=excluded.timestamp,{column}=excluded.{column},updated_at=excluded.updated_at",
-                (user_id, record_id, timestamp, value, self._now()),
-            )
-        return "updated" if old else "added"
-
     def latest_sync_at(
         self, user_id: str, data_types: tuple[str, ...] | None = None
     ) -> str | None:
@@ -647,16 +603,6 @@ class Database:
                 continue
         return parsed_values
 
-    def sync_failure(self, user_id: str, data_type: str) -> dict[str, Any] | None:
-        """Return the latest unresolved sanitized failure for one dataset."""
-        with self._connect() as connection:
-            row = connection.execute(
-                """SELECT last_attempt_at,last_error FROM sync_failures
-                   WHERE user_id=? AND data_type=?""",
-                (user_id, data_type),
-            ).fetchone()
-        return dict(row) if row else None
-
     def latest_sync_failure_at(
         self, user_id: str, data_types: tuple[str, ...]
     ) -> str | None:
@@ -682,17 +628,6 @@ class Database:
                 (user_id, date),
             ).fetchone()
         return dict(row) if row else None
-
-    def recent_activity(
-        self, user_id: str, end_date: str, limit: int = 2
-    ) -> list[dict[str, Any]]:
-        """Return a short local-day activity history for natural conversation."""
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT * FROM daily_activity WHERE user_id=? AND date<=? ORDER BY date DESC LIMIT ?",
-                (user_id, end_date, max(1, min(limit, 7))),
-            ).fetchall()
-        return [dict(row) for row in rows]
 
     def recent_activity_between(
         self,
@@ -764,14 +699,6 @@ class Database:
             ).fetchone()
         return dict(row) if row else None
 
-    def latest_sleep(self, user_id: str) -> dict[str, Any] | None:
-        with self._connect() as c:
-            row = c.execute(
-                "SELECT * FROM sleep_sessions WHERE user_id=? ORDER BY end_at DESC LIMIT 1",
-                (user_id,),
-            ).fetchone()
-        return dict(row) if row else None
-
     def recent_sleep(self, user_id: str, limit: int = 3) -> list[dict[str, Any]]:
         """Return a small sleep history for owner-only natural-language replies."""
         with self._connect() as c:
@@ -831,19 +758,6 @@ class Database:
                 (user_id, start_timestamp, end_timestamp),
             ).fetchone()
         return dict(row) if row else None
-
-    def metric_samples_since(
-        self, table: str, user_id: str, timestamp: str, limit: int = 100
-    ) -> list[dict[str, Any]]:
-        """Return recent validated SpO2 or stress rows in newest-first order."""
-        if table not in {"spo2_samples", "stress_samples"}:
-            raise ValueError("Unsupported metric table")
-        with self._connect() as connection:
-            rows = connection.execute(
-                f"SELECT * FROM {table} WHERE user_id=? AND timestamp>=? ORDER BY timestamp DESC LIMIT ?",
-                (user_id, timestamp, max(1, min(limit, 500))),
-            ).fetchall()
-        return [dict(row) for row in rows]
 
     def trend(
         self, user_id: str, start_date: str, end_date: str
