@@ -34,6 +34,19 @@ class PrivacyTest(unittest.TestCase):
                 self.assertNotIn(synthetic_secret, redacted)
                 self.assertNotIn("synthetic-id", redacted)
 
+    def test_api_keys_and_common_provider_token_formats_are_redacted(self) -> None:
+        samples = (
+            "api_key=sk-synthetic-secret-value",
+            '"apiKey":"AIzaSyntheticSecretValue123456"',
+            "x-api-key: ghp_syntheticSecretValue1234567890",
+            "client_secret=synthetic-secret-value",
+            "private_key=synthetic-private-key-value",
+        )
+        for sample in samples:
+            with self.subTest(sample=sample):
+                redacted = redact_error(sample)
+                self.assertNotIn("synthetic", redacted.lower())
+
     def test_urls_controls_and_newlines_never_reach_status_text(self) -> None:
         redacted = redact_error(
             "failure\nhttps://example.invalid/path?serviceToken=synthetic\r\nnext"

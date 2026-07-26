@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -112,6 +113,9 @@ class MainLifecycleTest(unittest.TestCase):
             async def latest_sync_at(self, data_types):
                 return None
 
+            async def latest_failure_at(self, data_types):
+                return None
+
         plugin.query_service = Query()
 
         async def fake_sync(data_types=None, days=None):
@@ -155,6 +159,9 @@ class MainLifecycleTest(unittest.TestCase):
                 return ("sleep",) if "睡" in focus else ("heart_rate",)
 
             async def latest_sync_at(self, data_types):
+                return None
+
+            async def latest_failure_at(self, data_types):
                 return None
 
         plugin.query_service = Query()
@@ -207,6 +214,76 @@ class MainLifecycleTest(unittest.TestCase):
         finished, restarted = asyncio.run(run())
         self.assertIsNot(finished, restarted)
         plugin._auto_sync_loop.assert_awaited_once()
+
+    def test_repeated_background_start_keeps_only_monitor_loop(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.proactive_monitor_enabled = True
+        plugin.allow_health_data_to_llm = True
+        plugin.owner_platform_id = "owner"
+        plugin.owner_platform_instance_id = "bot"
+        plugin.user_id = "user"
+        plugin.pass_token = "synthetic-token"
+        plugin.auto_sync_enabled = True
+        plugin._monitor_task = None
+        plugin._auto_task = None
+        release = asyncio.Event()
+
+        async def monitor():
+            await release.wait()
+
+        plugin._health_monitor_loop = monitor
+        plugin._auto_sync_loop = AsyncMock(return_value=None)
+
+        async def run():
+            plugin._ensure_background_task()
+            first = plugin._monitor_task
+            plugin._ensure_background_task()
+            second = plugin._monitor_task
+            release.set()
+            await second
+            return first, second
+
+        first, second = asyncio.run(run())
+        self.assertIs(first, second)
+        self.assertIsNone(plugin._auto_task)
+        plugin._auto_sync_loop.assert_not_awaited()
+
+    def test_recent_natural_refresh_failure_backs_off_unless_explicitly_forced(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        plugin.natural_query_sync_minutes = 15
+        plugin._natural_refresh_task = None
+        plugin._pending_refresh_types = set()
+        plugin._active_refresh_types = set()
+
+        class Query:
+            @staticmethod
+            def sync_types_for_focus(focus):
+                return ("sleep",)
+
+            async def latest_sync_at(self, data_types):
+                return None
+
+            async def latest_failure_at(self, data_types):
+                return datetime.now(UTC).isoformat()
+
+        plugin.query_service = Query()
+        plugin._sync = AsyncMock(return_value={})
+
+        async def run():
+            skipped = await plugin._refresh_for_natural_question(
+                "昨天睡眠", wait_for_result=False
+            )
+            forced = await plugin._refresh_for_natural_question(
+                "刷新睡眠", wait_for_result=True
+            )
+            return skipped, forced
+
+        skipped, forced = asyncio.run(run())
+        self.assertFalse(skipped)
+        self.assertTrue(forced)
+        plugin._sync.assert_awaited_once_with(data_types={"sleep"})
 
     def test_zero_retention_configuration_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

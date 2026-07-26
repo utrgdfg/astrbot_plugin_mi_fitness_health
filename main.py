@@ -146,7 +146,11 @@ class MiFitnessHealthPlugin(Star):
             self._monitor_task = asyncio.create_task(
                 self._health_monitor_loop(), name=f"{self.name}-health-monitor"
             )
-        elif (
+        if monitor_ready:
+            # The monitor loop already performs periodic cloud sync. Returning
+            # here prevents repeated commands from starting a second loop.
+            return
+        if (
             self.auto_sync_enabled
             and self.user_id
             and self.pass_token
@@ -599,7 +603,8 @@ class MiFitnessHealthPlugin(Star):
         """
         data_types = set(self.query_service.sync_types_for_focus(text))
         last_sync = await self.query_service.latest_sync_at(tuple(sorted(data_types)))
-        if last_sync and not self._wants_fresh_cloud_data(text):
+        force_refresh = self._wants_fresh_cloud_data(text)
+        if last_sync and not force_refresh:
             try:
                 parsed = datetime.fromisoformat(last_sync)
                 parsed = parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
@@ -609,6 +614,24 @@ class MiFitnessHealthPlugin(Star):
                     return False
             except ValueError:
                 pass
+        if not force_refresh:
+            last_failure = await self.query_service.latest_failure_at(
+                tuple(sorted(data_types))
+            )
+            if last_failure:
+                try:
+                    parsed_failure = datetime.fromisoformat(last_failure)
+                    parsed_failure = (
+                        parsed_failure
+                        if parsed_failure.tzinfo
+                        else parsed_failure.replace(tzinfo=UTC)
+                    )
+                    if datetime.now(UTC) - parsed_failure < timedelta(
+                        minutes=self.natural_query_sync_minutes
+                    ):
+                        return False
+                except ValueError:
+                    pass
         self._pending_refresh_types.update(data_types - self._active_refresh_types)
         if self._natural_refresh_task is None or self._natural_refresh_task.done():
             self._natural_refresh_task = asyncio.create_task(
@@ -621,7 +644,7 @@ class MiFitnessHealthPlugin(Star):
             return await asyncio.wait_for(
                 asyncio.shield(self._natural_refresh_task), timeout=20
             )
-        except TimeoutError:
+        except asyncio.TimeoutError:
             logger.warning(
                 "Mi Fitness natural-query refresh timed out; using local cache"
             )
@@ -734,7 +757,7 @@ class MiFitnessHealthPlugin(Star):
                 "未配置 user_id 或 pass_token。请在插件配置页填写后重新加载插件。"
             )
             return
-        if not await self.sync_service.connect():
+        if not await self.sync_service.connect(force=True):
             yield event.plain_result(
                 f"健康连接失败：{redact_error(self.adapter.last_error or '未知错误')}\n"
                 "遇到验证码、二次验证或风控时，请在浏览器完成验证后更新 Cookie。"
@@ -807,7 +830,7 @@ class MiFitnessHealthPlugin(Star):
         yield event.plain_result(
             today_text(activity, rates, measurement, self.query_service.timezone)
             + "\n"
-            + await self.query_service.care_snapshot()
+            + await self.query_service.care_snapshot("睡眠 血氧 压力")
         )
 
     @filter.command("健康详情")
@@ -818,7 +841,7 @@ class MiFitnessHealthPlugin(Star):
             return
         yield event.plain_result(
             "健康详情（云端已同步数据，非实时）\n"
-            + await self.query_service.care_snapshot()
+            + await self.query_service.care_snapshot("睡眠 血氧 压力")
         )
 
     @filter.command("健康诊断")
@@ -849,18 +872,34 @@ class MiFitnessHealthPlugin(Star):
         private_state = await asyncio.to_thread(
             self.database.private_owner_session, self.owner_platform_id
         )
+        monitor_running = bool(self._monitor_task and not self._monitor_task.done())
+        auto_running = bool(self._auto_task and not self._auto_task.done())
         if self._auto_sync_paused:
             background_status = "已暂停（请检查授权）"
-        elif self.proactive_monitor_enabled:
+        elif monitor_running:
             background_status = f"后台生活数据同步（每 {self.monitor_interval} 分钟）"
+        elif auto_running:
+            background_status = f"自动同步（每 {self.sync_interval} 分钟）"
+        elif not self.user_id or not self.pass_token:
+            background_status = "未运行（缺少小米凭证）"
+        elif not self.owner_platform_id or not self.owner_platform_instance_id:
+            background_status = "未运行（所有者身份未完整配置）"
+        elif (
+            self.auto_sync_enabled
+            and self.proactive_monitor_enabled
+            and not self.allow_health_data_to_llm
+        ):
+            background_status = "普通自动同步（模型数据授权未开启）"
+        elif self.proactive_monitor_enabled and not self.allow_health_data_to_llm:
+            background_status = "未运行（模型数据授权未开启，自动同步已关闭）"
         else:
-            background_status = "开启" if self.auto_sync_enabled else "关闭"
+            background_status = "未运行"
         yield event.plain_result(
             f"健康状态\n连接：{'已连接' if self.adapter.is_connected() else '未连接/待验证'}\n"
             f"区域：{self.adapter.region or '自动探测'}\n最近同步完成时间：{self.query_service.display_timestamp(last_sync) if last_sync else '暂无'}\n"
             f"平台实例校验：{'已启用' if self.owner_platform_instance_id else '未配置（健康功能禁用）'}\n"
             f"后台同步：{background_status}\n"
-            f"后台生活数据同步：{'开启（每 ' + str(self.monitor_interval) + ' 分钟）' if self.proactive_monitor_enabled else '关闭'}\n"
+            f"主动关心任务：{'运行中' if monitor_running else '未运行'}\n"
             f"主动私聊目标：{'已记录' if private_state else '待所有者先私聊一次'}\n"
             f"自然语言查询刷新：{self.natural_query_sync_minutes} 分钟\n"
             f"模型健康数据授权：{'开启' if self.allow_health_data_to_llm else '关闭'}\n"

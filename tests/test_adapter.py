@@ -7,6 +7,7 @@ import json
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta, timezone
+from email.utils import format_datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -453,7 +454,11 @@ class AdapterTest(unittest.TestCase):
 
         class FixtureAdapter(MiFitnessCloudAdapter):
             async def _fetch_key(self, key, start, end, region):
-                if key in {"steps", "heart_rate", "weight", "sleep", "spo2", "stress"}:
+                if key == "heart_rate":
+                    return [{"time": 1784692800, "value": {"bpm": 72}}]
+                if key == "spo2":
+                    return [{"time": 1784692800, "value": {"spo2": 97}}]
+                if key in {"steps", "weight", "sleep", "stress"}:
                     return [{"time": 1784692800000, "value": "{}"}]
                 return []
 
@@ -490,6 +495,61 @@ class AdapterTest(unittest.TestCase):
         records = asyncio.run(collect())
         self.assertEqual([record.bpm for record in records], [71])
 
+    def test_invalid_primary_heart_rate_rows_do_not_hide_valid_alias(self) -> None:
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region):
+                if key == "heart_rate":
+                    return [{"time": 1784692800, "value": {"unexpected": 71}}]
+                if key == "heartrate":
+                    return [{"time": 1784692860, "value": {"heart_rate": 73}}]
+                return []
+
+        async def collect():
+            adapter = FixtureAdapter("user", "token", "cn")
+            return [
+                row
+                async for row in adapter.iter_heart_rate(
+                    datetime.now(UTC), datetime.now(UTC)
+                )
+            ]
+
+        records = asyncio.run(collect())
+        self.assertEqual([record.bpm for record in records], [73])
+
+    def test_candidate_key_error_is_not_reported_as_empty_success(self) -> None:
+        class HeartAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region):
+                if key == "heart_rate":
+                    raise RuntimeError("synthetic heart endpoint failure")
+                return []
+
+        class SpO2Adapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region):
+                if key == "spo2":
+                    raise RuntimeError("synthetic spo2 endpoint failure")
+                return []
+
+        async def collect_heart():
+            return [
+                row
+                async for row in HeartAdapter("user", "token", "cn").iter_heart_rate(
+                    datetime.now(UTC), datetime.now(UTC)
+                )
+            ]
+
+        async def collect_spo2():
+            return [
+                row
+                async for row in SpO2Adapter("user", "token", "cn").iter_spo2(
+                    datetime.now(UTC), datetime.now(UTC)
+                )
+            ]
+
+        with self.assertRaisesRegex(RuntimeError, "heart endpoint failure"):
+            asyncio.run(collect_heart())
+        with self.assertRaisesRegex(RuntimeError, "spo2 endpoint failure"):
+            asyncio.run(collect_spo2())
+
     def test_blood_oxygen_alias_is_used_by_normal_sync(self) -> None:
         class FixtureAdapter(MiFitnessCloudAdapter):
             async def _fetch_key(self, key, start, end, region):
@@ -512,8 +572,10 @@ class AdapterTest(unittest.TestCase):
     def test_discovery_reports_alias_only_heart_rate_and_spo2(self) -> None:
         class FixtureAdapter(MiFitnessCloudAdapter):
             async def _fetch_key(self, key, start, end, region):
-                if key in {"heartrate", "blood_oxygen"}:
-                    return [{"time": 1784692800, "value": {}}]
+                if key == "heartrate":
+                    return [{"time": 1784692800, "value": {"heart_rate": 72}}]
+                if key == "blood_oxygen":
+                    return [{"time": 1784692800, "value": {"blood_oxygen": 97}}]
                 return []
 
         available = asyncio.run(
@@ -542,6 +604,12 @@ class AdapterTest(unittest.TestCase):
         adapter = FixtureAdapter("user", "token")
         with self.assertRaisesRegex(RuntimeError, "手动选择 region"):
             asyncio.run(adapter._discover_region())
+
+    def test_http_date_retry_after_is_supported_and_bounded(self) -> None:
+        retry_at = format_datetime(datetime.now(UTC) + timedelta(seconds=5))
+        delay = MiFitnessCloudAdapter._retry_after_delay(retry_at, 0)
+        self.assertGreaterEqual(delay, 3.0)
+        self.assertLessEqual(delay, 6.0)
 
     def test_activity_deduplicates_same_minute_and_uses_user_timezone(self) -> None:
         base = int(datetime(2026, 1, 1, 16, 30, tzinfo=UTC).timestamp())

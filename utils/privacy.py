@@ -16,7 +16,7 @@ def redact_error(error: Exception | str) -> str:
     """
     message = str(error)
     message = re.sub(
-        r"(?im)^\s*(authorization|set-cookie|cookie)\s*:\s*.*$",
+        r"(?im)^\s*(authorization|set-cookie|cookie|x-api-key|api-key)\s*:\s*.*$",
         r"\1: ***",
         message,
     )
@@ -27,12 +27,18 @@ def redact_error(error: Exception | str) -> str:
     )
     message = re.sub(
         (
-            r"(?i)\b(passToken|serviceToken|accessToken|refreshToken|userId|"
-            r"cUserId|ssecurity|cookie|set-cookie|authorization|_nonce|"
-            r"signature|rc4_hash__)\b[\"']?\s*(?:=|:)\s*"
+            r"(?i)\b(passToken|pass_token|serviceToken|accessToken|refreshToken|"
+            r"userId|cUserId|ssecurity|cookie|set-cookie|authorization|_nonce|"
+            r"signature|rc4_hash__|api[_-]?key|x-api-key|client[_-]?secret|"
+            r"secret[_-]?key|private[_-]?key)\b[\"']?\s*(?:=|:)\s*"
             r"(?:[\"'][^\"']*[\"']|[^\s;,&]+)"
         ),
         r"\1=***",
+        message,
+    )
+    message = re.sub(
+        r"(?i)\b(?:sk-(?:ant-)?[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{12,})\b",
+        "***",
         message,
     )
     message = re.sub(r"https?://\S+", "[remote URL]", message)

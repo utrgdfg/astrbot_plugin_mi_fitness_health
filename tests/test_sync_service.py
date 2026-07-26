@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from datetime import UTC
 from pathlib import Path
+from unittest.mock import patch
 
 import astrbot_test_stub  # noqa: F401
 
@@ -75,8 +76,8 @@ class SyncServiceTest(unittest.TestCase):
             result = asyncio.run(service.sync(1, {"sleep"}))
             self.assertEqual(adapter.calls, ["sleep"])
             self.assertEqual(set(result["details"]), {"sleep"})
-            self.assertIsNotNone(database.latest_sync_at(("sleep",)))
-            self.assertIsNone(database.latest_sync_at(("heart_rate",)))
+            self.assertIsNotNone(database.latest_sync_at("user", ("sleep",)))
+            self.assertIsNone(database.latest_sync_at("user", ("heart_rate",)))
 
     def test_connection_and_sync_share_one_operation_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -123,3 +124,50 @@ class SyncServiceTest(unittest.TestCase):
 
             asyncio.run(run())
             self.assertEqual(adapter.max_active, 1)
+
+    def test_forced_connection_closes_existing_session_before_reconnecting(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+
+            class ReconnectingAdapter(_RecordingAdapter):
+                def __init__(self):
+                    super().__init__()
+                    self.closed = 0
+                    self.connected_count = 0
+
+                async def close(self):
+                    self.closed += 1
+                    self.connected = False
+
+                async def connect(self):
+                    self.connected_count += 1
+                    self.connected = True
+                    return True
+
+            adapter = ReconnectingAdapter()
+            service = SyncService(adapter, database, "user")
+            self.assertTrue(asyncio.run(service.connect(force=True)))
+            self.assertEqual(adapter.closed, 1)
+            self.assertEqual(adapter.connected_count, 1)
+
+    def test_entire_sync_has_a_bounded_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+
+            class SlowAdapter(_RecordingAdapter):
+                async def _empty(self, name):
+                    await asyncio.sleep(1)
+                    if False:
+                        yield None
+
+            service = SyncService(SlowAdapter(), database, "user")
+            with patch(
+                "astrbot_plugin_mi_fitness_health.services.sync_service.SYNC_TIMEOUT_SECONDS",
+                0.001,
+            ):
+                with self.assertRaises(RuntimeError):
+                    asyncio.run(service.sync(1, {"sleep"}))

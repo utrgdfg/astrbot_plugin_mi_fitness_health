@@ -12,6 +12,7 @@ from astrbot_plugin_mi_fitness_health.models import (
     BodyMeasurement,
     DailyActivity,
     HeartRateSample,
+    SleepSession,
 )
 from astrbot_plugin_mi_fitness_health.services.query_service import QueryService
 from astrbot_plugin_mi_fitness_health.storage import Database
@@ -75,6 +76,48 @@ class QueryServiceTest(unittest.TestCase):
             snapshot = asyncio.run(service.care_snapshot("我昨天睡得怎么样"))
             self.assertIn("暂无已同步记录", snapshot)
             self.assertIn("不代表设备不支持", snapshot)
+
+    def test_yesterday_sleep_excludes_sessions_ending_today(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            service = QueryService(database, "user", "Asia/Shanghai")
+            local_now = datetime.now(service.timezone)
+            yesterday = local_now.date() - timedelta(days=1)
+            yesterday_end = datetime.combine(
+                yesterday,
+                datetime.min.time(),
+                tzinfo=service.timezone,
+            ) + timedelta(hours=8)
+            today_end = yesterday_end + timedelta(days=1)
+            database.upsert_sleep(
+                "user",
+                SleepSession(
+                    "yesterday",
+                    (yesterday_end - timedelta(minutes=450)).astimezone(UTC),
+                    yesterday_end.astimezone(UTC),
+                    450,
+                    420,
+                    30,
+                    88,
+                ),
+            )
+            database.upsert_sleep(
+                "user",
+                SleepSession(
+                    "today",
+                    (today_end - timedelta(minutes=130)).astimezone(UTC),
+                    today_end.astimezone(UTC),
+                    130,
+                    111,
+                    19,
+                    70,
+                ),
+            )
+
+            snapshot = asyncio.run(service.care_snapshot("昨天睡眠"))
+            self.assertIn("420 分钟", snapshot)
+            self.assertNotIn("111 分钟", snapshot)
 
     def test_display_timestamps_use_configured_user_timezone(self) -> None:
         """UTC storage timestamps must display as local time, not raw +00:00 text."""

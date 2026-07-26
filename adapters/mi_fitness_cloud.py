@@ -11,6 +11,7 @@ import struct
 from collections import defaultdict
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta, tzinfo
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlencode
 
 import httpx
@@ -44,6 +45,7 @@ REGION_PROBE_KEYS = (
     "stress",
 )
 CONNECT_TIMEOUT_SECONDS = 90
+MAX_RECORDS_PER_KEY = 100_000
 
 
 class MiFitnessAuthenticationError(RuntimeError):
@@ -168,7 +170,7 @@ class MiFitnessCloudAdapter(DataAdapter):
             except MiFitnessAuthenticationError as error:
                 self.authentication_failed = True
                 self.last_error = redact_error(error)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 self.last_error = "连接小米健康云超时，请稍后重试或手动指定区域。"
             except (httpx.HTTPError, ValueError, KeyError, RuntimeError) as error:
                 self.last_error = redact_error(error)
@@ -263,10 +265,7 @@ class MiFitnessCloudAdapter(DataAdapter):
                     )
                 if response.status_code == 429 and attempt < 2:
                     retry_after = response.headers.get("Retry-After", "")
-                    try:
-                        delay = max(0.5, min(float(retry_after), 10.0))
-                    except ValueError:
-                        delay = 0.5 * (2**attempt)
+                    delay = self._retry_after_delay(retry_after, attempt)
                     await asyncio.sleep(delay)
                     continue
                 if response.status_code >= 400 and response.status_code not in {
@@ -290,15 +289,27 @@ class MiFitnessCloudAdapter(DataAdapter):
                     if any(
                         marker in message.lower()
                         for marker in (
-                            "auth",
-                            "login",
-                            "token",
-                            "session",
+                            "unauthorized",
+                            "authentication failed",
+                            "authentication expired",
+                            "authorization expired",
+                            "not logged in",
+                            "login required",
+                            "invalid token",
+                            "token expired",
+                            "invalid session",
+                            "session expired",
+                            "invalid credential",
+                            "credentials expired",
                             "401",
                             "403",
-                            "登录",
-                            "授权",
-                            "凭证",
+                            "请登录",
+                            "登录失效",
+                            "登录过期",
+                            "授权失效",
+                            "授权过期",
+                            "凭证失效",
+                            "凭证过期",
                         )
                     ):
                         self._connected = False
@@ -327,6 +338,24 @@ class MiFitnessCloudAdapter(DataAdapter):
         raise RuntimeError(
             f"小米健康云请求失败：{redact_error(last_error or 'unknown error')}"
         )
+
+    @staticmethod
+    def _retry_after_delay(value: str, attempt: int) -> float:
+        """Parse both Retry-After seconds and HTTP-date values with a safe cap."""
+        try:
+            delay = float(value)
+        except (TypeError, ValueError):
+            try:
+                retry_at = parsedate_to_datetime(value)
+                retry_at = (
+                    retry_at.replace(tzinfo=UTC)
+                    if retry_at.tzinfo is None
+                    else retry_at.astimezone(UTC)
+                )
+                delay = (retry_at - datetime.now(UTC)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                delay = 0.5 * (2**attempt)
+        return max(0.5, min(delay, 10.0))
 
     @staticmethod
     def _utc_timestamp(value: datetime) -> int:
@@ -382,6 +411,10 @@ class MiFitnessCloudAdapter(DataAdapter):
                     if fingerprint not in seen_records:
                         seen_records.add(fingerprint)
                         records.append(item)
+                        if len(records) > MAX_RECORDS_PER_KEY:
+                            raise RuntimeError(
+                                f"小米健康云 {key} 数据超过单次同步安全上限。"
+                            )
             next_cursor = (
                 result.get("next_key")
                 if isinstance(result.get("next_key"), str)
@@ -430,7 +463,7 @@ class MiFitnessCloudAdapter(DataAdapter):
                         return region
                 except MiFitnessAuthenticationError:
                     raise
-                except TimeoutError as error:
+                except asyncio.TimeoutError as error:
                     last_error = error
                     break
                 except RuntimeError as error:
@@ -456,6 +489,32 @@ class MiFitnessCloudAdapter(DataAdapter):
             ("spo2", SPO2_KEYS),
             ("stress", ("stress",)),
         ):
+            if data_type == "heart_rate":
+                try:
+                    if [
+                        row
+                        async for row in self.iter_heart_rate(
+                            now - timedelta(days=30), now
+                        )
+                    ]:
+                        types.append(data_type)
+                except MiFitnessAuthenticationError:
+                    raise
+                except RuntimeError:
+                    pass
+                continue
+            if data_type == "spo2":
+                try:
+                    if [
+                        row
+                        async for row in self.iter_spo2(now - timedelta(days=30), now)
+                    ]:
+                        types.append(data_type)
+                except MiFitnessAuthenticationError:
+                    raise
+                except RuntimeError:
+                    pass
+                continue
             found = False
             for key in keys:
                 try:
@@ -579,35 +638,48 @@ class MiFitnessCloudAdapter(DataAdapter):
         ``resting_heart_rate`` is treated as an optional account-specific
         fallback and cannot invalidate records returned by ``heart_rate``.
         """
-        records: list[tuple[dict, bool, str]] = []
-        successful_keys = 0
+        samples: list[HeartRateSample] = []
         errors: list[RuntimeError] = []
         for key in PRIMARY_HEART_RATE_KEYS:
             try:
-                key_records = await self._fetch_key(key, start, end, self.region)
-                successful_keys += 1
-                if key_records:
-                    records.extend((item, False, key) for item in key_records)
-                    break
+                samples.extend(
+                    self._parse_heart_rate_records(
+                        await self._fetch_key(key, start, end, self.region),
+                        is_resting=False,
+                    )
+                )
             except MiFitnessAuthenticationError:
                 raise
             except RuntimeError as error:
                 errors.append(error)
         for key in RESTING_HEART_RATE_KEYS:
             try:
-                records.extend(
-                    (item, True, key)
-                    for item in await self._fetch_key(key, start, end, self.region)
+                samples.extend(
+                    self._parse_heart_rate_records(
+                        await self._fetch_key(key, start, end, self.region),
+                        is_resting=True,
+                    )
                 )
-                successful_keys += 1
             except MiFitnessAuthenticationError:
                 raise
             except RuntimeError as error:
                 errors.append(error)
-        if not successful_keys and errors:
+        if not samples and errors:
             raise errors[-1]
         seen: set[tuple[int, int]] = set()
-        for item, is_resting, _key in records:
+        for sample in samples:
+            identity = (int(sample.timestamp.timestamp()), sample.bpm)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            yield sample
+
+    def _parse_heart_rate_records(
+        self, records: list[dict], *, is_resting: bool
+    ) -> list[HeartRateSample]:
+        """Validate one candidate key before it can suppress another alias."""
+        samples: list[HeartRateSample] = []
+        for item in records:
             record_time = self._record_time(item)
             if not record_time:
                 continue
@@ -625,10 +697,6 @@ class MiFitnessCloudAdapter(DataAdapter):
             )
             if bpm is None:
                 continue
-            identity = (int(timestamp.timestamp()), int(bpm))
-            if identity in seen:
-                continue
-            seen.add(identity)
             kind = (
                 "passive"
                 if is_resting or str(value.get("type", "0")) == "0"
@@ -636,13 +704,16 @@ class MiFitnessCloudAdapter(DataAdapter):
             )
             is_workout = bool(value.get("workout_id") or value.get("is_workout"))
             source = "resting_hr" if is_resting else "hr"
-            yield HeartRateSample(
-                f"mi_fitness_{source}_{int(timestamp.timestamp())}_{int(bpm)}",
-                timestamp,
-                int(bpm),
-                kind,
-                is_workout,
+            samples.append(
+                HeartRateSample(
+                    f"mi_fitness_{source}_{int(timestamp.timestamp())}_{int(bpm)}",
+                    timestamp,
+                    int(bpm),
+                    kind,
+                    is_workout,
+                )
             )
+        return samples
 
     async def iter_body_measurements(
         self, start: datetime, end: datetime
@@ -724,24 +795,34 @@ class MiFitnessCloudAdapter(DataAdapter):
         self, start: datetime, end: datetime
     ) -> AsyncIterator[SpO2Sample]:
         """Yield validated blood-oxygen records; unsupported keys simply return no rows."""
-        records: list[dict] = []
+        samples: list[SpO2Sample] = []
         errors: list[RuntimeError] = []
-        successful_keys = 0
         for key in SPO2_KEYS:
             try:
-                candidate = await self._fetch_key(key, start, end, self.region)
-                successful_keys += 1
-                if candidate:
-                    records = candidate
-                    break
+                samples.extend(
+                    self._parse_spo2_records(
+                        await self._fetch_key(key, start, end, self.region)
+                    )
+                )
             except MiFitnessAuthenticationError:
                 raise
             except RuntimeError as error:
                 errors.append(error)
-        if not successful_keys and errors:
+        if not samples and errors:
             raise errors[-1]
+        seen_timestamps: set[int] = set()
+        for sample in samples:
+            timestamp = int(sample.timestamp.timestamp())
+            if timestamp in seen_timestamps:
+                continue
+            seen_timestamps.add(timestamp)
+            yield sample
+
+    def _parse_spo2_records(self, records: list[dict]) -> list[SpO2Sample]:
+        """Return only validated samples from one SpO2 candidate key."""
+        samples: list[SpO2Sample] = []
         for item in records:
-            time = self._record_time(item)
+            record_time = self._record_time(item)
             value = self._value(item)
             raw_percent = value.get("spo2")
             if raw_percent is None:
@@ -751,13 +832,16 @@ class MiFitnessCloudAdapter(DataAdapter):
             if raw_percent is None:
                 raw_percent = value.get("value")
             percent = self._number(raw_percent, 70, 100)
-            if time and percent is not None:
-                timestamp, _ = time
-                yield SpO2Sample(
-                    f"mi_fitness_spo2_{int(timestamp.timestamp())}",
-                    timestamp,
-                    int(percent),
+            if record_time and percent is not None:
+                timestamp, _ = record_time
+                samples.append(
+                    SpO2Sample(
+                        f"mi_fitness_spo2_{int(timestamp.timestamp())}",
+                        timestamp,
+                        int(percent),
+                    )
                 )
+        return samples
 
     async def iter_stress(
         self, start: datetime, end: datetime

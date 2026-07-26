@@ -18,7 +18,7 @@ from ..models import (
     StressSample,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class Database:
@@ -172,6 +172,46 @@ class Database:
                         ON stress_samples(user_id, timestamp);
                     CREATE INDEX IF NOT EXISTS idx_alert_created
                         ON alerts(alert_type, created_at);
+                    """
+                )
+                connection.execute("UPDATE schema_version SET version = 5")
+                current = 5
+            if current < 6:
+                alert_columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(alerts)"
+                    ).fetchall()
+                }
+                if "owner_platform_id" not in alert_columns:
+                    connection.execute(
+                        "ALTER TABLE alerts ADD COLUMN owner_platform_id TEXT NOT NULL DEFAULT ''"
+                    )
+                # Legacy sync state did not identify the Xiaomi account. It
+                # cannot be assigned safely, so discard only freshness/error
+                # metadata and force each configured account to refresh.
+                connection.executescript(
+                    """
+                    DROP TABLE IF EXISTS sync_state;
+                    CREATE TABLE sync_state (
+                        user_id TEXT NOT NULL,
+                        data_type TEXT NOT NULL,
+                        last_sync_at TEXT NOT NULL,
+                        last_record_at TEXT,
+                        PRIMARY KEY(user_id, data_type)
+                    );
+                    DROP TABLE IF EXISTS sync_failures;
+                    CREATE TABLE sync_failures (
+                        user_id TEXT NOT NULL,
+                        data_type TEXT NOT NULL,
+                        last_attempt_at TEXT NOT NULL,
+                        last_error TEXT NOT NULL,
+                        PRIMARY KEY(user_id, data_type)
+                    );
+                    DROP INDEX IF EXISTS idx_alert_event;
+                    CREATE UNIQUE INDEX idx_alert_event
+                        ON alerts(owner_platform_id,alert_type,event_key)
+                        WHERE event_key IS NOT NULL;
                     """
                 )
                 connection.execute(
@@ -462,32 +502,34 @@ class Database:
         return "updated" if exists else "added"
 
     def update_sync_state(
-        self, data_type: str, last_record_at: datetime | None
+        self, user_id: str, data_type: str, last_record_at: datetime | None
     ) -> None:
         """Record a successful completion and clear any older failure."""
         with self._connect() as connection:
             connection.execute(
-                """INSERT INTO sync_state(data_type,last_sync_at,last_record_at) VALUES(?,?,?)
-                   ON CONFLICT(data_type) DO UPDATE SET last_sync_at=excluded.last_sync_at,
+                """INSERT INTO sync_state(user_id,data_type,last_sync_at,last_record_at) VALUES(?,?,?,?)
+                   ON CONFLICT(user_id,data_type) DO UPDATE SET last_sync_at=excluded.last_sync_at,
                    last_record_at=excluded.last_record_at""",
                 (
+                    user_id,
                     data_type,
                     self._now(),
                     last_record_at.isoformat() if last_record_at else None,
                 ),
             )
             connection.execute(
-                "DELETE FROM sync_failures WHERE data_type=?", (data_type,)
+                "DELETE FROM sync_failures WHERE user_id=? AND data_type=?",
+                (user_id, data_type),
             )
 
-    def update_sync_failure(self, data_type: str, reason: str) -> None:
+    def update_sync_failure(self, user_id: str, data_type: str, reason: str) -> None:
         """Record a sanitized dataset failure without replacing its last success."""
         with self._connect() as connection:
             connection.execute(
-                """INSERT INTO sync_failures(data_type,last_attempt_at,last_error)
-                   VALUES(?,?,?) ON CONFLICT(data_type) DO UPDATE SET
+                """INSERT INTO sync_failures(user_id,data_type,last_attempt_at,last_error)
+                   VALUES(?,?,?,?) ON CONFLICT(user_id,data_type) DO UPDATE SET
                    last_attempt_at=excluded.last_attempt_at,last_error=excluded.last_error""",
-                (data_type, self._now(), reason[:180]),
+                (user_id, data_type, self._now(), reason[:180]),
             )
 
     def upsert_sleep(self, user_id: str, record: SleepSession) -> str:
@@ -555,12 +597,15 @@ class Database:
             )
         return "updated" if old else "added"
 
-    def latest_sync_at(self, data_types: tuple[str, ...] | None = None) -> str | None:
+    def latest_sync_at(
+        self, user_id: str, data_types: tuple[str, ...] | None = None
+    ) -> str | None:
         """Return global latest success or the oldest valid success for required types."""
         with self._connect() as connection:
             if not data_types:
                 rows = connection.execute(
-                    "SELECT last_sync_at FROM sync_state"
+                    "SELECT last_sync_at FROM sync_state WHERE user_id=?",
+                    (user_id,),
                 ).fetchall()
                 timestamps = self._valid_utc_timestamps(
                     row["last_sync_at"] for row in rows
@@ -571,9 +616,9 @@ class Database:
             rows = connection.execute(
                 f"""SELECT s.data_type,s.last_sync_at,f.last_attempt_at
                     FROM sync_state s LEFT JOIN sync_failures f
-                    ON f.data_type=s.data_type
-                    WHERE s.data_type IN ({placeholders})""",
-                unique_types,
+                    ON f.user_id=s.user_id AND f.data_type=s.data_type
+                    WHERE s.user_id=? AND s.data_type IN ({placeholders})""",
+                (user_id, *unique_types),
             ).fetchall()
         if len(rows) != len(unique_types):
             return None
@@ -602,14 +647,32 @@ class Database:
                 continue
         return parsed_values
 
-    def sync_failure(self, data_type: str) -> dict[str, Any] | None:
+    def sync_failure(self, user_id: str, data_type: str) -> dict[str, Any] | None:
         """Return the latest unresolved sanitized failure for one dataset."""
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT last_attempt_at,last_error FROM sync_failures WHERE data_type=?",
-                (data_type,),
+                """SELECT last_attempt_at,last_error FROM sync_failures
+                   WHERE user_id=? AND data_type=?""",
+                (user_id, data_type),
             ).fetchone()
         return dict(row) if row else None
+
+    def latest_sync_failure_at(
+        self, user_id: str, data_types: tuple[str, ...]
+    ) -> str | None:
+        """Return the newest unresolved attempt time for selected datasets."""
+        unique_types = tuple(dict.fromkeys(data_types))
+        if not unique_types:
+            return None
+        placeholders = ",".join("?" for _ in unique_types)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""SELECT last_attempt_at FROM sync_failures
+                    WHERE user_id=? AND data_type IN ({placeholders})""",
+                (user_id, *unique_types),
+            ).fetchall()
+        timestamps = self._valid_utc_timestamps(row["last_attempt_at"] for row in rows)
+        return max(timestamps).isoformat() if timestamps else None
 
     def today_activity(self, user_id: str, date: str) -> dict[str, Any] | None:
         """Return one local-day activity summary."""
@@ -628,6 +691,23 @@ class Database:
             rows = connection.execute(
                 "SELECT * FROM daily_activity WHERE user_id=? AND date<=? ORDER BY date DESC LIMIT ?",
                 (user_id, end_date, max(1, min(limit, 7))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def recent_activity_between(
+        self,
+        user_id: str,
+        start_date: str,
+        end_date: str,
+        limit: int = 7,
+    ) -> list[dict[str, Any]]:
+        """Return bounded activity rows inside an explicit local-date range."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM daily_activity
+                   WHERE user_id=? AND date BETWEEN ? AND ?
+                   ORDER BY date DESC LIMIT ?""",
+                (user_id, start_date, end_date, max(1, min(limit, 31))),
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -671,6 +751,19 @@ class Database:
             ).fetchone()
         return dict(row) if row else None
 
+    def latest_measurement_between(
+        self, user_id: str, start_timestamp: str, end_timestamp: str
+    ) -> dict[str, Any] | None:
+        """Return the newest body measurement inside a half-open UTC range."""
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT * FROM body_measurements
+                   WHERE user_id=? AND timestamp>=? AND timestamp<?
+                   ORDER BY timestamp DESC LIMIT 1""",
+                (user_id, start_timestamp, end_timestamp),
+            ).fetchone()
+        return dict(row) if row else None
+
     def latest_sleep(self, user_id: str) -> dict[str, Any] | None:
         with self._connect() as c:
             row = c.execute(
@@ -688,6 +781,28 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def sleep_ending_between(
+        self,
+        user_id: str,
+        start_timestamp: str,
+        end_timestamp: str,
+        limit: int = 7,
+    ) -> list[dict[str, Any]]:
+        """Return sleep sessions whose wake time belongs to a UTC range."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM sleep_sessions
+                   WHERE user_id=? AND end_at>=? AND end_at<?
+                   ORDER BY end_at DESC LIMIT ?""",
+                (
+                    user_id,
+                    start_timestamp,
+                    end_timestamp,
+                    max(1, min(limit, 31)),
+                ),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def latest_metric(self, table: str, user_id: str) -> dict[str, Any] | None:
         if table not in {"spo2_samples", "stress_samples"}:
             raise ValueError("Unsupported metric table")
@@ -695,6 +810,25 @@ class Database:
             row = c.execute(
                 f"SELECT * FROM {table} WHERE user_id=? ORDER BY timestamp DESC LIMIT 1",
                 (user_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def latest_metric_between(
+        self,
+        table: str,
+        user_id: str,
+        start_timestamp: str,
+        end_timestamp: str,
+    ) -> dict[str, Any] | None:
+        """Return the newest validated metric inside a half-open UTC range."""
+        if table not in {"spo2_samples", "stress_samples"}:
+            raise ValueError("Unsupported metric table")
+        with self._connect() as connection:
+            row = connection.execute(
+                f"""SELECT * FROM {table}
+                    WHERE user_id=? AND timestamp>=? AND timestamp<?
+                    ORDER BY timestamp DESC LIMIT 1""",
+                (user_id, start_timestamp, end_timestamp),
             ).fetchone()
         return dict(row) if row else None
 
@@ -727,6 +861,7 @@ class Database:
 
     def add_alert(
         self,
+        owner_platform_id: str,
         alert_type: str,
         message: str,
         event_key: str | None = None,
@@ -735,39 +870,50 @@ class Database:
         """Persist a non-diagnostic alert audit record."""
         with self._connect() as connection:
             connection.execute(
-                "INSERT OR IGNORE INTO alerts(alert_type,created_at,message,event_key) VALUES(?,?,?,?)",
+                """INSERT OR IGNORE INTO alerts(
+                       alert_type,created_at,message,event_key,owner_platform_id
+                   ) VALUES(?,?,?,?,?)""",
                 (
                     alert_type,
                     (created_at or datetime.now(UTC)).astimezone(UTC).isoformat(),
                     message,
                     event_key,
+                    owner_platform_id,
                 ),
             )
 
-    def last_alert_at(self, alert_type: str) -> str | None:
+    def last_alert_at(self, owner_platform_id: str, alert_type: str) -> str | None:
         """Return the latest alert timestamp for cooldown enforcement."""
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT created_at FROM alerts WHERE alert_type=? ORDER BY id DESC LIMIT 1",
-                (alert_type,),
+                """SELECT created_at FROM alerts
+                   WHERE owner_platform_id=? AND alert_type=?
+                   ORDER BY id DESC LIMIT 1""",
+                (owner_platform_id, alert_type),
             ).fetchone()
         return row["created_at"] if row else None
 
-    def alert_event_sent(self, alert_type: str, event_key: str) -> bool:
+    def alert_event_sent(
+        self, owner_platform_id: str, alert_type: str, event_key: str
+    ) -> bool:
         """Return whether one exact cloud record sequence was already delivered."""
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT 1 FROM alerts WHERE alert_type=? AND event_key=? LIMIT 1",
-                (alert_type, event_key),
+                """SELECT 1 FROM alerts
+                   WHERE owner_platform_id=? AND alert_type=? AND event_key=? LIMIT 1""",
+                (owner_platform_id, alert_type, event_key),
             ).fetchone()
         return row is not None
 
-    def alert_count_since(self, alert_type: str, timestamp: str) -> int:
+    def alert_count_since(
+        self, owner_platform_id: str, alert_type: str, timestamp: str
+    ) -> int:
         """Count successfully delivered proactive messages in a bounded period."""
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT COUNT(*) AS value FROM alerts WHERE alert_type=? AND created_at>=?",
-                (alert_type, timestamp),
+                """SELECT COUNT(*) AS value FROM alerts
+                   WHERE owner_platform_id=? AND alert_type=? AND created_at>=?""",
+                (owner_platform_id, alert_type, timestamp),
             ).fetchone()
         return int(row["value"]) if row else 0
 
@@ -881,8 +1027,23 @@ class Database:
                     (owner_platform_id,),
                 ).rowcount,
             )
-            for table in ("alerts", "care_deliveries", "sync_state", "sync_failures"):
-                deleted += max(0, connection.execute(f"DELETE FROM {table}").rowcount)
+            deleted += max(
+                0,
+                connection.execute(
+                    "DELETE FROM alerts WHERE owner_platform_id=?",
+                    (owner_platform_id,),
+                ).rowcount,
+            )
+            deleted += max(
+                0, connection.execute("DELETE FROM care_deliveries").rowcount
+            )
+            for table in ("sync_state", "sync_failures"):
+                deleted += max(
+                    0,
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE user_id=?", (user_id,)
+                    ).rowcount,
+                )
         self.compact()
         return deleted
 

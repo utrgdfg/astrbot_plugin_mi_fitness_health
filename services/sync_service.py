@@ -9,6 +9,9 @@ from ..adapters import MiFitnessAuthenticationError, MiFitnessCloudAdapter
 from ..storage import Database
 from ..utils.privacy import redact_error
 
+SYNC_TIMEOUT_SECONDS = 300
+MAX_RECORDS_PER_DATASET = 100_000
+
 
 class SyncService:
     """Coordinate manual, startup, and periodic syncs with one async lock."""
@@ -53,9 +56,11 @@ class SyncService:
             getattr(self.adapter, "user_timezone", UTC),
         )
 
-    async def connect(self) -> bool:
+    async def connect(self, *, force: bool = False) -> bool:
         """Serialize explicit connection checks with all cloud operations."""
         async with self.lock:
+            if force and self.adapter.is_connected():
+                await self.adapter.close()
             return self.adapter.is_connected() or await self.adapter.connect()
 
     async def probe_data_keys(self, start: datetime, end: datetime) -> dict[str, str]:
@@ -96,88 +101,111 @@ class SyncService:
         if not allowed_types:
             raise ValueError("没有可同步的健康数据类型")
         async with self.lock:
-            if not self.adapter.is_connected() and not await self.adapter.connect():
-                reason = self.adapter.last_error or "小米健康云连接失败"
-                if getattr(self.adapter, "authentication_failed", False):
-                    raise MiFitnessAuthenticationError(reason)
-                raise RuntimeError(reason)
-            end = datetime.now(UTC)
-            start = end - timedelta(days=days + 2)  # delayed uploads and corrections
-            counters = {"added": 0, "updated": 0, "errors": 0}
-            details: dict[str, dict[str, object]] = {}
-            first_error = ""
-            for data_type, iterator in (
-                ("daily_activity", self.adapter.iter_daily_activity(start, end)),
-                ("heart_rate", self.adapter.iter_heart_rate(start, end)),
-                ("body_measurements", self.adapter.iter_body_measurements(start, end)),
-                ("sleep", self.adapter.iter_sleep(start, end)),
-                ("spo2", self.adapter.iter_spo2(start, end)),
-                ("stress", self.adapter.iter_stress(start, end)),
-            ):
-                if data_type not in allowed_types:
-                    continue
-                try:
-                    records = [record async for record in iterator]
-                    if data_type == "daily_activity":
-                        outcome = await asyncio.to_thread(
-                            self.database.replace_activity_records,
-                            self.user_id,
-                            records,
-                            getattr(self.adapter, "user_timezone", UTC),
-                        )
-                    else:
-                        outcome = await asyncio.to_thread(
-                            self.database.upsert_many,
-                            self.user_id,
-                            data_type,
-                            records,
-                        )
-                    latest = max(
-                        (
-                            getattr(record, "timestamp", None)
-                            or getattr(record, "collected_at", None)
-                            or getattr(record, "end_at", None)
-                            for record in records
-                        ),
-                        default=None,
-                    )
-                    await asyncio.to_thread(
-                        self.database.update_sync_state, data_type, latest
-                    )
-                    counters["added"] += outcome["added"]
-                    counters["updated"] += outcome["updated"]
-                    details[data_type] = {"fetched": len(records), **outcome}
-                except MiFitnessAuthenticationError:
-                    await asyncio.to_thread(
-                        self.database.update_sync_failure,
-                        data_type,
-                        "小米健康云授权已失效",
-                    )
-                    raise
-                except Exception as error:
-                    # A variant key can fail for one account. Keep the other
-                    # datasets usable and expose only a short safe status.
-                    counters["errors"] += 1
-                    reason = redact_error(error)
-                    first_error = first_error or reason
-                    details[data_type] = {"error": reason}
-                    await asyncio.to_thread(
-                        self.database.update_sync_failure, data_type, reason
-                    )
-            if counters["errors"] == len(details):
-                raise RuntimeError(
-                    f"所有健康数据集同步失败：{first_error or '未知云端错误'}"
+            try:
+                return await asyncio.wait_for(
+                    self._sync_locked(days, allowed_types),
+                    timeout=SYNC_TIMEOUT_SECONDS,
                 )
-            pruned = await asyncio.to_thread(
-                self.database.prune_user_data,
-                self.user_id,
-                self.retention_days,
-                getattr(self.adapter, "user_timezone", UTC),
+            except asyncio.TimeoutError as error:
+                raise RuntimeError(
+                    "小米健康云同步超过 5 分钟安全时限，已取消本次操作"
+                ) from error
+
+    async def _sync_locked(
+        self, days: int, allowed_types: set[str]
+    ) -> dict[str, object]:
+        """Run one bounded sync while the caller owns the operation lock."""
+        if not self.adapter.is_connected() and not await self.adapter.connect():
+            reason = self.adapter.last_error or "小米健康云连接失败"
+            if getattr(self.adapter, "authentication_failed", False):
+                raise MiFitnessAuthenticationError(reason)
+            raise RuntimeError(reason)
+        end = datetime.now(UTC)
+        start = end - timedelta(days=days + 2)  # delayed uploads and corrections
+        counters = {"added": 0, "updated": 0, "errors": 0}
+        details: dict[str, dict[str, object]] = {}
+        first_error = ""
+        for data_type, iterator in (
+            ("daily_activity", self.adapter.iter_daily_activity(start, end)),
+            ("heart_rate", self.adapter.iter_heart_rate(start, end)),
+            ("body_measurements", self.adapter.iter_body_measurements(start, end)),
+            ("sleep", self.adapter.iter_sleep(start, end)),
+            ("spo2", self.adapter.iter_spo2(start, end)),
+            ("stress", self.adapter.iter_stress(start, end)),
+        ):
+            if data_type not in allowed_types:
+                continue
+            try:
+                records = []
+                async for record in iterator:
+                    records.append(record)
+                    if len(records) > MAX_RECORDS_PER_DATASET:
+                        raise RuntimeError(f"{data_type} 超过单次同步记录安全上限")
+                if data_type == "daily_activity":
+                    outcome = await asyncio.to_thread(
+                        self.database.replace_activity_records,
+                        self.user_id,
+                        records,
+                        getattr(self.adapter, "user_timezone", UTC),
+                    )
+                else:
+                    outcome = await asyncio.to_thread(
+                        self.database.upsert_many,
+                        self.user_id,
+                        data_type,
+                        records,
+                    )
+                latest = max(
+                    (
+                        getattr(record, "timestamp", None)
+                        or getattr(record, "collected_at", None)
+                        or getattr(record, "end_at", None)
+                        for record in records
+                    ),
+                    default=None,
+                )
+                await asyncio.to_thread(
+                    self.database.update_sync_state,
+                    self.user_id,
+                    data_type,
+                    latest,
+                )
+                counters["added"] += outcome["added"]
+                counters["updated"] += outcome["updated"]
+                details[data_type] = {"fetched": len(records), **outcome}
+            except MiFitnessAuthenticationError:
+                await asyncio.to_thread(
+                    self.database.update_sync_failure,
+                    self.user_id,
+                    data_type,
+                    "小米健康云授权已失效",
+                )
+                raise
+            except Exception as error:
+                counters["errors"] += 1
+                reason = redact_error(error)
+                first_error = first_error or reason
+                details[data_type] = {"error": reason}
+                await asyncio.to_thread(
+                    self.database.update_sync_failure,
+                    self.user_id,
+                    data_type,
+                    reason,
+                )
+        if counters["errors"] == len(details):
+            raise RuntimeError(
+                f"所有健康数据集同步失败：{first_error or '未知云端错误'}"
             )
-            return {
-                **counters,
-                "types": len(details),
-                "days": days,
-                "details": details,
-                "pruned": pruned,
-            }
+        pruned = await asyncio.to_thread(
+            self.database.prune_user_data,
+            self.user_id,
+            self.retention_days,
+            getattr(self.adapter, "user_timezone", UTC),
+        )
+        return {
+            **counters,
+            "types": len(details),
+            "days": days,
+            "details": details,
+            "pruned": pruned,
+        }
