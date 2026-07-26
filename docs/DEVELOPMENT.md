@@ -38,7 +38,7 @@
 - 群聊不会返回健康数据。
 - 向 LLM 提供健康摘要需要用户显式开启授权，默认关闭。
 - 用户关注文本会被限长、压缩为单行并作为不可信数据隔离。
-- 深夜闸门通过 AstrBot 官方会话管理器读取当前所有者私聊，最多保留最近 8 条 user/assistant 文字和 4000 字符；图片、工具结果、系统消息不会传入。刚收到但尚未落入 AstrBot 历史的所有者文本仅在插件内存中短暂补充，不写入插件 SQLite。
+- 深夜闸门可通过 AstrBot 官方会话管理器、平台消息历史管理器或混合模式读取当前所有者私聊。配置范围为 0～50 条，总量仍限制为 4000 字符；可选择排除 assistant/Bot 文本，图片、工具结果和系统消息始终不会传入。刚收到但尚未落入 AstrBot 历史的所有者文本仅在插件内存中短暂补充，不写入插件 SQLite。
 - 日志和用户可见错误会脱敏 Cookie、Token、授权头、签名参数和常见模型密钥格式。
 - 主动消息只发送到已记录且与配置 Bot ID 匹配的统一会话标识。
 
@@ -49,6 +49,8 @@
 `context_decision_provider_id` 是可选的对话分类模型。它只接收经过长度限制和边界转义的当前所有者私聊消息，并返回严格 JSON；不接收小米生活数据。有效结果最多选择两个数据类别，随后仍由插件根据每类缓存的新鲜度决定是否联网刷新。模型失败或输出无效时按 1、5、15 分钟退避并回退到本地关键词规则；有效结果立即清零退避。原始消息的强制刷新意图单独保留，不依赖模型生成的焦点文本。
 
 `context_decision_prompt` 和 `proactive_decision_prompt` 使用官方 `text` 配置类型。前者只定义生活数据调用任务，后者定义深夜候选时机的发送取舍；代码固定追加允许类别、JSON 输出协议、提示注入隔离和 fail-closed 规则，配置提示词不能移除这些边界。
+
+`proactive_context_source` 支持 `conversation_history`、`platform_message_history` 与 `hybrid`。平台流水通过 AstrBot 官方 `message_history_manager.get()` 读取，并且仅解析已验证所有者私聊 UMO；读取失败或为空时回退到当前对话历史。`proactive_context_prompt` 支持 `{{context_lines}}` 占位符，缺少占位符时插件会自动在末尾追加序列化上下文。
 
 主动关心使用 `proactive_reminder_provider_id` 选择的模型执行两步流程：先读取受限的当前会话文字上下文并输出 `{"send_care": boolean}`，通过后才结合人格生成最终消息。留空 provider 时两步均沿用当前私聊模型。
 
