@@ -8,6 +8,8 @@ import unittest
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import astrbot_test_stub  # noqa: F401
+
 from astrbot_plugin_mi_fitness_health.models import (
     BodyMeasurement,
     DailyActivity,
@@ -118,6 +120,34 @@ class QueryServiceTest(unittest.TestCase):
             snapshot = asyncio.run(service.care_snapshot("昨天睡眠"))
             self.assertIn("420 分钟", snapshot)
             self.assertNotIn("111 分钟", snapshot)
+
+    def test_naive_legacy_sleep_timestamp_is_interpreted_as_utc(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            service = QueryService(database, "user", "Asia/Shanghai")
+            end_utc = (datetime.now(UTC) - timedelta(hours=1)).replace(
+                second=0, microsecond=0
+            )
+            start_utc = end_utc - timedelta(hours=7)
+            database.upsert_sleep(
+                "user",
+                SleepSession(
+                    "legacy-naive",
+                    start_utc.replace(tzinfo=None),
+                    end_utc.replace(tzinfo=None),
+                    420,
+                    390,
+                    30,
+                    80,
+                ),
+            )
+
+            snapshot = asyncio.run(service.care_snapshot("睡眠"))
+            expected = end_utc.astimezone(service.timezone)
+
+            self.assertIn(expected.date().isoformat(), snapshot)
+            self.assertIn(f"结束 {expected.strftime('%H:%M')}", snapshot)
 
     def test_display_timestamps_use_configured_user_timezone(self) -> None:
         """UTC storage timestamps must display as local time, not raw +00:00 text."""

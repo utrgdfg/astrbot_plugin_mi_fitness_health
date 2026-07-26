@@ -335,14 +335,19 @@ class QueryService:
         if requested["sleep"] and sleeps:
             values = []
             for sleep in sleeps:
-                ended = datetime.fromisoformat(sleep["end_at"]).astimezone(
-                    self.timezone
-                )
+                try:
+                    ended = datetime.fromisoformat(str(sleep["end_at"]))
+                    if ended.tzinfo is None:
+                        ended = ended.replace(tzinfo=UTC)
+                    ended = ended.astimezone(self.timezone)
+                except (KeyError, TypeError, ValueError, OverflowError, OSError):
+                    continue
                 score = sleep["score"] if sleep["score"] is not None else "未提供"
                 values.append(
                     f"{ended.date()} 睡眠 {sleep['asleep_minutes']} 分钟（结束 {ended.strftime('%H:%M')}，评分 {score}）"
                 )
-            parts.append("；".join(values))
+            if values:
+                parts.append("；".join(values))
         elif requested["sleep"] and explicitly_requested:
             parts.append(
                 "睡眠：本地缓存暂无已同步记录；这不代表设备不支持或手机端无法同步"

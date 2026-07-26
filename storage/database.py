@@ -888,7 +888,7 @@ class Database:
         if retention_days <= 0:
             return 0
         cutoff_date_value = datetime.now(user_timezone).date() - timedelta(
-            days=max(7, retention_days)
+            days=max(1, retention_days)
         )
         cutoff_date = cutoff_date_value.isoformat()
         cutoff_timestamp = (

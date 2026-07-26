@@ -21,6 +21,27 @@ class PrivacyTest(unittest.TestCase):
             schema["context_decision_provider_id"]["_special"], "select_provider"
         )
         self.assertEqual(schema["context_decision_provider_id"]["default"], "")
+        self.assertEqual(schema["context_decision_prompt"]["type"], "text")
+        self.assertTrue(schema["context_decision_prompt"]["default"])
+        self.assertEqual(schema["proactive_decision_prompt"]["type"], "text")
+        self.assertIn(
+            "拿不准时不要发送", schema["proactive_decision_prompt"]["default"]
+        )
+        self.assertEqual(
+            schema["proactive_context_source"]["options"],
+            [
+                "conversation_history",
+                "platform_message_history",
+                "hybrid",
+            ],
+        )
+        self.assertEqual(schema["proactive_context_message_count"]["default"], 8)
+        self.assertEqual(schema["proactive_context_message_count"]["slider"]["max"], 50)
+        self.assertEqual(schema["proactive_context_prompt"]["type"], "text")
+        self.assertIn(
+            "{{context_lines}}", schema["proactive_context_prompt"]["default"]
+        )
+        self.assertIs(schema["proactive_context_include_bot_messages"]["default"], True)
         self.assertIs(schema["enable_auto_sync"]["default"], False)
 
     def test_common_xiaomi_and_provider_secrets_are_redacted(self) -> None:
