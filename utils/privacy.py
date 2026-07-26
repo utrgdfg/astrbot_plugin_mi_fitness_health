@@ -14,11 +14,30 @@ def redact_error(error: Exception | str) -> str:
     Returns:
         A message safe to show to the owner.
     """
-    message = str(error).replace("\n", " ")
+    message = str(error)
     message = re.sub(
-        r"(?i)(passToken|userId|ssecurity|cookie)=?[^\s;,&]+", r"\1=***", message
+        r"(?im)^\s*(authorization|set-cookie|cookie)\s*:\s*.*$",
+        r"\1: ***",
+        message,
+    )
+    message = re.sub(
+        r"(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]+",
+        "authorization=***",
+        message,
+    )
+    message = re.sub(
+        (
+            r"(?i)\b(passToken|serviceToken|accessToken|refreshToken|userId|"
+            r"cUserId|ssecurity|cookie|set-cookie|authorization|_nonce|"
+            r"signature|rc4_hash__)\b[\"']?\s*(?:=|:)\s*"
+            r"(?:[\"'][^\"']*[\"']|[^\s;,&]+)"
+        ),
+        r"\1=***",
+        message,
     )
     message = re.sub(r"https?://\S+", "[remote URL]", message)
+    message = re.sub(r"[\x00-\x1f\x7f]+", " ", message)
+    message = " ".join(message.split())
     return message[:180] or type(error).__name__
 
 

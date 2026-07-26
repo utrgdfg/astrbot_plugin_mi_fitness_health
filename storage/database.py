@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta, tzinfo
 from pathlib import Path
 from typing import Any
 
@@ -17,11 +18,11 @@ from ..models import (
     StressSample,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class Database:
-    """Persist one account's cloud records without deleting old plugin data."""
+    """Persist one account's cloud records with bounded, owner-controlled retention."""
 
     def __init__(self, path: Path):
         """Open or migrate a SQLite database.
@@ -34,8 +35,22 @@ class Database:
     def initialize(self) -> None:
         """Create the schema and apply forward-only migrations."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            try:
+                descriptor = os.open(
+                    self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+                )
+                os.close(descriptor)
+            except FileExistsError:
+                pass
+        try:
+            os.chmod(self.path, 0o600)
+        except OSError:
+            # Some Windows filesystems expose ACLs rather than POSIX modes.
+            pass
         with self._connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA secure_delete=ON")
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)"
             )
@@ -118,6 +133,47 @@ class Database:
                 connection.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_event ON alerts(alert_type,event_key) WHERE event_key IS NOT NULL"
                 )
+                connection.execute("UPDATE schema_version SET version = 4")
+                current = 4
+            if current < 5:
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS sync_failures (
+                        data_type TEXT PRIMARY KEY,
+                        last_attempt_at TEXT NOT NULL,
+                        last_error TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS sleep_sessions (
+                        user_id TEXT NOT NULL, record_id TEXT NOT NULL,
+                        start_at TEXT NOT NULL, end_at TEXT NOT NULL,
+                        duration_minutes INTEGER NOT NULL,
+                        asleep_minutes INTEGER NOT NULL,
+                        awake_minutes INTEGER NOT NULL, score INTEGER,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(user_id,record_id)
+                    );
+                    CREATE TABLE IF NOT EXISTS spo2_samples (
+                        user_id TEXT NOT NULL, record_id TEXT NOT NULL,
+                        timestamp TEXT NOT NULL, percent INTEGER NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(user_id,record_id)
+                    );
+                    CREATE TABLE IF NOT EXISTS stress_samples (
+                        user_id TEXT NOT NULL, record_id TEXT NOT NULL,
+                        timestamp TEXT NOT NULL, score INTEGER NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY(user_id,record_id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_sleep_end
+                        ON sleep_sessions(user_id, end_at);
+                    CREATE INDEX IF NOT EXISTS idx_spo2_timestamp
+                        ON spo2_samples(user_id, timestamp);
+                    CREATE INDEX IF NOT EXISTS idx_stress_timestamp
+                        ON stress_samples(user_id, timestamp);
+                    CREATE INDEX IF NOT EXISTS idx_alert_created
+                        ON alerts(alert_type, created_at);
+                    """
+                )
                 connection.execute(
                     "UPDATE schema_version SET version = ?", (SCHEMA_VERSION,)
                 )
@@ -128,6 +184,7 @@ class Database:
         connection = sqlite3.connect(self.path, timeout=30.0)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute("PRAGMA secure_delete=ON")
         try:
             yield connection
             connection.commit()
@@ -293,6 +350,58 @@ class Database:
                 counters["updated" if exists else "added"] += 1
         return counters
 
+    def replace_activity_records(
+        self, user_id: str, records: list[DailyActivity], user_timezone: tzinfo
+    ) -> dict[str, int]:
+        """Replace complete returned activity days and remove legacy misdated rows."""
+        counters = {"added": 0, "updated": 0}
+        if not records:
+            return counters
+        incoming_dates = {record.date for record in records}
+        with self._connect() as connection:
+            existing_rows = connection.execute(
+                "SELECT date,collected_at FROM daily_activity WHERE user_id=?",
+                (user_id,),
+            ).fetchall()
+            existing_dates = {str(row["date"]) for row in existing_rows}
+            dates_to_replace = set(incoming_dates)
+            for row in existing_rows:
+                try:
+                    collected = datetime.fromisoformat(str(row["collected_at"]))
+                    collected = (
+                        collected if collected.tzinfo else collected.replace(tzinfo=UTC)
+                    )
+                    corrected_date = (
+                        collected.astimezone(user_timezone).date().isoformat()
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if corrected_date in incoming_dates and row["date"] != corrected_date:
+                    dates_to_replace.add(str(row["date"]))
+            placeholders = ",".join("?" for _ in dates_to_replace)
+            connection.execute(
+                f"DELETE FROM daily_activity WHERE user_id=? AND date IN ({placeholders})",
+                (user_id, *sorted(dates_to_replace)),
+            )
+            now = self._now()
+            for record in records:
+                connection.execute(
+                    """INSERT INTO daily_activity(
+                           user_id,date,steps,distance_m,active_kcal,collected_at,updated_at
+                       ) VALUES(?,?,?,?,?,?,?)""",
+                    (
+                        user_id,
+                        record.date,
+                        record.steps,
+                        record.distance_m,
+                        record.active_kcal,
+                        record.collected_at.isoformat(),
+                        now,
+                    ),
+                )
+                counters["updated" if record.date in existing_dates else "added"] += 1
+        return counters
+
     def upsert_heart_rate(self, user_id: str, record: HeartRateSample) -> str:
         """Insert or update one heart-rate row and return its exact outcome."""
         with self._connect() as connection:
@@ -355,7 +464,7 @@ class Database:
     def update_sync_state(
         self, data_type: str, last_record_at: datetime | None
     ) -> None:
-        """Record completion time and maximum accepted data timestamp."""
+        """Record a successful completion and clear any older failure."""
         with self._connect() as connection:
             connection.execute(
                 """INSERT INTO sync_state(data_type,last_sync_at,last_record_at) VALUES(?,?,?)
@@ -366,6 +475,19 @@ class Database:
                     self._now(),
                     last_record_at.isoformat() if last_record_at else None,
                 ),
+            )
+            connection.execute(
+                "DELETE FROM sync_failures WHERE data_type=?", (data_type,)
+            )
+
+    def update_sync_failure(self, data_type: str, reason: str) -> None:
+        """Record a sanitized dataset failure without replacing its last success."""
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO sync_failures(data_type,last_attempt_at,last_error)
+                   VALUES(?,?,?) ON CONFLICT(data_type) DO UPDATE SET
+                   last_attempt_at=excluded.last_attempt_at,last_error=excluded.last_error""",
+                (data_type, self._now(), reason[:180]),
             )
 
     def upsert_sleep(self, user_id: str, record: SleepSession) -> str:
@@ -433,13 +555,61 @@ class Database:
             )
         return "updated" if old else "added"
 
-    def latest_sync_at(self) -> str | None:
-        """Return the most recent completed synchronization timestamp."""
+    def latest_sync_at(self, data_types: tuple[str, ...] | None = None) -> str | None:
+        """Return global latest success or the oldest valid success for required types."""
+        with self._connect() as connection:
+            if not data_types:
+                rows = connection.execute(
+                    "SELECT last_sync_at FROM sync_state"
+                ).fetchall()
+                timestamps = self._valid_utc_timestamps(
+                    row["last_sync_at"] for row in rows
+                )
+                return max(timestamps).isoformat() if timestamps else None
+            unique_types = tuple(dict.fromkeys(data_types))
+            placeholders = ",".join("?" for _ in unique_types)
+            rows = connection.execute(
+                f"""SELECT s.data_type,s.last_sync_at,f.last_attempt_at
+                    FROM sync_state s LEFT JOIN sync_failures f
+                    ON f.data_type=s.data_type
+                    WHERE s.data_type IN ({placeholders})""",
+                unique_types,
+            ).fetchall()
+        if len(rows) != len(unique_types):
+            return None
+        successes = self._valid_utc_timestamps(row["last_sync_at"] for row in rows)
+        if len(successes) != len(rows):
+            return None
+        for row, success in zip(rows, successes, strict=True):
+            if not row["last_attempt_at"]:
+                continue
+            failures = self._valid_utc_timestamps((row["last_attempt_at"],))
+            if not failures or failures[0] >= success:
+                return None
+        return min(successes).isoformat()
+
+    @staticmethod
+    def _valid_utc_timestamps(values) -> list[datetime]:
+        """Parse stored ISO values consistently; malformed state forces a refresh."""
+        parsed_values: list[datetime] = []
+        for value in values:
+            try:
+                parsed = datetime.fromisoformat(str(value))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=UTC)
+                parsed_values.append(parsed.astimezone(UTC))
+            except (TypeError, ValueError):
+                continue
+        return parsed_values
+
+    def sync_failure(self, data_type: str) -> dict[str, Any] | None:
+        """Return the latest unresolved sanitized failure for one dataset."""
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT MAX(last_sync_at) AS value FROM sync_state"
+                "SELECT last_attempt_at,last_error FROM sync_failures WHERE data_type=?",
+                (data_type,),
             ).fetchone()
-        return row["value"] if row and row["value"] else None
+        return dict(row) if row else None
 
     def today_activity(self, user_id: str, date: str) -> dict[str, Any] | None:
         """Return one local-day activity summary."""
@@ -635,3 +805,93 @@ class Database:
                 (owner_platform_id,),
             ).fetchone()
         return dict(row) if row else None
+
+    def prune_user_data(
+        self, user_id: str, retention_days: int, user_timezone: tzinfo = UTC
+    ) -> int:
+        """Delete health/audit rows older than an explicitly configured retention."""
+        if retention_days <= 0:
+            return 0
+        cutoff_date_value = datetime.now(user_timezone).date() - timedelta(
+            days=max(7, retention_days)
+        )
+        cutoff_date = cutoff_date_value.isoformat()
+        cutoff_timestamp = (
+            datetime.combine(cutoff_date_value, time.min, tzinfo=user_timezone)
+            .astimezone(UTC)
+            .isoformat()
+        )
+        deleted = 0
+        statements = (
+            (
+                "DELETE FROM daily_activity WHERE user_id=? AND date<?",
+                (user_id, cutoff_date),
+            ),
+            (
+                "DELETE FROM heart_rate_samples WHERE user_id=? AND timestamp<?",
+                (user_id, cutoff_timestamp),
+            ),
+            (
+                "DELETE FROM body_measurements WHERE user_id=? AND timestamp<?",
+                (user_id, cutoff_timestamp),
+            ),
+            (
+                "DELETE FROM sleep_sessions WHERE user_id=? AND end_at<?",
+                (user_id, cutoff_timestamp),
+            ),
+            (
+                "DELETE FROM spo2_samples WHERE user_id=? AND timestamp<?",
+                (user_id, cutoff_timestamp),
+            ),
+            (
+                "DELETE FROM stress_samples WHERE user_id=? AND timestamp<?",
+                (user_id, cutoff_timestamp),
+            ),
+            ("DELETE FROM alerts WHERE created_at<?", (cutoff_timestamp,)),
+            ("DELETE FROM care_deliveries WHERE created_at<?", (cutoff_timestamp,)),
+        )
+        with self._connect() as connection:
+            for statement, values in statements:
+                deleted += max(0, connection.execute(statement, values).rowcount)
+        return deleted
+
+    def purge_user_data(self, user_id: str, owner_platform_id: str) -> int:
+        """Delete all locally cached health and delivery state for this plugin owner."""
+        deleted = 0
+        tables = (
+            "daily_activity",
+            "heart_rate_samples",
+            "body_measurements",
+            "sleep_sessions",
+            "spo2_samples",
+            "stress_samples",
+        )
+        with self._connect() as connection:
+            for table in tables:
+                deleted += max(
+                    0,
+                    connection.execute(
+                        f"DELETE FROM {table} WHERE user_id=?", (user_id,)
+                    ).rowcount,
+                )
+            deleted += max(
+                0,
+                connection.execute(
+                    "DELETE FROM private_owner_sessions WHERE owner_platform_id=?",
+                    (owner_platform_id,),
+                ).rowcount,
+            )
+            for table in ("alerts", "care_deliveries", "sync_state", "sync_failures"):
+                deleted += max(0, connection.execute(f"DELETE FROM {table}").rowcount)
+        self.compact()
+        return deleted
+
+    def compact(self) -> None:
+        """Truncate the WAL and reclaim pages after an explicit full purge."""
+        connection = sqlite3.connect(self.path, timeout=30.0)
+        try:
+            connection.execute("PRAGMA secure_delete=ON")
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            connection.execute("VACUUM")
+        finally:
+            connection.close()

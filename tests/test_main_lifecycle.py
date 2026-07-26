@@ -1,0 +1,251 @@
+"""Offline lifecycle and LLM-privacy tests for the plugin entrypoint."""
+
+from __future__ import annotations
+
+import asyncio
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
+
+import astrbot_test_stub  # noqa: F401
+from astrbot.api.provider import ProviderRequest
+
+from astrbot_plugin_mi_fitness_health.adapters import MiFitnessAuthenticationError
+from astrbot_plugin_mi_fitness_health.main import MiFitnessHealthPlugin
+
+
+class MainLifecycleTest(unittest.TestCase):
+    @staticmethod
+    def _bare_plugin() -> MiFitnessHealthPlugin:
+        plugin = object.__new__(MiFitnessHealthPlugin)
+        plugin.name = "mi-fitness-test"
+        plugin._auto_sync_paused = False
+        return plugin
+
+    def test_temporary_auto_sync_error_retries_without_permanent_pause(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.sync_interval = 5
+        plugin._sync = AsyncMock(side_effect=[RuntimeError("temporary"), {}])
+        sleeps = 0
+
+        async def fake_sleep(seconds):
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps >= 2:
+                raise asyncio.CancelledError
+
+        async def run():
+            with patch(
+                "astrbot_plugin_mi_fitness_health.main.asyncio.sleep",
+                side_effect=fake_sleep,
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await plugin._auto_sync_loop()
+
+        asyncio.run(run())
+        self.assertEqual(plugin._sync.await_count, 2)
+        self.assertFalse(plugin._auto_sync_paused)
+
+    def test_authentication_error_pauses_auto_sync(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.sync_interval = 5
+        plugin._sync = AsyncMock(
+            side_effect=MiFitnessAuthenticationError("reauthorize")
+        )
+        asyncio.run(plugin._auto_sync_loop())
+        self.assertTrue(plugin._auto_sync_paused)
+
+    def test_llm_context_is_disabled_without_explicit_sensitive_data_consent(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        plugin.care_dialogue_enabled = True
+        plugin.allow_health_data_to_llm = False
+        request = ProviderRequest()
+        asyncio.run(plugin.add_owner_health_context(Mock(), request))
+        self.assertEqual(request.extra_user_content_parts, [])
+
+    def test_llm_context_uses_cache_without_waiting_for_cloud_refresh(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.care_dialogue_enabled = True
+        plugin.allow_health_data_to_llm = True
+        plugin._is_private_owner_event = Mock(return_value=True)
+        plugin._refresh_for_natural_question = AsyncMock(return_value=False)
+
+        class Query:
+            async def care_snapshot(self, focus):
+                return "昨日睡眠 430 分钟"
+
+            async def sync_at_for_focus(self, focus):
+                return None
+
+            @staticmethod
+            def display_timestamp(value):
+                return str(value)
+
+        plugin.query_service = Query()
+        event = Mock()
+        event.get_message_str.return_value = "早安"
+        request = ProviderRequest()
+        asyncio.run(plugin.add_owner_health_context(event, request))
+        self.assertEqual(len(request.extra_user_content_parts), 1)
+        plugin._refresh_for_natural_question.assert_awaited_once_with(
+            "睡眠 心率", wait_for_result=False
+        )
+
+    def test_concurrent_natural_refreshes_share_one_cloud_operation(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.natural_query_sync_minutes = 15
+        plugin._natural_refresh_task = None
+        plugin._pending_refresh_types = set()
+        plugin._active_refresh_types = set()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        class Query:
+            @staticmethod
+            def sync_types_for_focus(focus):
+                return ("sleep",)
+
+            async def latest_sync_at(self, data_types):
+                return None
+
+        plugin.query_service = Query()
+
+        async def fake_sync(data_types=None, days=None):
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return {}
+
+        plugin._sync = fake_sync
+
+        async def run():
+            await asyncio.gather(
+                *(
+                    plugin._refresh_for_natural_question(
+                        "昨天睡眠", wait_for_result=False
+                    )
+                    for _ in range(5)
+                )
+            )
+            await started.wait()
+            release.set()
+            await plugin._natural_refresh_task
+
+        asyncio.run(run())
+        self.assertEqual(calls, 1)
+
+    def test_failed_refresh_batch_does_not_drop_another_queued_category(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.natural_query_sync_minutes = 15
+        plugin._natural_refresh_task = None
+        plugin._pending_refresh_types = set()
+        plugin._active_refresh_types = set()
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        calls = []
+
+        class Query:
+            @staticmethod
+            def sync_types_for_focus(focus):
+                return ("sleep",) if "睡" in focus else ("heart_rate",)
+
+            async def latest_sync_at(self, data_types):
+                return None
+
+        plugin.query_service = Query()
+
+        async def fake_sync(data_types=None, days=None):
+            calls.append(set(data_types))
+            if data_types == {"sleep"}:
+                first_started.set()
+                await release_first.wait()
+                raise RuntimeError("temporary sleep failure")
+            return {}
+
+        plugin._sync = fake_sync
+
+        async def run():
+            await plugin._refresh_for_natural_question(
+                "昨天睡眠", wait_for_result=False
+            )
+            await first_started.wait()
+            await plugin._refresh_for_natural_question(
+                "最近心率", wait_for_result=False
+            )
+            release_first.set()
+            return await plugin._natural_refresh_task
+
+        self.assertTrue(asyncio.run(run()))
+        self.assertEqual(calls, [{"sleep"}, {"heart_rate"}])
+
+    def test_ensure_background_task_restarts_a_finished_auto_sync_loop(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.proactive_monitor_enabled = False
+        plugin.allow_health_data_to_llm = False
+        plugin.owner_platform_id = "owner"
+        plugin.owner_platform_instance_id = "bot"
+        plugin.user_id = "user"
+        plugin.pass_token = "synthetic-token"
+        plugin.auto_sync_enabled = True
+        plugin._monitor_task = None
+        plugin._auto_sync_loop = AsyncMock(return_value=None)
+
+        async def run():
+            finished = asyncio.create_task(asyncio.sleep(0))
+            await finished
+            plugin._auto_task = finished
+            plugin._ensure_background_task()
+            restarted = plugin._auto_task
+            await restarted
+            return finished, restarted
+
+        finished, restarted = asyncio.run(run())
+        self.assertIsNot(finished, restarted)
+        plugin._auto_sync_loop.assert_awaited_once()
+
+    def test_zero_retention_configuration_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = MiFitnessHealthPlugin(
+                Mock(),
+                {
+                    "data_retention_days": 0,
+                    "database_path": str(Path(directory) / "health.sqlite3"),
+                },
+            )
+            self.assertEqual(plugin.data_retention_days, 0)
+
+    def test_local_clear_requires_confirmation_and_disabled_background_sync(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        plugin.auto_sync_enabled = True
+        plugin.proactive_monitor_enabled = False
+        plugin._natural_refresh_task = None
+        plugin.owner_platform_id = "owner"
+        plugin.sync_service = Mock()
+        plugin.sync_service.purge_local_data = AsyncMock(return_value=5)
+
+        async def allow_guard(event):
+            if False:
+                yield None
+
+        plugin._guard = allow_guard
+        event = Mock()
+        event.plain_result.side_effect = lambda text: text
+
+        async def collect(confirmation):
+            return [
+                item
+                async for item in plugin.clear_local_health_data(event, confirmation)
+            ]
+
+        missing_confirmation = asyncio.run(collect(""))
+        self.assertIn("确认清除", missing_confirmation[0])
+        background_enabled = asyncio.run(collect("确认清除"))
+        self.assertIn("先在插件配置中关闭", background_enabled[0])
+        plugin.sync_service.purge_local_data.assert_not_awaited()

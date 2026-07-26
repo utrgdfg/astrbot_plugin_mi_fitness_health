@@ -13,6 +13,15 @@ from ..utils import local_timestamp
 class QueryService:
     """Read cached cloud records without blocking AstrBot's event loop."""
 
+    CATEGORY_SYNC_TYPES = {
+        "activity": "daily_activity",
+        "heart": "heart_rate",
+        "body": "body_measurements",
+        "sleep": "sleep",
+        "spo2": "spo2",
+        "stress": "stress",
+    }
+
     def __init__(self, database: Database, user_id: str, timezone_name: str):
         """Create a query service using a user-local timezone.
 
@@ -111,16 +120,15 @@ class QueryService:
             row["avg_heart_rate"] = sum(values) / len(values) if values else None
         return activities
 
-    async def latest_sync_at(self) -> str | None:
-        """Return latest synchronization marker."""
-        return await asyncio.to_thread(self.database.latest_sync_at)
+    async def latest_sync_at(
+        self, data_types: tuple[str, ...] | None = None
+    ) -> str | None:
+        """Return global latest sync or freshness shared by required datasets."""
+        return await asyncio.to_thread(self.database.latest_sync_at, data_types)
 
-    def display_timestamp(self, value: object) -> str:
-        """Format one stored timestamp in the configured user timezone."""
-        return local_timestamp(value, self.timezone)
-
-    async def care_snapshot(self, focus: str = "") -> str:
-        """Return only health categories relevant to an owner conversation."""
+    @staticmethod
+    def requested_categories(focus: str) -> tuple[dict[str, bool], bool]:
+        """Map natural wording to the smallest required health categories."""
         compact = focus.lower().replace(" ", "")
         requested = {
             "activity": any(
@@ -148,6 +156,29 @@ class QueryService:
         explicitly_requested = any(requested.values())
         if not explicitly_requested:
             requested = {key: True for key in requested}
+        return requested, explicitly_requested
+
+    def sync_types_for_focus(self, focus: str) -> tuple[str, ...]:
+        """Return storage sync keys needed to answer one natural-language focus."""
+        requested, _ = self.requested_categories(focus)
+        return tuple(
+            self.CATEGORY_SYNC_TYPES[key]
+            for key, enabled in requested.items()
+            if enabled
+        )
+
+    async def sync_at_for_focus(self, focus: str) -> str | None:
+        """Return the oldest valid success among every dataset required by focus."""
+        return await self.latest_sync_at(self.sync_types_for_focus(focus))
+
+    def display_timestamp(self, value: object) -> str:
+        """Format one stored timestamp in the configured user timezone."""
+        return local_timestamp(value, self.timezone)
+
+    async def care_snapshot(self, focus: str = "") -> str:
+        """Return only health categories relevant to an owner conversation."""
+        compact = focus.lower().replace(" ", "")
+        requested, explicitly_requested = self.requested_categories(focus)
         today = datetime.now(self.timezone).date()
         if "昨天" in compact or "昨日" in compact:
             heart_day = today - timedelta(days=1)

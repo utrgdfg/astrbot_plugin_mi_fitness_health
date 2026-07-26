@@ -1,4 +1,4 @@
-"""Offline adapter and alert tests using fully synthetic, redacted fixture data."""
+"""Offline cloud-adapter tests using fully synthetic, redacted fixture data."""
 
 from __future__ import annotations
 
@@ -6,27 +6,24 @@ import asyncio
 import json
 import tempfile
 import unittest
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import astrbot_test_stub  # noqa: F401
 
 from astrbot_plugin_mi_fitness_health.adapters.mi_fitness_cloud import (
     MiFitnessAuthenticationError,
     MiFitnessCloudAdapter,
+    MiFitnessResponseError,
     _rc4_crypt,
 )
-from astrbot_plugin_mi_fitness_health.models import HeartRateSample, SpO2Sample
-from astrbot_plugin_mi_fitness_health.services import (
-    AlertService,
-    QueryService,
-    SyncService,
-)
+from astrbot_plugin_mi_fitness_health.services import QueryService, SyncService
 from astrbot_plugin_mi_fitness_health.storage import Database
 
 
-class AdapterAndAlertTest(unittest.TestCase):
-    """Verify protocol primitives and alert safety without external HTTP."""
+class AdapterTest(unittest.TestCase):
+    """Verify protocol primitives and cloud parsing without external HTTP."""
 
     def test_rc4_round_trip_and_fixture_parse(self) -> None:
         """RC4 round-trips and accepts a redacted fixture payload."""
@@ -39,70 +36,6 @@ class AdapterAndAlertTest(unittest.TestCase):
         )[0]
         self.assertEqual(MiFitnessCloudAdapter._value(item)["bpm"], 72)
         self.assertIsNotNone(MiFitnessCloudAdapter._record_time(item))
-
-    def test_workout_record_does_not_complete_passive_alert(self) -> None:
-        """Workout records reset a sequence and cannot cause a passive alert."""
-        with tempfile.TemporaryDirectory() as directory:
-            database = Database(Path(directory) / "health.sqlite3")
-            database.initialize()
-            now = datetime.now(UTC)
-            for index, workout in enumerate((False, True, False)):
-                database.upsert_heart_rate(
-                    "user",
-                    HeartRateSample(
-                        f"hr{index}",
-                        now + timedelta(minutes=index),
-                        150,
-                        "passive",
-                        workout,
-                    ),
-                )
-            alerts = asyncio.run(
-                AlertService(database, "user", 120, 0, 2, 10).evaluate()
-            )
-            self.assertEqual(alerts, [])
-
-    def test_fresh_consecutive_alert_is_marked_only_after_delivery(self) -> None:
-        """One exact sequence retries before send and never repeats after mark_sent."""
-        with tempfile.TemporaryDirectory() as directory:
-            database = Database(Path(directory) / "health.sqlite3")
-            database.initialize()
-            now = datetime.now(UTC)
-            database.upsert_heart_rate(
-                "user",
-                HeartRateSample(
-                    "hr1", now - timedelta(minutes=2), 130, "passive", False
-                ),
-            )
-            database.upsert_heart_rate(
-                "user",
-                HeartRateSample(
-                    "hr2", now - timedelta(minutes=1), 132, "passive", False
-                ),
-            )
-            service = AlertService(database, "user", 120, 0, 2, 120)
-
-            first = asyncio.run(service.evaluate())
-            self.assertEqual(len(first), 1)
-            self.assertEqual(len(asyncio.run(service.evaluate())), 1)
-            asyncio.run(service.mark_sent(first[0]))
-            self.assertEqual(asyncio.run(service.evaluate()), [])
-
-    def test_spo2_requires_consecutive_fresh_samples(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            database = Database(Path(directory) / "health.sqlite3")
-            database.initialize()
-            now = datetime.now(UTC)
-            database.upsert_spo2(
-                "user", SpO2Sample("o1", now - timedelta(minutes=2), 92)
-            )
-            database.upsert_spo2(
-                "user", SpO2Sample("o2", now - timedelta(minutes=1), 93)
-            )
-            service = AlertService(database, "user", 0, 0, 2, 120, spo2_low=95)
-            findings = asyncio.run(service.evaluate())
-            self.assertEqual(len(findings), 1)
-            self.assertEqual(findings[0].alert_type, "spo2_low")
 
     def test_resting_heart_rate_fallback_is_queryable(self) -> None:
         """Resting-heart-rate data remains available when the sampled key is empty."""
@@ -444,6 +377,77 @@ class AdapterAndAlertTest(unittest.TestCase):
         with self.assertRaises(MiFitnessAuthenticationError):
             asyncio.run(adapter._login_with_token())
 
+    def test_non_transient_http_error_is_not_retried(self) -> None:
+        class Response:
+            status_code = 400
+            headers = {}
+            text = ""
+
+            def raise_for_status(self):
+                raise AssertionError("400 must be classified before raise_for_status")
+
+        class Client:
+            calls = 0
+
+            async def post(self, *args, **kwargs):
+                self.calls += 1
+                return Response()
+
+        adapter = MiFitnessCloudAdapter("user", "token", "cn")
+        adapter._client = Client()
+        adapter._ssecurity = b"synthetic-security"
+        with self.assertRaisesRegex(MiFitnessResponseError, "HTTP 400"):
+            asyncio.run(adapter._request("https://example.invalid", "/path", {}))
+        self.assertEqual(adapter._client.calls, 1)
+
+    def test_rate_limit_retry_after_is_bounded_and_respected(self) -> None:
+        class Response:
+            def __init__(self, status_code, retry_after=""):
+                self.status_code = status_code
+                self.headers = {"Retry-After": retry_after}
+                self.text = ""
+
+            def raise_for_status(self):
+                raise AssertionError(
+                    "the synthetic final 400 must be classified directly"
+                )
+
+        class Client:
+            def __init__(self):
+                self.responses = [Response(429, "2"), Response(400)]
+
+            async def post(self, *args, **kwargs):
+                return self.responses.pop(0)
+
+        adapter = MiFitnessCloudAdapter("user", "token", "cn")
+        adapter._client = Client()
+        adapter._ssecurity = b"synthetic-security"
+        sleep = AsyncMock()
+        with patch(
+            "astrbot_plugin_mi_fitness_health.adapters.mi_fitness_cloud.asyncio.sleep",
+            sleep,
+        ):
+            with self.assertRaises(MiFitnessResponseError):
+                asyncio.run(adapter._request("https://example.invalid", "/path", {}))
+        sleep.assert_awaited_once_with(2.0)
+
+    def test_connection_timeout_closes_client_and_session_material(self) -> None:
+        class SlowAdapter(MiFitnessCloudAdapter):
+            async def _establish_session(self):
+                self._cookies = "serviceToken=synthetic"
+                self._ssecurity = b"synthetic-security"
+                await asyncio.sleep(1)
+
+        adapter = SlowAdapter("user", "token", "cn")
+        with patch(
+            "astrbot_plugin_mi_fitness_health.adapters.mi_fitness_cloud.CONNECT_TIMEOUT_SECONDS",
+            0.001,
+        ):
+            self.assertFalse(asyncio.run(adapter.connect()))
+        self.assertIsNone(adapter._client)
+        self.assertEqual(adapter._cookies, "")
+        self.assertEqual(adapter._ssecurity, b"")
+
     def test_discovery_reports_every_supported_wellness_type(self) -> None:
         """Connection status includes sleep, SpO2, and stress when present."""
 
@@ -467,42 +471,127 @@ class AdapterAndAlertTest(unittest.TestCase):
             ],
         )
 
-    def test_old_heart_rate_cannot_complete_fresh_sequence(self) -> None:
-        """Every record in a consecutive alert sequence must still be fresh."""
-        with tempfile.TemporaryDirectory() as directory:
-            database = Database(Path(directory) / "health.sqlite3")
-            database.initialize()
-            now = datetime.now(UTC)
-            database.upsert_heart_rate(
-                "user",
-                HeartRateSample("old", now - timedelta(hours=4), 132, "passive", False),
-            )
-            database.upsert_heart_rate(
-                "user",
-                HeartRateSample(
-                    "fresh", now - timedelta(minutes=1), 130, "passive", False
-                ),
-            )
-            findings = asyncio.run(
-                AlertService(
-                    database, "user", 120, 0, 2, 120, data_max_age_minutes=60
-                ).evaluate()
-            )
-            self.assertEqual(findings, [])
+    def test_primary_heart_rate_alias_is_used_by_normal_sync(self) -> None:
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region):
+                if key == "heartrate":
+                    return [{"time": 1784692800, "value": {"heart_rate": 71}}]
+                return []
 
-    def test_old_spo2_cannot_complete_fresh_sequence(self) -> None:
-        """Metric alerts also reject an older matching sample in the sequence."""
-        with tempfile.TemporaryDirectory() as directory:
-            database = Database(Path(directory) / "health.sqlite3")
-            database.initialize()
-            now = datetime.now(UTC)
-            database.upsert_spo2(
-                "user", SpO2Sample("old", now - timedelta(hours=4), 92)
+        async def collect():
+            adapter = FixtureAdapter("user", "token", "cn")
+            return [
+                row
+                async for row in adapter.iter_heart_rate(
+                    datetime.now(UTC), datetime.now(UTC)
+                )
+            ]
+
+        records = asyncio.run(collect())
+        self.assertEqual([record.bpm for record in records], [71])
+
+    def test_blood_oxygen_alias_is_used_by_normal_sync(self) -> None:
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region):
+                if key == "spo2":
+                    raise RuntimeError("unsupported key")
+                if key == "blood_oxygen":
+                    return [{"time": 1784692800, "value": {"blood_oxygen": 97}}]
+                return []
+
+        async def collect():
+            adapter = FixtureAdapter("user", "token", "cn")
+            return [
+                row
+                async for row in adapter.iter_spo2(datetime.now(UTC), datetime.now(UTC))
+            ]
+
+        records = asyncio.run(collect())
+        self.assertEqual([record.percent for record in records], [97])
+
+    def test_discovery_reports_alias_only_heart_rate_and_spo2(self) -> None:
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region):
+                if key in {"heartrate", "blood_oxygen"}:
+                    return [{"time": 1784692800, "value": {}}]
+                return []
+
+        available = asyncio.run(
+            FixtureAdapter("user", "token", "cn")._discover_data_types()
+        )
+        self.assertIn("heart_rate", available)
+        self.assertIn("spo2", available)
+
+    def test_region_discovery_uses_non_step_data(self) -> None:
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region):
+                if region == "sg" and key == "sleep":
+                    return [{"time": 1784692800, "value": {}}]
+                return []
+
+        adapter = FixtureAdapter("user", "token")
+        self.assertEqual(asyncio.run(adapter._discover_region()), "sg")
+
+    def test_region_discovery_requires_manual_region_when_all_data_is_empty(
+        self,
+    ) -> None:
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region):
+                return []
+
+        adapter = FixtureAdapter("user", "token")
+        with self.assertRaisesRegex(RuntimeError, "手动选择 region"):
+            asyncio.run(adapter._discover_region())
+
+    def test_activity_deduplicates_same_minute_and_uses_user_timezone(self) -> None:
+        base = int(datetime(2026, 1, 1, 16, 30, tzinfo=UTC).timestamp())
+
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region):
+                if key == "steps":
+                    return [
+                        {
+                            "time": base,
+                            "zone_offset": 0,
+                            "value": {"steps": 10, "distance": 8, "calories": 1},
+                        },
+                        {
+                            "time": base + 20,
+                            "zone_offset": 0,
+                            "value": {"steps": 12, "distance": 9, "calories": 2},
+                        },
+                        {
+                            "time": base + 60,
+                            "zone_offset": 0,
+                            "value": {"steps": 8, "distance": 6, "calories": 1},
+                        },
+                    ]
+                return [
+                    {"time": base, "value": {"calories": 3}},
+                    {"time": base + 20, "value": {"calories": 5}},
+                    {"time": base + 60, "value": {"calories": 2}},
+                ]
+
+        async def collect():
+            adapter = FixtureAdapter(
+                "user", "token", "cn", timezone(timedelta(hours=8))
             )
-            database.upsert_spo2(
-                "user", SpO2Sample("fresh", now - timedelta(minutes=1), 93)
-            )
-            service = AlertService(
-                database, "user", 0, 0, 2, 120, spo2_low=95, data_max_age_minutes=60
-            )
-            self.assertEqual(asyncio.run(service.evaluate()), [])
+            return [
+                row
+                async for row in adapter.iter_daily_activity(
+                    datetime.now(UTC), datetime.now(UTC)
+                )
+            ]
+
+        records = asyncio.run(collect())
+        self.assertEqual(records[0].date, "2026-01-02")
+        self.assertEqual(records[0].steps, 20)
+        self.assertEqual(records[0].distance_m, 15)
+        self.assertEqual(records[0].active_kcal, 7)
+
+    def test_aware_fetch_boundary_is_converted_instead_of_relabelled(self) -> None:
+        value = datetime(2026, 1, 1, 8, 0, tzinfo=timezone(timedelta(hours=8)))
+        self.assertEqual(
+            MiFitnessCloudAdapter._utc_timestamp(value),
+            int(datetime(2026, 1, 1, 0, 0, tzinfo=UTC).timestamp()),
+        )

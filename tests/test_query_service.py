@@ -35,6 +35,24 @@ class QueryServiceTest(unittest.TestCase):
         asyncio.run(service.heart_rates(24))
         self.assertTrue(database.cutoff.endswith("+00:00"))
 
+    def test_focus_maps_to_only_required_sync_datasets(self) -> None:
+        service = QueryService(_RecordingDatabase(), "user", "Asia/Shanghai")
+        self.assertEqual(
+            service.sync_types_for_focus("昨天睡眠和心率"),
+            ("heart_rate", "sleep"),
+        )
+        self.assertEqual(
+            set(service.sync_types_for_focus("综合概况")),
+            {
+                "daily_activity",
+                "heart_rate",
+                "body_measurements",
+                "sleep",
+                "spo2",
+                "stress",
+            },
+        )
+
     def test_conversation_snapshot_only_returns_requested_category(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Database(Path(directory) / "health.sqlite3")
