@@ -267,3 +267,31 @@ class DatabaseTest(unittest.TestCase):
 
             self.assertIsNone(database.last_alert_at("owner-a", "proactive_message"))
             self.assertIsNotNone(database.last_alert_at("owner-b", "proactive_message"))
+
+    def test_retention_honors_values_shorter_than_seven_days(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            now = datetime.now(UTC)
+            two_days_old = now - timedelta(days=2)
+            database.upsert_heart_rate(
+                "user",
+                HeartRateSample(
+                    "old",
+                    two_days_old,
+                    70,
+                    "passive",
+                    False,
+                ),
+            )
+            database.upsert_heart_rate(
+                "user",
+                HeartRateSample("current", now, 72, "passive", False),
+            )
+
+            database.prune_user_data("user", 1)
+
+            rows = database.heart_rates_since(
+                "user", (now - timedelta(days=3)).isoformat()
+            )
+            self.assertEqual([row["record_id"] for row in rows], ["current"])

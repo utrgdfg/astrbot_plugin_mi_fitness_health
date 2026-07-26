@@ -6,7 +6,7 @@ import asyncio
 import json
 import tempfile
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -123,6 +123,10 @@ class MainLifecycleTest(unittest.TestCase):
     def test_recent_context_includes_immediate_owner_message(self) -> None:
         plugin = self._bare_plugin()
         session = "bot:FriendMessage:owner"
+        plugin.owner_platform_id = "owner"
+        plugin.owner_platform_instance_id = "bot"
+        plugin.database = Mock()
+        plugin.database.private_owner_session.return_value = {"session": session}
         plugin.context = Mock()
         plugin.context.conversation_manager = Mock()
         plugin.context.conversation_manager.get_curr_conversation_id = AsyncMock(
@@ -167,6 +171,8 @@ class MainLifecycleTest(unittest.TestCase):
         plugin.proactive_context_message_count = 2
         plugin.proactive_context_include_bot_messages = False
         plugin._latest_owner_message = None
+        plugin.database = Mock()
+        plugin.database.private_owner_session.return_value = {"session": session}
         plugin.context = Mock()
         plugin.context.message_history_manager = Mock()
         plugin.context.message_history_manager.get = AsyncMock(
@@ -207,6 +213,8 @@ class MainLifecycleTest(unittest.TestCase):
         plugin.proactive_context_message_count = 8
         plugin.proactive_context_include_bot_messages = True
         plugin._latest_owner_message = None
+        plugin.database = Mock()
+        plugin.database.private_owner_session.return_value = {"session": session}
         plugin.context = Mock()
         plugin.context.message_history_manager = Mock()
         plugin.context.message_history_manager.get = AsyncMock(return_value=[])
@@ -233,6 +241,10 @@ class MainLifecycleTest(unittest.TestCase):
         plugin.owner_platform_instance_id = "napcat"
         plugin.proactive_context_source = "platform_message_history"
         plugin.proactive_context_message_count = 8
+        plugin.database = Mock()
+        plugin.database.private_owner_session.return_value = {
+            "session": "napcat:FriendMessage:owner"
+        }
         plugin.context = Mock()
         plugin.context.message_history_manager = Mock()
         plugin.context.message_history_manager.get = AsyncMock()
@@ -244,10 +256,50 @@ class MainLifecycleTest(unittest.TestCase):
         self.assertEqual(context, [])
         plugin.context.message_history_manager.get.assert_not_awaited()
 
+    def test_context_source_fails_closed_without_bound_owner_session(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.owner_platform_id = "owner"
+        plugin.owner_platform_instance_id = "napcat"
+        plugin.proactive_context_source = "conversation_history"
+        plugin.proactive_context_message_count = 8
+        plugin.database = Mock()
+        plugin.database.private_owner_session.return_value = None
+        plugin._conversation_private_context = AsyncMock(
+            return_value=["用户: 私聊内容"]
+        )
+
+        context = asyncio.run(
+            plugin._recent_private_context("napcat:FriendMessage:owner")
+        )
+
+        self.assertEqual(context, [])
+        plugin._conversation_private_context.assert_not_awaited()
+
+    def test_context_source_accepts_bound_composite_private_umo(self) -> None:
+        plugin = self._bare_plugin()
+        session = "webchat:FriendMessage:webchat!owner!session-id"
+        plugin.owner_platform_id = "owner"
+        plugin.owner_platform_instance_id = "webchat"
+        plugin.proactive_context_source = "conversation_history"
+        plugin.proactive_context_message_count = 8
+        plugin.proactive_context_include_bot_messages = True
+        plugin.database = Mock()
+        plugin.database.private_owner_session.return_value = {"session": session}
+        plugin._conversation_private_context = AsyncMock(return_value=["用户: 还在忙"])
+
+        context = asyncio.run(plugin._recent_private_context(session))
+
+        self.assertEqual(context, ["用户: 还在忙"])
+        plugin.database.private_owner_session.assert_called_once_with("owner")
+
     def test_zero_context_count_keeps_proactive_gate_silent(self) -> None:
         plugin = self._bare_plugin()
         plugin.owner_platform_id = "owner"
         plugin.proactive_context_message_count = 0
+        plugin.database = Mock()
+        plugin.database.private_owner_session.return_value = {
+            "session": "napcat:FriendMessage:owner"
+        }
         plugin._latest_owner_message = (
             "napcat:FriendMessage:owner",
             "我还在忙",
@@ -263,10 +315,15 @@ class MainLifecycleTest(unittest.TestCase):
 
     def test_hybrid_context_deduplicates_and_respects_total_count(self) -> None:
         plugin = self._bare_plugin()
+        plugin.owner_platform_id = "owner"
         plugin.proactive_context_source = "hybrid"
         plugin.proactive_context_message_count = 2
         plugin.proactive_context_include_bot_messages = True
         plugin._latest_owner_message = None
+        plugin.database = Mock()
+        plugin.database.private_owner_session.return_value = {
+            "session": "napcat:FriendMessage:owner"
+        }
         plugin._conversation_private_context = AsyncMock(
             return_value=["用户: 还在忙", "机器人: 别太晚"]
         )
@@ -974,6 +1031,35 @@ class MainLifecycleTest(unittest.TestCase):
         skipped, forced = asyncio.run(run())
         self.assertFalse(skipped)
         self.assertTrue(forced)
+        plugin._sync.assert_awaited_once_with(data_types={"sleep"})
+
+    def test_future_sync_state_does_not_suppress_natural_refresh(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.natural_query_sync_minutes = 15
+        plugin._natural_refresh_task = None
+        plugin._pending_refresh_types = set()
+        plugin._active_refresh_types = set()
+        future = (datetime.now(UTC) + timedelta(days=1)).isoformat()
+
+        class Query:
+            @staticmethod
+            def sync_types_for_focus(focus):
+                return ("sleep",)
+
+            async def latest_sync_at(self, data_types):
+                return future
+
+            async def latest_failure_at(self, data_types):
+                return future
+
+        plugin.query_service = Query()
+        plugin._sync = AsyncMock(return_value={})
+
+        refreshed = asyncio.run(
+            plugin._refresh_for_natural_question("昨天睡眠", wait_for_result=True)
+        )
+
+        self.assertTrue(refreshed)
         plugin._sync.assert_awaited_once_with(data_types={"sleep"})
 
     def test_zero_retention_configuration_is_preserved(self) -> None:

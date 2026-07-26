@@ -507,20 +507,31 @@ class MiFitnessHealthPlugin(Star):
             entries.append(f"{'机器人' if is_bot else '用户'}: {text[:600]}")
         return entries[-count:]
 
-    def _is_configured_owner_private_session(self, session: str) -> bool:
-        """Verify a stored UMO before loading either form of private history."""
+    async def _is_configured_owner_private_session(self, session: str) -> bool:
+        """Verify a private UMO against the session bound by an owner event."""
         parts = session.split(":", 2)
         if len(parts) != 3 or "friend" not in parts[1].lower():
             return False
-        owner_id = getattr(self, "owner_platform_id", "")
-        if owner_id and normalize_identifier(parts[2]) != owner_id:
-            return False
         platform_instance_id = getattr(self, "owner_platform_instance_id", "")
-        return not platform_instance_id or parts[0] == platform_instance_id
+        if platform_instance_id and parts[0] != platform_instance_id:
+            return False
+        owner_id = getattr(self, "owner_platform_id", "")
+        database = getattr(self, "database", None)
+        if not owner_id or database is None:
+            return False
+        try:
+            state = await asyncio.to_thread(database.private_owner_session, owner_id)
+        except Exception as error:
+            logger.warning(
+                "Mi Fitness could not verify the owner private session: %s",
+                redact_error(error),
+            )
+            return False
+        return bool(state and state.get("session") == session)
 
     async def _recent_private_context(self, session: str) -> list[str]:
         """Load the configured private context source for the proactive gate."""
-        if not self._is_configured_owner_private_session(session):
+        if not await self._is_configured_owner_private_session(session):
             return []
         try:
             configured_count = int(getattr(self, "proactive_context_message_count", 8))
@@ -1202,11 +1213,14 @@ class MiFitnessHealthPlugin(Star):
             try:
                 parsed = datetime.fromisoformat(last_sync)
                 parsed = parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
-                if datetime.now(UTC) - parsed < timedelta(
-                    minutes=self.natural_query_sync_minutes
+                sync_age = datetime.now(UTC) - parsed.astimezone(UTC)
+                if (
+                    timedelta(0)
+                    <= sync_age
+                    < timedelta(minutes=self.natural_query_sync_minutes)
                 ):
                     return False
-            except ValueError:
+            except (TypeError, ValueError, OverflowError):
                 pass
         if not force_refresh:
             last_failure = await self.query_service.latest_failure_at(
@@ -1220,11 +1234,14 @@ class MiFitnessHealthPlugin(Star):
                         if parsed_failure.tzinfo
                         else parsed_failure.replace(tzinfo=UTC)
                     )
-                    if datetime.now(UTC) - parsed_failure < timedelta(
-                        minutes=self.natural_query_sync_minutes
+                    failure_age = datetime.now(UTC) - parsed_failure.astimezone(UTC)
+                    if (
+                        timedelta(0)
+                        <= failure_age
+                        < timedelta(minutes=self.natural_query_sync_minutes)
                     ):
                         return False
-                except ValueError:
+                except (TypeError, ValueError, OverflowError):
                     pass
         self._pending_refresh_types.update(data_types - self._active_refresh_types)
         if self._natural_refresh_task is None or self._natural_refresh_task.done():

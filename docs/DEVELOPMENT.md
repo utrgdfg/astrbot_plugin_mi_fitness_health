@@ -50,7 +50,7 @@
 
 `context_decision_prompt` 和 `proactive_decision_prompt` 使用官方 `text` 配置类型。前者只定义生活数据调用任务，后者定义深夜候选时机的发送取舍；代码固定追加允许类别、JSON 输出协议、提示注入隔离和 fail-closed 规则，配置提示词不能移除这些边界。
 
-`proactive_context_source` 支持 `conversation_history`、`platform_message_history` 与 `hybrid`。平台流水通过 AstrBot 官方 `message_history_manager.get()` 读取，并且仅解析已验证所有者私聊 UMO；读取失败或为空时回退到当前对话历史。`proactive_context_prompt` 支持 `{{context_lines}}` 占位符，缺少占位符时插件会自动在末尾追加序列化上下文。
+`proactive_context_source` 支持 `conversation_history`、`platform_message_history` 与 `hybrid`。平台流水通过 AstrBot 官方 `message_history_manager.get()` 读取；读取前会将完整 UMO 与插件数据库中由所有者事件绑定的私聊会话进行精确匹配，而不是假设 UMO 第三段必然等于 UID。读取失败或为空时回退到当前对话历史。`proactive_context_prompt` 支持 `{{context_lines}}` 占位符，缺少占位符时插件会自动在末尾追加序列化上下文。
 
 主动关心使用 `proactive_reminder_provider_id` 选择的模型执行两步流程：先读取受限的当前会话文字上下文并输出 `{"send_care": boolean}`，通过后才结合人格生成最终消息。留空 provider 时两步均沿用当前私聊模型。
 
