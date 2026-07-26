@@ -31,6 +31,33 @@ class MainLifecycleTest(unittest.TestCase):
         self.assertNotIn("\n", focus)
         self.assertLessEqual(len(focus), 200)
 
+    def test_daily_chat_cues_are_not_misclassified_as_data_queries(self) -> None:
+        examples = {
+            "早啊，今天不太想起床": "睡眠 心率",
+            "今天好累": "睡眠 心率",
+            "刚散步回来": "活动",
+            "还在加班": "睡眠 心率",
+            "晚安": "睡眠 心率",
+            "昨晚没睡好": "睡眠 心率",
+        }
+        for message, expected_focus in examples.items():
+            with self.subTest(message=message):
+                self.assertFalse(MiFitnessHealthPlugin._is_health_question(message))
+                self.assertTrue(MiFitnessHealthPlugin._is_care_conversation(message))
+                self.assertEqual(
+                    MiFitnessHealthPlugin._care_focus(message), expected_focus
+                )
+
+    def test_explicit_data_questions_remain_available_for_troubleshooting(self) -> None:
+        for message in (
+            "我昨天睡得怎么样",
+            "今天走了多少步",
+            "帮我看看最近的心率",
+            "我的平均心率是多少",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(MiFitnessHealthPlugin._is_health_question(message))
+
     def test_health_dialogue_marks_focus_as_untrusted_and_escapes_boundaries(
         self,
     ) -> None:
