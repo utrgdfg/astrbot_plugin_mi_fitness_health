@@ -54,6 +54,13 @@
     "hint": "开启后，普通聊天出现作息、疲劳、运动、早晚问候等线索时，插件会在后台准备相关数据，让 Bot 按当前人格自然回应。用户不需要主动询问数据。",
     "default": true
   },
+  "context_decision_provider_id": {
+    "type": "string",
+    "description": "生活数据调用判断模型（可选）",
+    "hint": "直接选择 AstrBot 中已有的聊天模型。它会在所有者私聊时判断当前消息是否需要生活数据以及需要哪些类别，只接收当前消息，不接收小米数据；建议选择响应快、成本低的模型。留空时使用插件内置规则。",
+    "_special": "select_provider",
+    "default": ""
+  },
   "health_dialogue_provider_id": {
     "type": "string",
     "description": "补充回复草稿使用的模型（可选）",
@@ -77,7 +84,7 @@
   "enable_proactive_health_monitor": {
     "type": "bool",
     "description": "开启后台生活数据同步与主动关心",
-    "hint": "开启后定期更新小米云数据，并只在合适的日常时机私聊关心。还需要开启“允许 Bot 在对话中使用生活数据”。",
+    "hint": "开启后定期更新小米云数据，并只在合适的日常时机私聊关心。还需要开启“允许聊天模型接收生活数据摘要”。",
     "default": true
   },
   "proactive_reminder_provider_id": {
