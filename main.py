@@ -501,11 +501,10 @@ class MiFitnessHealthPlugin(Star):
 
     @staticmethod
     def _is_health_question(text: str) -> bool:
-        """Recognize ordinary Chinese health questions without intercepting replies."""
+        """Recognize explicit data requests without treating daily chat as a query."""
         compact = text.lower().replace(" ", "")
-        keywords = (
+        data_topics = (
             "睡",
-            "失眠",
             "心率",
             "心跳",
             "步数",
@@ -519,10 +518,36 @@ class MiFitnessHealthPlugin(Star):
             "压力",
             "身体数据",
             "健康",
-            "昨天怎么样",
-            "今天怎么样",
         )
-        return any(word in compact for word in keywords)
+        query_cues = (
+            "怎么样",
+            "多少",
+            "多久",
+            "几步",
+            "查一下",
+            "查询",
+            "看看",
+            "看下",
+            "看一下",
+            "帮我看",
+            "告诉我",
+            "数据",
+            "记录",
+            "平均",
+            "范围",
+            "趋势",
+            "正常吗",
+            "高吗",
+            "低吗",
+            "是不是",
+            "有没有",
+            "多不多",
+            "同步一下",
+            "刷新一下",
+        )
+        return any(word in compact for word in data_topics) and any(
+            cue in compact for cue in query_cues
+        )
 
     @staticmethod
     def _is_care_conversation(text: str) -> bool:
@@ -532,15 +557,25 @@ class MiFitnessHealthPlugin(Star):
             word in compact
             for word in (
                 "早安",
+                "早啊",
+                "早呀",
+                "早上好",
                 "晚安",
+                "起床",
+                "睡",
                 "熬夜",
-                "睡不着",
                 "好困",
+                "犯困",
                 "好累",
+                "累死",
                 "疲惫",
+                "没精神",
                 "加班",
                 "休息",
                 "散步",
+                "走路",
+                "跑步",
+                "健身",
                 "锻炼",
             )
         )
@@ -551,10 +586,27 @@ class MiFitnessHealthPlugin(Star):
         compact = text.lower().replace(" ", "")
         if any(
             word in compact
-            for word in ("早安", "晚安", "熬夜", "睡不着", "困", "累", "休息")
+            for word in (
+                "早安",
+                "早啊",
+                "早呀",
+                "早上好",
+                "晚安",
+                "起床",
+                "睡",
+                "熬夜",
+                "困",
+                "累",
+                "疲惫",
+                "没精神",
+                "休息",
+                "加班",
+            )
         ):
             return "睡眠 心率"
-        if any(word in compact for word in ("散步", "锻炼", "运动", "加班")):
+        if any(
+            word in compact for word in ("散步", "走路", "跑步", "健身", "锻炼", "运动")
+        ):
             return "活动"
         return "综合概况"
 
@@ -745,9 +797,10 @@ class MiFitnessHealthPlugin(Star):
         yield event.plain_result(
             "小米运动健康（仅所有者可用）\n"
             "健康连接｜健康同步｜健康状态｜今日健康｜心率记录 [小时]｜身体数据｜健康趋势 [天]\n"
-            "也可以直接说“我昨天睡得怎么样”或“我今天走了多少步”：机器人会按配置自动刷新云端缓存。\n"
+            "平时只需正常聊天；出现作息、疲劳、运动或早晚问候等线索时，插件会在后台准备相关生活数据，让机器人按当前人格自然回应。\n"
+            "直接查询和以上命令主要用于核对数据或排查连接问题。\n"
             f"后台生活数据同步：{'每 ' + str(self.monitor_interval) + ' 分钟' if self.proactive_monitor_enabled else '关闭'}；只在自然时机且冷却结束时私聊一次。\n"
-            f"模型健康数据授权：{'已开启' if self.allow_health_data_to_llm else '未开启（仅命令查询）'}。\n"
+            f"对话生活数据授权：{'已开启' if self.allow_health_data_to_llm else '未开启（仅命令查询）'}。\n"
             "数据用于让日常对话更贴近你；它不是实时监护，也不用于医疗诊断。"
         )
 
