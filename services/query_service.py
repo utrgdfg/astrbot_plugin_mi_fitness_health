@@ -205,8 +205,13 @@ class QueryService:
             f"（结束 {ended.strftime('%H:%M')}，评分 {score}）"
         )
 
-    async def care_snapshot(self, focus: str = "") -> str:
-        """Return only health categories relevant to an owner conversation."""
+    async def care_snapshot(
+        self,
+        focus: str = "",
+        *,
+        include_missing_notice: bool = True,
+    ) -> str:
+        """Return relevant records, optionally omitting all missing-data notices."""
         compact = focus.lower().replace(" ", "")
         requested, explicitly_requested = self.requested_categories(focus)
         today = datetime.now(self.timezone).date()
@@ -362,7 +367,7 @@ class QueryService:
             ]
             if values:
                 parts.append("；".join(values))
-            elif target_day == today:
+            elif target_day == today and include_missing_notice:
                 recent_sleeps = await asyncio.to_thread(
                     self.database.recent_sleep,
                     self.user_id,
@@ -380,7 +385,7 @@ class QueryService:
                 else:
                     message += "；这可能是小米云仍在生成或上传本次睡眠汇总"
                 parts.append(message)
-            elif explicitly_requested:
+            elif explicitly_requested and include_missing_notice:
                 parts.append(
                     "睡眠：本地缓存暂无已同步记录；这不代表设备不支持或手机端无法同步"
                 )
@@ -392,4 +397,6 @@ class QueryService:
             parts.append(
                 f"{day_label}压力分数：{stress['score']}（数据采集时间 {self.display_timestamp(stress['timestamp'])}）"
             )
-        return "；".join(parts) or "暂无所查询项目的已同步云端数据"
+        if parts:
+            return "；".join(parts)
+        return "暂无所查询项目的已同步云端数据" if include_missing_notice else ""

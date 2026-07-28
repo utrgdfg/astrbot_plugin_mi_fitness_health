@@ -586,7 +586,7 @@ class MainLifecycleTest(unittest.TestCase):
         plugin._refresh_for_natural_question = AsyncMock(return_value=False)
 
         class Query:
-            async def care_snapshot(self, focus):
+            async def care_snapshot(self, focus, *, include_missing_notice=True):
                 return "昨日睡眠 430 分钟"
 
             async def sync_at_for_focus(self, focus):
@@ -608,6 +608,29 @@ class MainLifecycleTest(unittest.TestCase):
             force_refresh=False,
             wait_timeout=5.0,
         )
+
+    def test_llm_context_silently_skips_when_no_current_data_exists(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.care_dialogue_enabled = True
+        plugin.allow_health_data_to_llm = True
+        plugin._is_private_owner_event = Mock(return_value=True)
+        plugin._refresh_for_natural_question = AsyncMock(return_value=False)
+        plugin.query_service = Mock()
+        plugin.query_service.care_snapshot = AsyncMock(return_value="")
+        plugin.query_service.sync_at_for_focus = AsyncMock()
+        event = Mock()
+        event.unified_msg_origin = "qq:FriendMessage:123"
+        event.get_message_str.return_value = "早安，我刚醒"
+        request = ProviderRequest()
+
+        asyncio.run(plugin.add_owner_health_context(event, request))
+
+        self.assertEqual(request.extra_user_content_parts, [])
+        plugin.query_service.care_snapshot.assert_awaited_once_with(
+            "今天 睡眠 心率",
+            include_missing_notice=False,
+        )
+        plugin.query_service.sync_at_for_focus.assert_not_awaited()
 
     def test_empty_cache_refresh_is_visible_to_current_llm_request(self) -> None:
         plugin = self._bare_plugin()
@@ -632,7 +655,7 @@ class MainLifecycleTest(unittest.TestCase):
             async def latest_failure_at(self, data_types):
                 return None
 
-            async def care_snapshot(self, focus):
+            async def care_snapshot(self, focus, *, include_missing_notice=True):
                 return snapshot
 
             async def sync_at_for_focus(self, focus):
@@ -830,7 +853,7 @@ class MainLifecycleTest(unittest.TestCase):
         plugin._refresh_for_natural_question = AsyncMock(return_value=True)
 
         class Query:
-            async def care_snapshot(self, focus):
+            async def care_snapshot(self, focus, *, include_missing_notice=True):
                 return "今日睡眠记录"
 
             async def sync_at_for_focus(self, focus):
@@ -864,7 +887,7 @@ class MainLifecycleTest(unittest.TestCase):
         plugin._compose_health_dialogue = AsyncMock(return_value=None)
 
         class Query:
-            async def care_snapshot(self, focus):
+            async def care_snapshot(self, focus, *, include_missing_notice=True):
                 return "今日睡眠记录"
 
             async def sync_at_for_focus(self, focus):
@@ -887,6 +910,32 @@ class MainLifecycleTest(unittest.TestCase):
             force_refresh=True,
             wait_timeout=5.0,
         )
+
+    def test_llm_tool_without_data_requests_silent_normal_conversation(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.care_dialogue_enabled = True
+        plugin.allow_health_data_to_llm = True
+        plugin._access_denial_reason = Mock(return_value=None)
+        plugin._refresh_for_natural_question = AsyncMock(return_value=False)
+        plugin._compose_health_dialogue = AsyncMock()
+        plugin.query_service = Mock()
+        plugin.query_service.care_snapshot = AsyncMock(return_value="")
+        plugin.query_service.sync_at_for_focus = AsyncMock()
+        event = Mock()
+        event.unified_msg_origin = "qq:FriendMessage:123"
+        event.get_message_str.return_value = "早安，我刚醒"
+
+        result = asyncio.run(plugin.query_mi_fitness_health(event, "最近 睡眠"))
+
+        self.assertIn("NO_HEALTH_CONTEXT", result)
+        self.assertNotIn("小米云", result)
+        self.assertNotIn("暂无", result)
+        plugin.query_service.care_snapshot.assert_awaited_once_with(
+            "今天 睡眠",
+            include_missing_notice=False,
+        )
+        plugin.query_service.sync_at_for_focus.assert_not_awaited()
+        plugin._compose_health_dialogue.assert_not_awaited()
 
     def test_concurrent_natural_refreshes_share_one_cloud_operation(self) -> None:
         plugin = self._bare_plugin()

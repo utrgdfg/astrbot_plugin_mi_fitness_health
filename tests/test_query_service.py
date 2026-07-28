@@ -153,6 +153,73 @@ class QueryServiceTest(unittest.TestCase):
             self.assertIn("仅供历史参考", snapshot)
             self.assertIn("不能作为今天刚醒后的状态", snapshot)
 
+    def test_conversation_snapshot_silently_omits_missing_today_sleep(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            service = QueryService(database, "user", "Asia/Shanghai")
+            local_now = datetime.now(service.timezone)
+            yesterday_end = local_now - timedelta(days=1)
+            database.upsert_sleep(
+                "user",
+                SleepSession(
+                    "yesterday-only",
+                    (yesterday_end - timedelta(minutes=450)).astimezone(UTC),
+                    yesterday_end.astimezone(UTC),
+                    450,
+                    420,
+                    30,
+                    88,
+                ),
+            )
+
+            snapshot = asyncio.run(
+                service.care_snapshot(
+                    "今天 睡眠",
+                    include_missing_notice=False,
+                )
+            )
+
+            self.assertEqual(snapshot, "")
+
+    def test_conversation_snapshot_keeps_today_metrics_while_omitting_old_sleep(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            service = QueryService(database, "user", "Asia/Shanghai")
+            now = datetime.now(UTC)
+            yesterday_end = now - timedelta(days=1)
+            database.upsert_sleep(
+                "user",
+                SleepSession(
+                    "yesterday-only",
+                    yesterday_end - timedelta(minutes=450),
+                    yesterday_end,
+                    450,
+                    420,
+                    30,
+                    88,
+                ),
+            )
+            database.upsert_heart_rate(
+                "user",
+                HeartRateSample("today-heart", now, 72, "passive", False),
+            )
+
+            snapshot = asyncio.run(
+                service.care_snapshot(
+                    "今天 睡眠 心率",
+                    include_missing_notice=False,
+                )
+            )
+
+            self.assertIn("今日心率", snapshot)
+            self.assertIn("72 bpm", snapshot)
+            self.assertNotIn("睡眠", snapshot)
+            self.assertNotIn("历史参考", snapshot)
+
     def test_today_sleep_uses_record_ending_today_when_available(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Database(Path(directory) / "health.sqlite3")

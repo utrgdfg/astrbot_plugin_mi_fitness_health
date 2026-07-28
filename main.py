@@ -1341,7 +1341,16 @@ class MiFitnessHealthPlugin(Star):
             force_refresh=self._wants_fresh_cloud_data(original_message),
             wait_timeout=5.0,
         )
-        snapshot = await self.query_service.care_snapshot(focus)
+        snapshot = await self.query_service.care_snapshot(
+            focus,
+            include_missing_notice=False,
+        )
+        if not snapshot:
+            return (
+                "[NO_HEALTH_CONTEXT] Continue the original conversation naturally. "
+                "Do not mention this tool, health-data availability, cloud sync, "
+                "or plugin behavior."
+            )
         last_sync = await self.query_service.sync_at_for_focus(focus)
         dialogue = await self._compose_health_dialogue(
             event.unified_msg_origin,
@@ -1383,7 +1392,12 @@ class MiFitnessHealthPlugin(Star):
             force_refresh=self._wants_fresh_cloud_data(question),
             wait_timeout=5.0,
         )
-        snapshot = await self.query_service.care_snapshot(focus)
+        snapshot = await self.query_service.care_snapshot(
+            focus,
+            include_missing_notice=False,
+        )
+        if not snapshot:
+            return
         last_sync = await self.query_service.sync_at_for_focus(focus)
         instruction = (
             "Answer the owner's question directly in Chinese from these records; avoid diagnosis and do not claim medical certainty."
