@@ -12,7 +12,7 @@ from collections import defaultdict
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta, tzinfo
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import httpx
 from astrbot.api import logger
@@ -29,6 +29,12 @@ from ..models import (
 from ..utils.privacy import redact_error
 
 LOGIN_PREFIX = b"&&&START&&&"
+ALLOWED_REDIRECT_HOSTS = (
+    "account.xiaomi.com",
+    "io.mi.com",
+    "hlth.io.mi.com",
+    "api.io.mi.com",
+)
 KNOWN_REGIONS = ("cn", "ru", "de", "i2", "sg", "us")
 PRIMARY_HEART_RATE_KEYS = ("heart_rate", "heartrate", "hr")
 RESTING_HEART_RATE_KEYS = ("resting_heart_rate",)
@@ -209,7 +215,22 @@ class MiFitnessCloudAdapter(DataAdapter):
         self.user_id = str(payload.get("userId") or self.user_id)
         self.pass_token = str(payload.get("passToken") or self.pass_token)
         self._ssecurity = base64.b64decode(payload["ssecurity"])
-        redirected = await self._client.get(str(payload["location"]))
+        location = str(payload["location"])
+        parsed_location = urlparse(location)
+        host = parsed_location.hostname or ""
+        is_allowed_host = (
+            parsed_location.scheme == "https"
+            and host.endswith(ALLOWED_REDIRECT_HOSTS)
+            and any(
+                host == allowed or host.endswith(f".{allowed}")
+                for allowed in ALLOWED_REDIRECT_HOSTS
+            )
+        )
+        if not is_allowed_host:
+            raise MiFitnessAuthenticationError(
+                "小米登录重定向必须使用 HTTPS 且目标位于受信任域内；请重新获取 Cookie。"
+            )
+        redirected = await self._client.get(location)
         if redirected.status_code in (401, 403):
             raise MiFitnessAuthenticationError(
                 "小米健康云会话授权失败；请重新获取 Cookie。"

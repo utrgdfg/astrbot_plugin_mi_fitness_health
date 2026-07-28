@@ -34,7 +34,7 @@ class MainLifecycleTest(unittest.TestCase):
 
     def test_daily_chat_cues_are_not_misclassified_as_data_queries(self) -> None:
         examples = {
-            "早啊，今天不太想起床": "睡眠 心率",
+            "早啊，今天不太想起床": "今天 睡眠 心率",
             "今天好累": "睡眠 心率",
             "刚散步回来": "活动",
             "还在加班": "睡眠 心率",
@@ -48,6 +48,80 @@ class MainLifecycleTest(unittest.TestCase):
                 self.assertEqual(
                     MiFitnessHealthPlugin._care_focus(message), expected_focus
                 )
+
+    def test_morning_sleep_focus_uses_today_even_when_model_selects_recent(
+        self,
+    ) -> None:
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "早安，我刚醒",
+                "最近 睡眠 心率",
+            ),
+            "今天 睡眠 心率",
+        )
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "早安，我刚醒",
+                "最近睡眠",
+            ),
+            "今天 睡眠",
+        )
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "早安，我刚醒",
+                "昨天睡眠",
+            ),
+            "今天 睡眠",
+        )
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "早安",
+                "今日综合概况",
+            ),
+            "今天 综合概况",
+        )
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "今天好累",
+                "睡眠 心率",
+            ),
+            "今天 睡眠 心率",
+        )
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "昨天走了很多路",
+                "今天活动",
+            ),
+            "昨天 活动",
+        )
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "早安，想看看昨天睡眠",
+                "今天睡眠",
+            ),
+            "昨天 睡眠",
+        )
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "早安，想看看昨日睡眠",
+                "最近睡眠",
+            ),
+            "昨天 睡眠",
+        )
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "我刚醒，睡得怎么样",
+                "我刚醒，睡得怎么样",
+            ),
+            "今天 我刚醒，睡得怎么样",
+        )
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "早安",
+                "综合概况",
+            ),
+            "今天 综合概况",
+        )
 
     def test_explicit_data_questions_remain_available_for_troubleshooting(self) -> None:
         for message in (
@@ -554,7 +628,7 @@ class MainLifecycleTest(unittest.TestCase):
         plugin._refresh_for_natural_question = AsyncMock(return_value=False)
 
         class Query:
-            async def care_snapshot(self, focus):
+            async def care_snapshot(self, focus, *, include_missing_notice=True):
                 return "昨日睡眠 430 分钟"
 
             async def sync_at_for_focus(self, focus):
@@ -571,11 +645,34 @@ class MainLifecycleTest(unittest.TestCase):
         asyncio.run(plugin.add_owner_health_context(event, request))
         self.assertEqual(len(request.extra_user_content_parts), 1)
         plugin._refresh_for_natural_question.assert_awaited_once_with(
-            "睡眠 心率",
+            "今天 睡眠 心率",
             wait_for_result=True,
             force_refresh=False,
             wait_timeout=5.0,
         )
+
+    def test_llm_context_silently_skips_when_no_current_data_exists(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.care_dialogue_enabled = True
+        plugin.allow_health_data_to_llm = True
+        plugin._is_private_owner_event = Mock(return_value=True)
+        plugin._refresh_for_natural_question = AsyncMock(return_value=False)
+        plugin.query_service = Mock()
+        plugin.query_service.care_snapshot = AsyncMock(return_value="")
+        plugin.query_service.sync_at_for_focus = AsyncMock()
+        event = Mock()
+        event.unified_msg_origin = "qq:FriendMessage:123"
+        event.get_message_str.return_value = "早安，我刚醒"
+        request = ProviderRequest()
+
+        asyncio.run(plugin.add_owner_health_context(event, request))
+
+        self.assertEqual(request.extra_user_content_parts, [])
+        plugin.query_service.care_snapshot.assert_awaited_once_with(
+            "今天 睡眠 心率",
+            include_missing_notice=False,
+        )
+        plugin.query_service.sync_at_for_focus.assert_not_awaited()
 
     def test_empty_cache_refresh_is_visible_to_current_llm_request(self) -> None:
         plugin = self._bare_plugin()
@@ -600,7 +697,7 @@ class MainLifecycleTest(unittest.TestCase):
             async def latest_failure_at(self, data_types):
                 return None
 
-            async def care_snapshot(self, focus):
+            async def care_snapshot(self, focus, *, include_missing_notice=True):
                 return snapshot
 
             async def sync_at_for_focus(self, focus):
@@ -715,6 +812,80 @@ class MainLifecycleTest(unittest.TestCase):
         self.assertEqual(warning[1], "睡眠")
         self.assertNotIn("synthetic", str(warning))
 
+    def test_fresh_natural_refresh_logs_cache_hit_without_cloud_access(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.natural_query_sync_minutes = 15
+        plugin._natural_refresh_task = None
+        plugin._pending_refresh_types = set()
+        plugin._active_refresh_types = set()
+        plugin._sync = AsyncMock()
+
+        class Query:
+            @staticmethod
+            def sync_types_for_focus(focus):
+                return ("sleep",)
+
+            async def latest_sync_at(self, data_types):
+                return datetime.now(UTC).isoformat()
+
+        plugin.query_service = Query()
+
+        with patch("astrbot_plugin_mi_fitness_health.main.logger") as log:
+            refreshed = asyncio.run(
+                plugin._refresh_for_natural_question(
+                    "昨天睡眠",
+                    wait_for_result=True,
+                )
+            )
+
+        self.assertFalse(refreshed)
+        plugin._sync.assert_not_awaited()
+        self.assertIsNone(plugin._natural_refresh_task)
+        self.assertEqual(log.info.call_count, 1)
+        report = log.info.call_args.args
+        self.assertIn("最近一次云端同步仍在刷新间隔内", report[0])
+        self.assertIn("使用本地缓存", report[0])
+        self.assertEqual(report[1], "睡眠")
+        self.assertNotIn("昨天睡眠", str(report))
+
+    def test_recent_refresh_failure_logs_cache_fallback_without_retry(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.natural_query_sync_minutes = 15
+        plugin._natural_refresh_task = None
+        plugin._pending_refresh_types = set()
+        plugin._active_refresh_types = set()
+        plugin._sync = AsyncMock()
+
+        class Query:
+            @staticmethod
+            def sync_types_for_focus(focus):
+                return ("heart_rate",)
+
+            async def latest_sync_at(self, data_types):
+                return None
+
+            async def latest_failure_at(self, data_types):
+                return datetime.now(UTC).isoformat()
+
+        plugin.query_service = Query()
+
+        with patch("astrbot_plugin_mi_fitness_health.main.logger") as log:
+            refreshed = asyncio.run(
+                plugin._refresh_for_natural_question(
+                    "最近心率",
+                    wait_for_result=True,
+                )
+            )
+
+        self.assertFalse(refreshed)
+        plugin._sync.assert_not_awaited()
+        self.assertIsNone(plugin._natural_refresh_task)
+        self.assertEqual(log.warning.call_count, 1)
+        report = log.warning.call_args.args
+        self.assertIn("近期云端拉取失败", report[0])
+        self.assertEqual(report[1], "心率")
+        self.assertNotIn("最近心率", str(report))
+
     def test_original_just_synced_intent_forces_model_selected_refresh(self) -> None:
         plugin = self._bare_plugin()
         plugin.care_dialogue_enabled = True
@@ -724,7 +895,7 @@ class MainLifecycleTest(unittest.TestCase):
         plugin._refresh_for_natural_question = AsyncMock(return_value=True)
 
         class Query:
-            async def care_snapshot(self, focus):
+            async def care_snapshot(self, focus, *, include_missing_notice=True):
                 return "今日睡眠记录"
 
             async def sync_at_for_focus(self, focus):
@@ -758,7 +929,7 @@ class MainLifecycleTest(unittest.TestCase):
         plugin._compose_health_dialogue = AsyncMock(return_value=None)
 
         class Query:
-            async def care_snapshot(self, focus):
+            async def care_snapshot(self, focus, *, include_missing_notice=True):
                 return "今日睡眠记录"
 
             async def sync_at_for_focus(self, focus):
@@ -773,7 +944,7 @@ class MainLifecycleTest(unittest.TestCase):
         event.unified_msg_origin = "qq:FriendMessage:123"
         event.get_message_str.return_value = "我刚同步完，今天还是很累"
 
-        asyncio.run(plugin.query_mi_fitness_health(event, "今天 睡眠"))
+        result = asyncio.run(plugin.query_mi_fitness_health(event, "今天 睡眠"))
 
         plugin._refresh_for_natural_question.assert_awaited_once_with(
             "今天 睡眠",
@@ -781,6 +952,54 @@ class MainLifecycleTest(unittest.TestCase):
             force_refresh=True,
             wait_timeout=5.0,
         )
+        self.assertNotIn("暂无", result)
+
+    def test_llm_tool_without_data_requests_silent_normal_conversation(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.care_dialogue_enabled = True
+        plugin.allow_health_data_to_llm = True
+        plugin._access_denial_reason = Mock(return_value=None)
+        plugin._refresh_for_natural_question = AsyncMock(return_value=False)
+        plugin._compose_health_dialogue = AsyncMock()
+        plugin.query_service = Mock()
+        plugin.query_service.care_snapshot = AsyncMock(return_value="")
+        plugin.query_service.sync_at_for_focus = AsyncMock()
+        event = Mock()
+        event.unified_msg_origin = "qq:FriendMessage:123"
+        event.get_message_str.return_value = "早安，我刚醒"
+
+        result = asyncio.run(plugin.query_mi_fitness_health(event, "最近 睡眠"))
+
+        self.assertIn("NO_HEALTH_CONTEXT", result)
+        self.assertNotIn("小米云", result)
+        self.assertNotIn("暂无", result)
+        plugin.query_service.care_snapshot.assert_awaited_once_with(
+            "今天 睡眠",
+            include_missing_notice=False,
+        )
+        plugin.query_service.sync_at_for_focus.assert_not_awaited()
+        plugin._compose_health_dialogue.assert_not_awaited()
+
+    def test_llm_tool_silently_skips_when_unavailable_or_unauthorized(self) -> None:
+        event = Mock()
+        plugin = self._bare_plugin()
+        plugin.care_dialogue_enabled = False
+        plugin.allow_health_data_to_llm = True
+        plugin._access_denial_reason = Mock(return_value=None)
+        disabled = asyncio.run(plugin.query_mi_fitness_health(event))
+
+        plugin.care_dialogue_enabled = True
+        plugin.allow_health_data_to_llm = False
+        unconsented = asyncio.run(plugin.query_mi_fitness_health(event))
+
+        plugin.allow_health_data_to_llm = True
+        plugin._access_denial_reason = Mock(return_value="授权失败")
+        unauthorized = asyncio.run(plugin.query_mi_fitness_health(event))
+
+        for result in (disabled, unconsented, unauthorized):
+            self.assertIn("NO_HEALTH_CONTEXT", result)
+            self.assertNotIn("配置", result)
+            self.assertNotIn("授权失败", result)
 
     def test_concurrent_natural_refreshes_share_one_cloud_operation(self) -> None:
         plugin = self._bare_plugin()

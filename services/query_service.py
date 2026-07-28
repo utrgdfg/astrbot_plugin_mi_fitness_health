@@ -183,8 +183,35 @@ class QueryService:
         """Format one stored timestamp in the configured user timezone."""
         return local_timestamp(value, self.timezone)
 
-    async def care_snapshot(self, focus: str = "") -> str:
-        """Return only health categories relevant to an owner conversation."""
+    def _format_sleep_row(self, sleep: dict) -> str | None:
+        """Format one sleep row by its local wake date, skipping malformed history."""
+        try:
+            ended = datetime.fromisoformat(str(sleep["end_at"]))
+            if ended.tzinfo is None:
+                ended = ended.replace(tzinfo=UTC)
+            ended = ended.astimezone(self.timezone)
+            score = sleep["score"] if sleep["score"] is not None else "未提供"
+            asleep_minutes = sleep["asleep_minutes"]
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            OverflowError,
+            OSError,
+        ):
+            return None
+        return (
+            f"{ended.date()} 睡眠 {asleep_minutes} 分钟"
+            f"（结束 {ended.strftime('%H:%M')}，评分 {score}）"
+        )
+
+    async def care_snapshot(
+        self,
+        focus: str = "",
+        *,
+        include_missing_notice: bool = True,
+    ) -> str:
+        """Return relevant records, optionally omitting all missing-data notices."""
         compact = focus.lower().replace(" ", "")
         requested, explicitly_requested = self.requested_categories(focus)
         today = datetime.now(self.timezone).date()
@@ -332,26 +359,36 @@ class QueryService:
             parts.append(
                 f"{day_label}体重：{measurement['weight_kg']} kg（数据采集时间 {self.display_timestamp(measurement['timestamp'])}）"
             )
-        if requested["sleep"] and sleeps:
-            values = []
-            for sleep in sleeps:
-                try:
-                    ended = datetime.fromisoformat(str(sleep["end_at"]))
-                    if ended.tzinfo is None:
-                        ended = ended.replace(tzinfo=UTC)
-                    ended = ended.astimezone(self.timezone)
-                except (KeyError, TypeError, ValueError, OverflowError, OSError):
-                    continue
-                score = sleep["score"] if sleep["score"] is not None else "未提供"
-                values.append(
-                    f"{ended.date()} 睡眠 {sleep['asleep_minutes']} 分钟（结束 {ended.strftime('%H:%M')}，评分 {score}）"
-                )
+        if requested["sleep"]:
+            values = [
+                value
+                for sleep in sleeps
+                if (value := self._format_sleep_row(sleep)) is not None
+            ]
             if values:
                 parts.append("；".join(values))
-        elif requested["sleep"] and explicitly_requested:
-            parts.append(
-                "睡眠：本地缓存暂无已同步记录；这不代表设备不支持或手机端无法同步"
-            )
+            elif target_day == today and include_missing_notice:
+                recent_sleeps = await asyncio.to_thread(
+                    self.database.recent_sleep,
+                    self.user_id,
+                    1,
+                )
+                recent_value = (
+                    self._format_sleep_row(recent_sleeps[0]) if recent_sleeps else None
+                )
+                message = "今日睡眠：当前缓存中尚未出现以今天起床时间结束的云端记录"
+                if recent_value:
+                    message += (
+                        f"；最近一条为 {recent_value}，仅供历史参考，"
+                        "不能作为今天刚醒后的状态"
+                    )
+                else:
+                    message += "；这可能是小米云仍在生成或上传本次睡眠汇总"
+                parts.append(message)
+            elif explicitly_requested and include_missing_notice:
+                parts.append(
+                    "睡眠：本地缓存暂无已同步记录；这不代表设备不支持或手机端无法同步"
+                )
         if requested["spo2"] and spo2:
             parts.append(
                 f"{day_label}血氧：{spo2['percent']}%（数据采集时间 {self.display_timestamp(spo2['timestamp'])}）"
@@ -360,4 +397,6 @@ class QueryService:
             parts.append(
                 f"{day_label}压力分数：{stress['score']}（数据采集时间 {self.display_timestamp(stress['timestamp'])}）"
             )
-        return "；".join(parts) or "暂无所查询项目的已同步云端数据"
+        if parts:
+            return "；".join(parts)
+        return "暂无所查询项目的已同步云端数据" if include_missing_notice else ""
