@@ -61,8 +61,50 @@ class MainLifecycleTest(unittest.TestCase):
         )
         self.assertEqual(
             MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "早安，我刚醒",
+                "最近睡眠",
+            ),
+            "今天 睡眠",
+        )
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "早安，我刚醒",
+                "昨天睡眠",
+            ),
+            "今天 睡眠",
+        )
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "早安",
+                "今日综合概况",
+            ),
+            "今天 综合概况",
+        )
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "今天好累",
+                "睡眠 心率",
+            ),
+            "今天 睡眠 心率",
+        )
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "昨天走了很多路",
+                "今天活动",
+            ),
+            "昨天 活动",
+        )
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
                 "早安，想看看昨天睡眠",
-                "昨天 睡眠",
+                "今天睡眠",
+            ),
+            "昨天 睡眠",
+        )
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "早安，想看看昨日睡眠",
+                "最近睡眠",
             ),
             "昨天 睡眠",
         )
@@ -902,7 +944,7 @@ class MainLifecycleTest(unittest.TestCase):
         event.unified_msg_origin = "qq:FriendMessage:123"
         event.get_message_str.return_value = "我刚同步完，今天还是很累"
 
-        asyncio.run(plugin.query_mi_fitness_health(event, "今天 睡眠"))
+        result = asyncio.run(plugin.query_mi_fitness_health(event, "今天 睡眠"))
 
         plugin._refresh_for_natural_question.assert_awaited_once_with(
             "今天 睡眠",
@@ -910,6 +952,7 @@ class MainLifecycleTest(unittest.TestCase):
             force_refresh=True,
             wait_timeout=5.0,
         )
+        self.assertNotIn("暂无", result)
 
     def test_llm_tool_without_data_requests_silent_normal_conversation(self) -> None:
         plugin = self._bare_plugin()
@@ -936,6 +979,27 @@ class MainLifecycleTest(unittest.TestCase):
         )
         plugin.query_service.sync_at_for_focus.assert_not_awaited()
         plugin._compose_health_dialogue.assert_not_awaited()
+
+    def test_llm_tool_silently_skips_when_unavailable_or_unauthorized(self) -> None:
+        event = Mock()
+        plugin = self._bare_plugin()
+        plugin.care_dialogue_enabled = False
+        plugin.allow_health_data_to_llm = True
+        plugin._access_denial_reason = Mock(return_value=None)
+        disabled = asyncio.run(plugin.query_mi_fitness_health(event))
+
+        plugin.care_dialogue_enabled = True
+        plugin.allow_health_data_to_llm = False
+        unconsented = asyncio.run(plugin.query_mi_fitness_health(event))
+
+        plugin.allow_health_data_to_llm = True
+        plugin._access_denial_reason = Mock(return_value="授权失败")
+        unauthorized = asyncio.run(plugin.query_mi_fitness_health(event))
+
+        for result in (disabled, unconsented, unauthorized):
+            self.assertIn("NO_HEALTH_CONTEXT", result)
+            self.assertNotIn("配置", result)
+            self.assertNotIn("授权失败", result)
 
     def test_concurrent_natural_refreshes_share_one_cloud_operation(self) -> None:
         plugin = self._bare_plugin()
