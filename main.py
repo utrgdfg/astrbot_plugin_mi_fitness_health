@@ -1141,6 +1141,18 @@ class MiFitnessHealthPlugin(Star):
             for word in ("刚同步", "刚上传", "最新", "更新一下", "刷新", "同步一下")
         )
 
+    @classmethod
+    def _sync_type_log_label(cls, data_types: set[str]) -> str:
+        """Describe selected datasets without exposing health values or message text."""
+        return (
+            "、".join(
+                label
+                for data_type, label in cls._SYNC_TYPE_LOG_LABELS.items()
+                if data_type in data_types
+            )
+            or "相关数据"
+        )
+
     async def _natural_refresh_worker(self) -> bool:
         """Coalesce concurrent natural-language refreshes into serialized batches."""
         refreshed = False
@@ -1148,14 +1160,10 @@ class MiFitnessHealthPlugin(Star):
             data_types = set(self._pending_refresh_types)
             self._pending_refresh_types.difference_update(data_types)
             self._active_refresh_types.update(data_types)
-            data_label = "、".join(
-                label
-                for data_type, label in self._SYNC_TYPE_LOG_LABELS.items()
-                if data_type in data_types
-            )
+            data_label = self._sync_type_log_label(data_types)
             logger.info(
                 "[小米运动健康] 对话需要最新生活数据，正在拉取小米云数据（%s）",
-                data_label or "相关数据",
+                data_label,
             )
             try:
                 summary = await self._sync(data_types=data_types)
@@ -1164,12 +1172,12 @@ class MiFitnessHealthPlugin(Star):
                     logger.warning(
                         "[小米运动健康] 小米云数据拉取部分完成，"
                         "部分数据类别暂时失败（%s）",
-                        data_label or "相关数据",
+                        data_label,
                     )
                 else:
                     logger.info(
                         "[小米运动健康] 小米云数据拉取成功（%s）",
-                        data_label or "相关数据",
+                        data_label,
                     )
             except MiFitnessAuthenticationError as error:
                 self._auto_sync_paused = True
@@ -1207,6 +1215,7 @@ class MiFitnessHealthPlugin(Star):
         phone app has uploaded the data.
         """
         data_types = set(self.query_service.sync_types_for_focus(text))
+        data_label = self._sync_type_log_label(data_types)
         last_sync = await self.query_service.latest_sync_at(tuple(sorted(data_types)))
         force_refresh = force_refresh or self._wants_fresh_cloud_data(text)
         if last_sync and not force_refresh:
@@ -1219,6 +1228,11 @@ class MiFitnessHealthPlugin(Star):
                     <= sync_age
                     < timedelta(minutes=self.natural_query_sync_minutes)
                 ):
+                    logger.info(
+                        "[小米运动健康] 对话判断需要生活数据，"
+                        "已命中有效缓存（%s），无需重复拉取",
+                        data_label,
+                    )
                     return False
             except (TypeError, ValueError, OverflowError):
                 pass
@@ -1240,6 +1254,11 @@ class MiFitnessHealthPlugin(Star):
                         <= failure_age
                         < timedelta(minutes=self.natural_query_sync_minutes)
                     ):
+                        logger.warning(
+                            "[小米运动健康] 对话判断需要生活数据，"
+                            "但近期云端拉取失败，暂用本地缓存（%s）",
+                            data_label,
+                        )
                         return False
                 except (TypeError, ValueError, OverflowError):
                     pass

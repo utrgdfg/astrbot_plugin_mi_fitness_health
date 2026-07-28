@@ -715,6 +715,79 @@ class MainLifecycleTest(unittest.TestCase):
         self.assertEqual(warning[1], "睡眠")
         self.assertNotIn("synthetic", str(warning))
 
+    def test_fresh_natural_refresh_logs_cache_hit_without_cloud_access(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.natural_query_sync_minutes = 15
+        plugin._natural_refresh_task = None
+        plugin._pending_refresh_types = set()
+        plugin._active_refresh_types = set()
+        plugin._sync = AsyncMock()
+
+        class Query:
+            @staticmethod
+            def sync_types_for_focus(focus):
+                return ("sleep",)
+
+            async def latest_sync_at(self, data_types):
+                return datetime.now(UTC).isoformat()
+
+        plugin.query_service = Query()
+
+        with patch("astrbot_plugin_mi_fitness_health.main.logger") as log:
+            refreshed = asyncio.run(
+                plugin._refresh_for_natural_question(
+                    "昨天睡眠",
+                    wait_for_result=True,
+                )
+            )
+
+        self.assertFalse(refreshed)
+        plugin._sync.assert_not_awaited()
+        self.assertIsNone(plugin._natural_refresh_task)
+        self.assertEqual(log.info.call_count, 1)
+        report = log.info.call_args.args
+        self.assertIn("命中有效缓存", report[0])
+        self.assertEqual(report[1], "睡眠")
+        self.assertNotIn("昨天睡眠", str(report))
+
+    def test_recent_refresh_failure_logs_cache_fallback_without_retry(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.natural_query_sync_minutes = 15
+        plugin._natural_refresh_task = None
+        plugin._pending_refresh_types = set()
+        plugin._active_refresh_types = set()
+        plugin._sync = AsyncMock()
+
+        class Query:
+            @staticmethod
+            def sync_types_for_focus(focus):
+                return ("heart_rate",)
+
+            async def latest_sync_at(self, data_types):
+                return None
+
+            async def latest_failure_at(self, data_types):
+                return datetime.now(UTC).isoformat()
+
+        plugin.query_service = Query()
+
+        with patch("astrbot_plugin_mi_fitness_health.main.logger") as log:
+            refreshed = asyncio.run(
+                plugin._refresh_for_natural_question(
+                    "最近心率",
+                    wait_for_result=True,
+                )
+            )
+
+        self.assertFalse(refreshed)
+        plugin._sync.assert_not_awaited()
+        self.assertIsNone(plugin._natural_refresh_task)
+        self.assertEqual(log.warning.call_count, 1)
+        report = log.warning.call_args.args
+        self.assertIn("近期云端拉取失败", report[0])
+        self.assertEqual(report[1], "心率")
+        self.assertNotIn("最近心率", str(report))
+
     def test_original_just_synced_intent_forces_model_selected_refresh(self) -> None:
         plugin = self._bare_plugin()
         plugin.care_dialogue_enabled = True
