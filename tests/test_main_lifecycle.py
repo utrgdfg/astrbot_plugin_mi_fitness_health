@@ -34,7 +34,7 @@ class MainLifecycleTest(unittest.TestCase):
 
     def test_daily_chat_cues_are_not_misclassified_as_data_queries(self) -> None:
         examples = {
-            "早啊，今天不太想起床": "睡眠 心率",
+            "早啊，今天不太想起床": "今天 睡眠 心率",
             "今天好累": "睡眠 心率",
             "刚散步回来": "活动",
             "还在加班": "睡眠 心率",
@@ -48,6 +48,38 @@ class MainLifecycleTest(unittest.TestCase):
                 self.assertEqual(
                     MiFitnessHealthPlugin._care_focus(message), expected_focus
                 )
+
+    def test_morning_sleep_focus_uses_today_even_when_model_selects_recent(
+        self,
+    ) -> None:
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "早安，我刚醒",
+                "最近 睡眠 心率",
+            ),
+            "今天 睡眠 心率",
+        )
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "早安，想看看昨天睡眠",
+                "昨天 睡眠",
+            ),
+            "昨天 睡眠",
+        )
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "我刚醒，睡得怎么样",
+                "我刚醒，睡得怎么样",
+            ),
+            "今天 我刚醒，睡得怎么样",
+        )
+        self.assertEqual(
+            MiFitnessHealthPlugin._normalize_context_focus_for_message(
+                "早安",
+                "综合概况",
+            ),
+            "今天 综合概况",
+        )
 
     def test_explicit_data_questions_remain_available_for_troubleshooting(self) -> None:
         for message in (
@@ -571,7 +603,7 @@ class MainLifecycleTest(unittest.TestCase):
         asyncio.run(plugin.add_owner_health_context(event, request))
         self.assertEqual(len(request.extra_user_content_parts), 1)
         plugin._refresh_for_natural_question.assert_awaited_once_with(
-            "睡眠 心率",
+            "今天 睡眠 心率",
             wait_for_result=True,
             force_refresh=False,
             wait_timeout=5.0,
@@ -746,7 +778,8 @@ class MainLifecycleTest(unittest.TestCase):
         self.assertIsNone(plugin._natural_refresh_task)
         self.assertEqual(log.info.call_count, 1)
         report = log.info.call_args.args
-        self.assertIn("命中有效缓存", report[0])
+        self.assertIn("最近一次云端同步仍在刷新间隔内", report[0])
+        self.assertIn("使用本地缓存", report[0])
         self.assertEqual(report[1], "睡眠")
         self.assertNotIn("昨天睡眠", str(report))
 

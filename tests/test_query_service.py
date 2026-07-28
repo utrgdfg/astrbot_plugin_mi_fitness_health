@@ -121,6 +121,64 @@ class QueryServiceTest(unittest.TestCase):
             self.assertIn("420 分钟", snapshot)
             self.assertNotIn("111 分钟", snapshot)
 
+    def test_today_sleep_does_not_present_yesterday_as_current(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            service = QueryService(database, "user", "Asia/Shanghai")
+            local_now = datetime.now(service.timezone)
+            yesterday_end = datetime.combine(
+                local_now.date() - timedelta(days=1),
+                datetime.min.time(),
+                tzinfo=service.timezone,
+            ) + timedelta(hours=8)
+            database.upsert_sleep(
+                "user",
+                SleepSession(
+                    "yesterday-only",
+                    (yesterday_end - timedelta(minutes=450)).astimezone(UTC),
+                    yesterday_end.astimezone(UTC),
+                    450,
+                    420,
+                    30,
+                    88,
+                ),
+            )
+
+            snapshot = asyncio.run(service.care_snapshot("今天 睡眠 心率"))
+
+            self.assertIn("今日睡眠", snapshot)
+            self.assertIn("尚未出现以今天起床时间结束", snapshot)
+            self.assertIn(yesterday_end.date().isoformat(), snapshot)
+            self.assertIn("仅供历史参考", snapshot)
+            self.assertIn("不能作为今天刚醒后的状态", snapshot)
+
+    def test_today_sleep_uses_record_ending_today_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            service = QueryService(database, "user", "Asia/Shanghai")
+            local_now = datetime.now(service.timezone)
+            today_end = local_now.replace(second=0, microsecond=0)
+            database.upsert_sleep(
+                "user",
+                SleepSession(
+                    "today",
+                    (today_end - timedelta(minutes=450)).astimezone(UTC),
+                    today_end.astimezone(UTC),
+                    450,
+                    420,
+                    30,
+                    88,
+                ),
+            )
+
+            snapshot = asyncio.run(service.care_snapshot("今天 睡眠"))
+
+            self.assertIn(today_end.date().isoformat(), snapshot)
+            self.assertIn("420 分钟", snapshot)
+            self.assertNotIn("仅供历史参考", snapshot)
+
     def test_naive_legacy_sleep_timestamp_is_interpreted_as_utc(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Database(Path(directory) / "health.sqlite3")

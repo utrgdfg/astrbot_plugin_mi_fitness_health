@@ -80,6 +80,16 @@ class MiFitnessHealthPlugin(Star):
         "spo2": "血氧",
         "stress": "压力",
     }
+    _MORNING_WAKE_CUES = (
+        "早安",
+        "早啊",
+        "早呀",
+        "早上好",
+        "起床",
+        "刚醒",
+        "醒了",
+        "睡醒",
+    )
 
     def __init__(self, context: Context, config: AstrBotConfig):
         """Configure one Xiaomi account and one AstrBot data owner.
@@ -972,15 +982,12 @@ class MiFitnessHealthPlugin(Star):
     def _care_focus(text: str) -> str:
         """Select the smallest useful data slice for a casual conversation."""
         compact = text.lower().replace(" ", "")
+        if any(word in compact for word in MiFitnessHealthPlugin._MORNING_WAKE_CUES):
+            return "今天 睡眠 心率"
         if any(
             word in compact
             for word in (
-                "早安",
-                "早啊",
-                "早呀",
-                "早上好",
                 "晚安",
-                "起床",
                 "睡",
                 "熬夜",
                 "困",
@@ -997,6 +1004,27 @@ class MiFitnessHealthPlugin(Star):
         ):
             return "活动"
         return "综合概况"
+
+    @classmethod
+    def _normalize_context_focus_for_message(cls, message: str, focus: str) -> str:
+        """Use today's wake-date boundary for morning sleep conversations."""
+        compact_message = message.lower().replace(" ", "")
+        compact_focus = focus.lower().replace(" ", "")
+        focus_includes_sleep = any(
+            word in compact_focus for word in ("睡", "失眠", "入睡", "醒")
+        ) or any(word in compact_focus for word in ("综合", "概况"))
+        if (
+            not any(word in compact_message for word in cls._MORNING_WAKE_CUES)
+            or any(word in compact_message for word in ("昨天", "昨日"))
+            or not focus_includes_sleep
+        ):
+            return focus
+        tokens = [
+            token
+            for token in focus.split()
+            if token not in {"今天", "今日", "昨天", "昨日", "最近"}
+        ]
+        return " ".join(("今天", *tokens))
 
     @classmethod
     def _parse_context_decision(cls, value: object) -> tuple[bool, str] | None:
@@ -1230,7 +1258,8 @@ class MiFitnessHealthPlugin(Star):
                 ):
                     logger.info(
                         "[小米运动健康] 对话判断需要生活数据，"
-                        "已命中有效缓存（%s），无需重复拉取",
+                        "最近一次云端同步仍在刷新间隔内，"
+                        "正在使用本地缓存（%s）",
                         data_label,
                     )
                     return False
@@ -1301,8 +1330,11 @@ class MiFitnessHealthPlugin(Star):
         denial_reason = self._access_denial_reason(event)
         if denial_reason:
             return denial_reason
-        focus = self._sanitize_focus(focus)
         original_message = self._sanitize_focus(event.get_message_str())
+        focus = self._normalize_context_focus_for_message(
+            original_message,
+            self._sanitize_focus(focus),
+        )
         await self._refresh_for_natural_question(
             focus,
             wait_for_result=True,
@@ -1343,6 +1375,7 @@ class MiFitnessHealthPlugin(Star):
         )
         if not use_data:
             return
+        focus = self._normalize_context_focus_for_message(question, focus)
         health_question = self._is_health_question(question)
         await self._refresh_for_natural_question(
             focus,
@@ -1479,7 +1512,7 @@ class MiFitnessHealthPlugin(Star):
         yield event.plain_result(
             today_text(activity, rates, measurement, self.query_service.timezone)
             + "\n"
-            + await self.query_service.care_snapshot("睡眠 血氧 压力")
+            + await self.query_service.care_snapshot("今天 睡眠 血氧 压力")
         )
 
     @filter.command("健康详情")
