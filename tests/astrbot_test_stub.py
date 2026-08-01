@@ -91,8 +91,10 @@ def install_logger_stub() -> None:
     class TextPart:
         def __init__(self, text):
             self.text = text
+            self._no_save = False
 
         def mark_as_temp(self):
+            self._no_save = True
             return self
 
     message_module.TextPart = TextPart

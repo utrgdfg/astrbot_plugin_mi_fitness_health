@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import hashlib
 import json
 import os
@@ -17,7 +18,6 @@ from urllib.parse import urlencode, urlparse
 import httpx
 from astrbot.api import logger
 
-from .base import DataAdapter
 from ..models import (
     BodyMeasurement,
     DailyActivity,
@@ -27,6 +27,7 @@ from ..models import (
     StressSample,
 )
 from ..utils.privacy import redact_error
+from .base import DataAdapter
 
 LOGIN_PREFIX = b"&&&START&&&"
 ALLOWED_REDIRECT_HOSTS = (
@@ -52,6 +53,14 @@ REGION_PROBE_KEYS = (
 )
 CONNECT_TIMEOUT_SECONDS = 90
 MAX_RECORDS_PER_KEY = 100_000
+LOGIN_RESPONSE_MAX_BYTES = 1 * 1024 * 1024
+API_RESPONSE_MAX_BYTES = 8 * 1024 * 1024
+MAX_DATASET_BYTES = 64 * 1024 * 1024
+MAX_LOGIN_FIELD_LENGTH = 8192
+MAX_SESSION_COOKIE_BYTES = 32 * 1024
+MAX_RATE_LIMIT_DELAY_SECONDS = 15 * 60
+DEFAULT_RATE_LIMIT_DELAY_SECONDS = 60
+DIAGNOSTIC_TIMEOUT_SECONDS = 120
 
 
 class MiFitnessAuthenticationError(RuntimeError):
@@ -60,6 +69,58 @@ class MiFitnessAuthenticationError(RuntimeError):
 
 class MiFitnessResponseError(RuntimeError):
     """A non-transient remote response that must not be retried."""
+
+
+class MiFitnessRateLimitError(RuntimeError):
+    """Xiaomi asked the client to stop sending requests until a shared deadline."""
+
+    def __init__(self, retry_after_seconds: float):
+        """Build a credential-safe error carrying the server-directed cooldown."""
+        self.retry_after_seconds = max(1.0, float(retry_after_seconds))
+        remaining = max(1, int(self.retry_after_seconds + 0.999))
+        super().__init__(f"小米健康云请求过于频繁；请约 {remaining} 秒后再尝试同步。")
+
+
+class MiFitnessBudgetError(MiFitnessResponseError):
+    """One bounded cloud operation exhausted its byte or record allowance."""
+
+
+class _OperationBudget:
+    """Share response-byte and record limits across pages and alias keys."""
+
+    __slots__ = ("bytes_used", "max_bytes", "max_records", "records_seen")
+
+    def __init__(
+        self,
+        *,
+        max_bytes: int = MAX_DATASET_BYTES,
+        max_records: int = MAX_RECORDS_PER_KEY,
+    ):
+        self.max_bytes = max(1, int(max_bytes))
+        self.max_records = max(1, int(max_records))
+        self.bytes_used = 0
+        self.records_seen = 0
+
+    def remaining_bytes(self) -> int:
+        """Return the response allowance left before another HTTP read starts."""
+        if self.records_seen >= self.max_records:
+            raise MiFitnessBudgetError("小米健康云数据超过单次操作记录安全上限。")
+        remaining = self.max_bytes - self.bytes_used
+        if remaining <= 0:
+            raise MiFitnessBudgetError("小米健康云数据超过单次操作字节安全上限。")
+        return remaining
+
+    def consume_response(self, payload: bytes) -> None:
+        """Count the full encrypted response, including unused result fields."""
+        self.bytes_used += len(payload)
+        if self.bytes_used > self.max_bytes:
+            raise MiFitnessBudgetError("小米健康云数据超过单次操作字节安全上限。")
+
+    def consume_record(self) -> None:
+        """Count every dictionary record before normalization or deduplication."""
+        self.records_seen += 1
+        if self.records_seen > self.max_records:
+            raise MiFitnessBudgetError("小米健康云数据超过单次操作记录安全上限。")
 
 
 def _rc4_crypt(key: bytes, payload: bytes) -> bytes:
@@ -139,6 +200,7 @@ class MiFitnessCloudAdapter(DataAdapter):
         self.last_error: str | None = None
         self.authentication_failed = False
         self._connect_lock = asyncio.Lock()
+        self._next_allowed_request_at = 0.0
 
     def get_available_data_types(self) -> list[str]:
         """Return discovered data types."""
@@ -173,12 +235,18 @@ class MiFitnessCloudAdapter(DataAdapter):
                 )
                 self._connected = True
                 return True
+            except asyncio.CancelledError:
+                await self.close()
+                raise
+            except MiFitnessRateLimitError:
+                await self.close()
+                raise
             except MiFitnessAuthenticationError as error:
                 self.authentication_failed = True
                 self.last_error = redact_error(error)
             except asyncio.TimeoutError:
                 self.last_error = "连接小米健康云超时，请稍后重试或手动指定区域。"
-            except (httpx.HTTPError, ValueError, KeyError, RuntimeError) as error:
+            except Exception as error:
                 self.last_error = redact_error(error)
             await self.close()
             logger.warning("Mi Fitness connection failed: %s", self.last_error)
@@ -186,40 +254,164 @@ class MiFitnessCloudAdapter(DataAdapter):
 
     async def _establish_session(self) -> None:
         """Authenticate and complete bounded region/type discovery."""
-        await self._login_with_token()
+        candidate_user_id, candidate_pass_token = await self._login_with_token()
+        discovery_budget = _OperationBudget()
         if self.region not in KNOWN_REGIONS:
-            self.region = await self._discover_region()
-        self._available_types = await self._discover_data_types()
+            self.region = await self._discover_region(discovery_budget)
+        self._available_types = await self._discover_data_types(discovery_budget)
+        # The login response is not trusted to replace configured credentials
+        # until the resulting session has completed at least one health API
+        # request.  This also keeps a failed/risk-control response from
+        # poisoning later connection attempts in the same plugin process.
+        self.user_id = candidate_user_id
+        self.pass_token = candidate_pass_token
 
-    async def _login_with_token(self) -> None:
-        """Exchange the configured login cookies for ssecurity and health session cookies."""
+    async def _limited_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        max_bytes: int,
+        read_body: bool = True,
+        headers: dict[str, str] | None = None,
+        content: str | bytes | None = None,
+    ) -> tuple[httpx.Response, bytes]:
+        """Stream one response and reject oversized decoded bodies before buffering."""
         if not self._client:
             raise RuntimeError("HTTP client unavailable")
-        response = await self._client.get(
+        chunks: list[bytes] = []
+        total = 0
+        async with self._client.stream(
+            method,
+            url,
+            headers=headers,
+            content=content,
+        ) as response:
+            if not read_body or response.status_code >= 400:
+                return response, b""
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > max_bytes:
+                    raise MiFitnessBudgetError("小米云响应超过单次读取安全上限。")
+                chunks.append(chunk)
+            return response, b"".join(chunks)
+
+    def rate_limit_remaining(self) -> float:
+        """Return the shared Xiaomi cooldown remaining in the current event loop."""
+        if self._next_allowed_request_at <= 0:
+            return 0.0
+        try:
+            now = asyncio.get_running_loop().time()
+        except RuntimeError:
+            return 0.0
+        remaining = self._next_allowed_request_at - now
+        if remaining <= 0:
+            self._next_allowed_request_at = 0.0
+            return 0.0
+        return remaining
+
+    def _raise_if_rate_limited(self) -> None:
+        """Fail fast so aliases and datasets cannot add requests during a cooldown."""
+        remaining = self.rate_limit_remaining()
+        if remaining > 0:
+            raise MiFitnessRateLimitError(remaining)
+
+    def _set_rate_limit(self, delay: float) -> None:
+        """Share the longest server-requested cooldown across all cloud operations."""
+        loop = asyncio.get_running_loop()
+        self._next_allowed_request_at = max(
+            self._next_allowed_request_at,
+            loop.time() + max(1.0, delay),
+        )
+
+    async def _login_with_token(self) -> tuple[str, str]:
+        """Exchange configured login cookies and return uncommitted credentials."""
+        if not self._client:
+            raise RuntimeError("HTTP client unavailable")
+        self._raise_if_rate_limited()
+        response, raw = await self._limited_request(
+            "GET",
             "https://account.xiaomi.com/pass/serviceLogin?_json=true&sid=miothealth",
+            max_bytes=LOGIN_RESPONSE_MAX_BYTES,
             headers={"Cookie": f"userId={self.user_id}; passToken={self.pass_token}"},
         )
+        if response.status_code == 429:
+            delay = self._retry_after_delay(response.headers.get("Retry-After", ""), 0)
+            self._set_rate_limit(delay)
+            raise MiFitnessRateLimitError(delay)
         if response.status_code in (401, 403):
             raise MiFitnessAuthenticationError(
                 "小米登录授权已失效；请重新获取 Cookie。"
             )
         response.raise_for_status()
-        raw = response.content
         if not raw.startswith(LOGIN_PREFIX):
             raise MiFitnessAuthenticationError("小米登录响应无效；请重新获取 Cookie。")
         payload = json.loads(raw[len(LOGIN_PREFIX) :].decode())
-        if not payload.get("ssecurity") or not payload.get("location"):
+        if not isinstance(payload, dict):
+            raise MiFitnessAuthenticationError(
+                "小米登录响应格式无效；请重新获取 Cookie。"
+            )
+        raw_ssecurity = payload.get("ssecurity")
+        raw_location = payload.get("location")
+        if (
+            not isinstance(raw_ssecurity, str)
+            or not 1 <= len(raw_ssecurity) <= MAX_LOGIN_FIELD_LENGTH
+            or not isinstance(raw_location, str)
+            or not 1 <= len(raw_location) <= MAX_LOGIN_FIELD_LENGTH
+        ):
             raise MiFitnessAuthenticationError(
                 "凭证已失效、需要验证或账号受到风控；请在浏览器重新登录后更新 Cookie。"
             )
-        self.user_id = str(payload.get("userId") or self.user_id)
-        self.pass_token = str(payload.get("passToken") or self.pass_token)
-        self._ssecurity = base64.b64decode(payload["ssecurity"])
-        location = str(payload["location"])
+        try:
+            candidate_ssecurity = base64.b64decode(raw_ssecurity, validate=True)
+        except (binascii.Error, ValueError) as error:
+            raise MiFitnessAuthenticationError(
+                "小米登录安全参数无效；请重新获取 Cookie。"
+            ) from error
+        if not 16 <= len(candidate_ssecurity) <= 64:
+            raise MiFitnessAuthenticationError(
+                "小米登录安全参数长度无效；请重新获取 Cookie。"
+            )
+        candidate_user_id = self.user_id
+        returned_user_id = payload.get("userId")
+        if returned_user_id not in (None, ""):
+            if isinstance(returned_user_id, bool) or not isinstance(
+                returned_user_id, (str, int)
+            ):
+                raise MiFitnessAuthenticationError(
+                    "小米登录账号标识格式无效；请重新获取 Cookie。"
+                )
+            candidate_user_id = str(returned_user_id).strip()
+            if not 1 <= len(candidate_user_id) <= 1024:
+                raise MiFitnessAuthenticationError(
+                    "小米登录账号标识长度无效；请重新获取 Cookie。"
+                )
+            if candidate_user_id != self.user_id:
+                raise MiFitnessAuthenticationError(
+                    "小米登录返回的账号与配置 userId 不一致；请重新获取同一账号的 Cookie。"
+                )
+        candidate_pass_token = self.pass_token
+        returned_pass_token = payload.get("passToken")
+        if returned_pass_token not in (None, ""):
+            if not isinstance(returned_pass_token, str) or not (
+                1 <= len(returned_pass_token) <= MAX_LOGIN_FIELD_LENGTH
+            ):
+                raise MiFitnessAuthenticationError(
+                    "小米登录凭证格式无效；请重新获取 Cookie。"
+                )
+            candidate_pass_token = returned_pass_token
+        location = raw_location
         parsed_location = urlparse(location)
         host = parsed_location.hostname or ""
+        try:
+            port = parsed_location.port
+        except ValueError:
+            port = -1
         is_allowed_host = (
             parsed_location.scheme == "https"
+            and port in (None, 443)
+            and parsed_location.username is None
+            and parsed_location.password is None
             and host.endswith(ALLOWED_REDIRECT_HOSTS)
             and any(
                 host == allowed or host.endswith(f".{allowed}")
@@ -230,28 +422,54 @@ class MiFitnessCloudAdapter(DataAdapter):
             raise MiFitnessAuthenticationError(
                 "小米登录重定向必须使用 HTTPS 且目标位于受信任域内；请重新获取 Cookie。"
             )
-        redirected = await self._client.get(location)
+        redirected, _ = await self._limited_request(
+            "GET",
+            location,
+            max_bytes=0,
+            read_body=False,
+        )
+        if redirected.status_code == 429:
+            delay = self._retry_after_delay(
+                redirected.headers.get("Retry-After", ""), 0
+            )
+            self._set_rate_limit(delay)
+            raise MiFitnessRateLimitError(delay)
         if redirected.status_code in (401, 403):
             raise MiFitnessAuthenticationError(
                 "小米健康云会话授权失败；请重新获取 Cookie。"
             )
         redirected.raise_for_status()
-        self._cookies = "; ".join(
+        candidate_cookies = "; ".join(
             value.split(";", 1)[0]
             for value in redirected.headers.get_list("set-cookie")
         )
-        if not self._cookies:
+        if not candidate_cookies:
             raise MiFitnessAuthenticationError(
                 "未取得小米健康云会话；请重新登录后更新 Cookie。"
             )
+        if len(candidate_cookies.encode("utf-8")) > MAX_SESSION_COOKIE_BYTES:
+            raise MiFitnessAuthenticationError(
+                "小米健康云会话 Cookie 超过安全上限；请重新登录后重试。"
+            )
+        self._ssecurity = candidate_ssecurity
+        self._cookies = candidate_cookies
+        return candidate_user_id, candidate_pass_token
 
-    async def _request(self, host: str, path: str, payload: dict[str, object]) -> dict:
+    async def _request(
+        self,
+        host: str,
+        path: str,
+        payload: dict[str, object],
+        *,
+        budget: _OperationBudget | None = None,
+    ) -> dict:
         """Send one encrypted request with capped exponential retries."""
         if not self._client or not self._ssecurity:
             raise RuntimeError("Xiaomi session unavailable")
         last_error: Exception | None = None
         for attempt in range(3):
             try:
+                self._raise_if_rate_limited()
                 nonce = _nonce()
                 signed_nonce = hashlib.sha256(self._ssecurity + nonce).digest()
                 form = {
@@ -270,25 +488,34 @@ class MiFitnessCloudAdapter(DataAdapter):
                     "POST", path, encrypted, signed_nonce
                 )
                 encrypted["_nonce"] = base64.b64encode(nonce).decode()
-                response = await self._client.post(
+                max_response_bytes = API_RESPONSE_MAX_BYTES
+                if budget is not None:
+                    max_response_bytes = min(
+                        max_response_bytes, budget.remaining_bytes()
+                    )
+                response, encrypted_body = await self._limited_request(
+                    "POST",
                     host + path,
+                    max_bytes=max_response_bytes,
                     headers={
                         "Cookie": self._cookies,
                         "Content-Type": "application/x-www-form-urlencoded",
                     },
                     content=urlencode(encrypted),
                 )
+                if budget is not None:
+                    budget.consume_response(encrypted_body)
                 if response.status_code in (401, 403):
                     self._connected = False
                     self.authentication_failed = True
                     raise MiFitnessAuthenticationError(
                         "小米健康云授权已失效；请重新获取 Cookie。"
                     )
-                if response.status_code == 429 and attempt < 2:
+                if response.status_code == 429:
                     retry_after = response.headers.get("Retry-After", "")
                     delay = self._retry_after_delay(retry_after, attempt)
-                    await asyncio.sleep(delay)
-                    continue
+                    self._set_rate_limit(delay)
+                    raise MiFitnessRateLimitError(delay)
                 if response.status_code >= 400 and response.status_code not in {
                     408,
                     425,
@@ -302,10 +529,21 @@ class MiFitnessCloudAdapter(DataAdapter):
                         f"小米健康云返回 HTTP {response.status_code}"
                     )
                 response.raise_for_status()
-                body = json.loads(
-                    _rc4_crypt(signed_nonce, base64.b64decode(response.text))
-                )
-                if body.get("code") != 0:
+                try:
+                    decoded_body = base64.b64decode(
+                        encrypted_body.strip(), validate=True
+                    )
+                except (binascii.Error, ValueError) as error:
+                    raise MiFitnessResponseError("小米健康云响应编码无效。") from error
+                body = json.loads(_rc4_crypt(signed_nonce, decoded_body))
+                if not isinstance(body, dict):
+                    raise MiFitnessResponseError("小米健康云响应格式无效。")
+                code_value = body.get("code")
+                if isinstance(code_value, bool) or not isinstance(
+                    code_value, (int, str)
+                ):
+                    raise MiFitnessResponseError("小米健康云响应状态格式无效。")
+                if str(code_value) != "0":
                     message = str(body.get("message") or "Mi Fitness request failed")
                     if any(
                         marker in message.lower()
@@ -338,14 +576,17 @@ class MiFitnessCloudAdapter(DataAdapter):
                         raise MiFitnessAuthenticationError(
                             "小米健康云授权已失效；请重新获取 Cookie。"
                         )
-                    code = str(body.get("code") or "unknown")
+                    code = str(code_value)
                     raise MiFitnessResponseError(f"小米健康云返回错误代码 {code}")
-                return (
-                    body.get("result") if isinstance(body.get("result"), dict) else {}
-                )
-            except MiFitnessAuthenticationError:
-                raise
-            except MiFitnessResponseError:
+                result = body.get("result")
+                if not isinstance(result, dict):
+                    raise MiFitnessResponseError("小米健康云响应结果格式无效。")
+                return result
+            except (
+                MiFitnessAuthenticationError,
+                MiFitnessRateLimitError,
+                MiFitnessResponseError,
+            ):
                 raise
             except (
                 httpx.HTTPError,
@@ -362,7 +603,7 @@ class MiFitnessCloudAdapter(DataAdapter):
 
     @staticmethod
     def _retry_after_delay(value: str, attempt: int) -> float:
-        """Parse both Retry-After seconds and HTTP-date values with a safe cap."""
+        """Parse Retry-After seconds or HTTP-date within a bounded shared cooldown."""
         try:
             delay = float(value)
         except (TypeError, ValueError):
@@ -375,8 +616,10 @@ class MiFitnessCloudAdapter(DataAdapter):
                 )
                 delay = (retry_at - datetime.now(UTC)).total_seconds()
             except (TypeError, ValueError, OverflowError):
-                delay = 0.5 * (2**attempt)
-        return max(0.5, min(delay, 10.0))
+                delay = DEFAULT_RATE_LIMIT_DELAY_SECONDS
+        if delay != delay:  # NaN must not bypass the shared cooldown.
+            delay = DEFAULT_RATE_LIMIT_DELAY_SECONDS
+        return max(1.0, min(delay, MAX_RATE_LIMIT_DELAY_SECONDS))
 
     @staticmethod
     def _utc_timestamp(value: datetime) -> int:
@@ -386,35 +629,91 @@ class MiFitnessCloudAdapter(DataAdapter):
         )
         return int(normalized.timestamp())
 
-    async def _fetch_key(
-        self, key: str, start: datetime, end: datetime, region: str
-    ) -> list[dict]:
-        """Fetch every paginated record for an upstream key in a bounded date range."""
+    async def _fetch_page(
+        self,
+        key: str,
+        start: datetime,
+        end: datetime,
+        region: str,
+        cursor: str | None = None,
+        *,
+        budget: _OperationBudget | None = None,
+    ) -> dict:
+        """Fetch one bounded page for a fixed Xiaomi region and data key."""
         host = (
             "https://hlth.io.mi.com"
             if region in ("", "cn")
             else f"https://{region}.hlth.io.mi.com"
         )
+        payload: dict[str, object] = {
+            "start_time": self._utc_timestamp(start),
+            "end_time": self._utc_timestamp(end),
+            "key": key,
+        }
+        if cursor:
+            payload["next_key"] = cursor
+        return await self._request(
+            host,
+            "/app/v1/data/get_fitness_data_by_time",
+            payload,
+            budget=budget,
+        )
+
+    async def _probe_key(
+        self,
+        key: str,
+        start: datetime,
+        end: datetime,
+        region: str,
+        *,
+        budget: _OperationBudget | None = None,
+    ) -> list[dict]:
+        """Return only the first page of dict records for low-cost discovery."""
+        operation_budget = budget or _OperationBudget()
+        result = await self._fetch_page(
+            key, start, end, region, budget=operation_budget
+        )
+        data = result.get("data_list")
+        if not isinstance(data, list):
+            return []
+        records = []
+        for item in data:
+            if isinstance(item, dict):
+                operation_budget.consume_record()
+                records.append(item)
+        return records
+
+    async def _fetch_key(
+        self,
+        key: str,
+        start: datetime,
+        end: datetime,
+        region: str,
+        *,
+        budget: _OperationBudget | None = None,
+    ) -> list[dict]:
+        """Fetch every paginated record within record, page, and byte budgets."""
+        operation_budget = budget or _OperationBudget()
         cursor: str | None = None
         seen_cursors: set[str] = set()
-        seen_records: set[str] = set()
+        seen_records: set[bytes] = set()
         records: list[dict] = []
+        dataset_bytes = 0
         for _ in range(100):
-            payload: dict[str, object] = {
-                "start_time": self._utc_timestamp(start),
-                "end_time": self._utc_timestamp(end),
-                "key": key,
-            }
-            if cursor:
-                payload["next_key"] = cursor
-            result = await self._request(
-                host, "/app/v1/data/get_fitness_data_by_time", payload
+            result = await self._fetch_page(
+                key,
+                start,
+                end,
+                region,
+                cursor,
+                budget=operation_budget,
             )
             data = result.get("data_list")
             if isinstance(data, list):
                 for item in data:
                     if not isinstance(item, dict):
                         continue
+                    operation_budget.consume_record()
                     normalized_item = dict(item)
                     raw_value = normalized_item.get("value")
                     if isinstance(raw_value, str):
@@ -422,20 +721,26 @@ class MiFitnessCloudAdapter(DataAdapter):
                             normalized_item["value"] = json.loads(raw_value)
                         except json.JSONDecodeError:
                             pass
-                    fingerprint = json.dumps(
+                    canonical = json.dumps(
                         normalized_item,
                         ensure_ascii=False,
                         sort_keys=True,
                         separators=(",", ":"),
                         default=str,
-                    )
+                    ).encode("utf-8")
+                    dataset_bytes += len(canonical)
+                    if dataset_bytes > MAX_DATASET_BYTES:
+                        raise RuntimeError(
+                            f"小米健康云 {key} 数据超过单次同步字节安全上限。"
+                        )
+                    fingerprint = hashlib.sha256(canonical).digest()
                     if fingerprint not in seen_records:
                         seen_records.add(fingerprint)
-                        records.append(item)
-                        if len(records) > MAX_RECORDS_PER_KEY:
+                        if len(records) >= MAX_RECORDS_PER_KEY:
                             raise RuntimeError(
                                 f"小米健康云 {key} 数据超过单次同步安全上限。"
                             )
+                        records.append(normalized_item)
             next_cursor = (
                 result.get("next_key")
                 if isinstance(result.get("next_key"), str)
@@ -467,8 +772,9 @@ class MiFitnessCloudAdapter(DataAdapter):
         )
         return records
 
-    async def _discover_region(self) -> str:
-        """Probe several low-cost datasets so accounts without steps still work."""
+    async def _discover_region(self, budget: _OperationBudget | None = None) -> str:
+        """Probe only first pages and stop at the first region with usable data."""
+        operation_budget = budget or _OperationBudget()
         now = datetime.now(UTC)
         successful_probe = False
         last_error: Exception | None = None
@@ -476,13 +782,23 @@ class MiFitnessCloudAdapter(DataAdapter):
             for key in REGION_PROBE_KEYS:
                 try:
                     records = await asyncio.wait_for(
-                        self._fetch_key(key, now - timedelta(days=30), now, region),
+                        self._probe_key(
+                            key,
+                            now - timedelta(days=30),
+                            now,
+                            region,
+                            budget=operation_budget,
+                        ),
                         timeout=10,
                     )
                     successful_probe = True
                     if records:
                         return region
                 except MiFitnessAuthenticationError:
+                    raise
+                except MiFitnessRateLimitError:
+                    raise
+                except MiFitnessBudgetError:
                     raise
                 except asyncio.TimeoutError as error:
                     last_error = error
@@ -498,10 +814,14 @@ class MiFitnessCloudAdapter(DataAdapter):
             "最近 30 天没有可用于自动识别区域的云端记录；请在插件配置中手动选择 region。"
         )
 
-    async def _discover_data_types(self) -> list[str]:
-        """Discover only supported datasets, using a recent bounded probe."""
+    async def _discover_data_types(
+        self, budget: _OperationBudget | None = None
+    ) -> list[str]:
+        """Discover supported datasets from one bounded first page per candidate key."""
+        operation_budget = budget or _OperationBudget()
         now = datetime.now(UTC)
         types: list[str] = []
+        successful_probe = False
         for data_type, keys in (
             ("daily_activity", ("steps",)),
             ("heart_rate", PRIMARY_HEART_RATE_KEYS + RESTING_HEART_RATE_KEYS),
@@ -511,45 +831,82 @@ class MiFitnessCloudAdapter(DataAdapter):
             ("stress", ("stress",)),
         ):
             if data_type == "heart_rate":
-                try:
-                    if [
-                        row
-                        async for row in self.iter_heart_rate(
-                            now - timedelta(days=30), now
+                for key in keys:
+                    try:
+                        records = await self._probe_key(
+                            key,
+                            now - timedelta(days=30),
+                            now,
+                            self.region,
+                            budget=operation_budget,
                         )
-                    ]:
-                        types.append(data_type)
-                except MiFitnessAuthenticationError:
-                    raise
-                except RuntimeError:
-                    pass
+                        successful_probe = True
+                        if self._parse_heart_rate_records(
+                            records,
+                            is_resting=key in RESTING_HEART_RATE_KEYS,
+                        ):
+                            types.append(data_type)
+                            break
+                    except (
+                        MiFitnessAuthenticationError,
+                        MiFitnessRateLimitError,
+                        MiFitnessBudgetError,
+                    ):
+                        raise
+                    except RuntimeError:
+                        continue
                 continue
             if data_type == "spo2":
-                try:
-                    if [
-                        row
-                        async for row in self.iter_spo2(now - timedelta(days=30), now)
-                    ]:
-                        types.append(data_type)
-                except MiFitnessAuthenticationError:
-                    raise
-                except RuntimeError:
-                    pass
+                for key in keys:
+                    try:
+                        records = await self._probe_key(
+                            key,
+                            now - timedelta(days=30),
+                            now,
+                            self.region,
+                            budget=operation_budget,
+                        )
+                        successful_probe = True
+                        if self._parse_spo2_records(records):
+                            types.append(data_type)
+                            break
+                    except (
+                        MiFitnessAuthenticationError,
+                        MiFitnessRateLimitError,
+                        MiFitnessBudgetError,
+                    ):
+                        raise
+                    except RuntimeError:
+                        continue
                 continue
             found = False
             for key in keys:
                 try:
-                    if await self._fetch_key(
-                        key, now - timedelta(days=30), now, self.region
-                    ):
+                    records = await self._probe_key(
+                        key,
+                        now - timedelta(days=30),
+                        now,
+                        self.region,
+                        budget=operation_budget,
+                    )
+                    successful_probe = True
+                    if records:
                         found = True
                         break
-                except MiFitnessAuthenticationError:
+                except (
+                    MiFitnessAuthenticationError,
+                    MiFitnessRateLimitError,
+                    MiFitnessBudgetError,
+                ):
                     raise
                 except RuntimeError:
                     continue
             if found:
                 types.append(data_type)
+        if not successful_probe:
+            raise RuntimeError(
+                "小米健康云会话未能通过健康数据接口验证；请稍后重试或检查区域设置。"
+            )
         return types
 
     @staticmethod
@@ -614,14 +971,8 @@ class MiFitnessCloudAdapter(DataAdapter):
         )
         calorie_buckets: dict[tuple[str, int], float] = defaultdict(float)
         latest: dict[str, datetime] = {}
-        step_records = await self._fetch_key("steps", start, end, self.region)
-        try:
-            calorie_records = await self._fetch_key("calories", start, end, self.region)
-        except MiFitnessAuthenticationError:
-            raise
-        except RuntimeError:
-            calorie_records = []
-        for key, records in (("steps", step_records), ("calories", calorie_records)):
+
+        def consume_records(key: str, records: list[dict]) -> None:
             for item in records:
                 record_time = self._record_time(item)
                 if not record_time:
@@ -651,6 +1002,27 @@ class MiFitnessCloudAdapter(DataAdapter):
                             calorie_buckets[bucket_key], calories
                         )
                 latest[date] = max(latest.get(date, timestamp), timestamp)
+
+        operation_budget = _OperationBudget()
+        step_records = await self._fetch_key(
+            "steps", start, end, self.region, budget=operation_budget
+        )
+        consume_records("steps", step_records)
+        del step_records
+        try:
+            calorie_records = await self._fetch_key(
+                "calories", start, end, self.region, budget=operation_budget
+            )
+            consume_records("calories", calorie_records)
+            del calorie_records
+        except MiFitnessAuthenticationError:
+            raise
+        except MiFitnessRateLimitError:
+            raise
+        except MiFitnessBudgetError:
+            raise
+        except RuntimeError:
+            pass
         totals: dict[str, dict[str, float]] = defaultdict(
             lambda: {"steps": 0.0, "distance_m": 0.0, "active_kcal": 0.0}
         )
@@ -683,41 +1055,40 @@ class MiFitnessCloudAdapter(DataAdapter):
         ``resting_heart_rate`` is treated as an optional account-specific
         fallback and cannot invalidate records returned by ``heart_rate``.
         """
-        samples: list[HeartRateSample] = []
+        operation_budget = _OperationBudget()
         errors: list[RuntimeError] = []
-        for key in PRIMARY_HEART_RATE_KEYS:
-            try:
-                samples.extend(
-                    self._parse_heart_rate_records(
-                        await self._fetch_key(key, start, end, self.region),
-                        is_resting=False,
-                    )
-                )
-            except MiFitnessAuthenticationError:
-                raise
-            except RuntimeError as error:
-                errors.append(error)
-        for key in RESTING_HEART_RATE_KEYS:
-            try:
-                samples.extend(
-                    self._parse_heart_rate_records(
-                        await self._fetch_key(key, start, end, self.region),
-                        is_resting=True,
-                    )
-                )
-            except MiFitnessAuthenticationError:
-                raise
-            except RuntimeError as error:
-                errors.append(error)
-        if not samples and errors:
-            raise errors[-1]
         seen: set[tuple[int, int]] = set()
-        for sample in samples:
-            identity = (int(sample.timestamp.timestamp()), sample.bpm)
-            if identity in seen:
+        found = False
+        for key in PRIMARY_HEART_RATE_KEYS + RESTING_HEART_RATE_KEYS:
+            try:
+                samples = self._parse_heart_rate_records(
+                    await self._fetch_key(
+                        key,
+                        start,
+                        end,
+                        self.region,
+                        budget=operation_budget,
+                    ),
+                    is_resting=key in RESTING_HEART_RATE_KEYS,
+                )
+            except MiFitnessAuthenticationError:
+                raise
+            except MiFitnessRateLimitError:
+                raise
+            except MiFitnessBudgetError:
+                raise
+            except RuntimeError as error:
+                errors.append(error)
                 continue
-            seen.add(identity)
-            yield sample
+            for sample in samples:
+                identity = (int(sample.timestamp.timestamp()), sample.bpm)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                found = True
+                yield sample
+        if not found and errors:
+            raise errors[-1]
 
     def _parse_heart_rate_records(
         self, records: list[dict], *, is_resting: bool
@@ -837,28 +1208,39 @@ class MiFitnessCloudAdapter(DataAdapter):
         self, start: datetime, end: datetime
     ) -> AsyncIterator[SpO2Sample]:
         """Yield validated blood-oxygen records; unsupported keys simply return no rows."""
-        samples: list[SpO2Sample] = []
+        operation_budget = _OperationBudget()
         errors: list[RuntimeError] = []
+        seen_timestamps: set[int] = set()
+        found = False
         for key in SPO2_KEYS:
             try:
-                samples.extend(
-                    self._parse_spo2_records(
-                        await self._fetch_key(key, start, end, self.region)
+                samples = self._parse_spo2_records(
+                    await self._fetch_key(
+                        key,
+                        start,
+                        end,
+                        self.region,
+                        budget=operation_budget,
                     )
                 )
             except MiFitnessAuthenticationError:
                 raise
+            except MiFitnessRateLimitError:
+                raise
+            except MiFitnessBudgetError:
+                raise
             except RuntimeError as error:
                 errors.append(error)
-        if not samples and errors:
-            raise errors[-1]
-        seen_timestamps: set[int] = set()
-        for sample in samples:
-            timestamp = int(sample.timestamp.timestamp())
-            if timestamp in seen_timestamps:
                 continue
-            seen_timestamps.add(timestamp)
-            yield sample
+            for sample in samples:
+                timestamp = int(sample.timestamp.timestamp())
+                if timestamp in seen_timestamps:
+                    continue
+                seen_timestamps.add(timestamp)
+                found = True
+                yield sample
+        if not found and errors:
+            raise errors[-1]
 
     def _parse_spo2_records(self, records: list[dict]) -> list[SpO2Sample]:
         """Return only validated samples from one SpO2 candidate key."""
@@ -909,18 +1291,26 @@ class MiFitnessCloudAdapter(DataAdapter):
     async def close(self) -> None:
         """Close the plugin-owned async HTTP client."""
         self._connected = False
-        if self._client:
-            await self._client.aclose()
-            self._client = None
+        client = self._client
+        self._client = None
         self._cookies = ""
         self._ssecurity = b""
+        if client:
+            await client.aclose()
 
-    async def probe_data_keys(self, start: datetime, end: datetime) -> dict[str, str]:
+    async def probe_data_keys(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        timeout_seconds: float = DIAGNOSTIC_TIMEOUT_SECONDS,
+    ) -> dict[str, str]:
         """Return safe key-level availability diagnostics without returning raw records.
 
         Args:
             start: Probe window start.
             end: Probe window end.
+            timeout_seconds: Total wall-clock budget shared by every diagnostic key.
 
         Returns:
             Mapping of candidate key to count or a sanitized error category.
@@ -936,13 +1326,36 @@ class MiFitnessCloudAdapter(DataAdapter):
                 + ("stress", "weight")
             )
         )
+        time_budget = max(1.0, min(float(timeout_seconds), 5 * 60.0))
+        deadline = asyncio.get_running_loop().time() + time_budget
+        operation_budget = _OperationBudget()
         for key in keys:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError("小米健康云数据诊断超过安全时限。")
             try:
                 result[key] = str(
-                    len(await self._fetch_key(key, start, end, self.region))
+                    len(
+                        await asyncio.wait_for(
+                            self._fetch_key(
+                                key,
+                                start,
+                                end,
+                                self.region,
+                                budget=operation_budget,
+                            ),
+                            timeout=remaining,
+                        )
+                    )
                 )
             except MiFitnessAuthenticationError:
                 raise
+            except MiFitnessRateLimitError:
+                raise
+            except MiFitnessBudgetError:
+                raise
+            except asyncio.TimeoutError as error:
+                raise TimeoutError("小米健康云数据诊断超过安全时限。") from error
             except Exception as error:
                 result[key] = f"错误：{redact_error(error)}"
         return result

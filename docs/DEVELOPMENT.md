@@ -8,7 +8,7 @@
 
 ## 数据与同步
 
-- SQLite 数据库默认位于 AstrBot 插件数据目录，可通过高级配置覆盖路径。
+- SQLite 数据库默认位于 AstrBot 插件数据目录，可通过高级配置覆盖路径。自定义路径必须是绝对 SQLite 文件路径，不能经过符号链接或目录联接；现有文件必须带有本插件 application ID/归属标记，或严格匹配可迁移的旧版插件表结构。
 - 当前 schema 版本为 v7，迁移会保留健康记录，并移除已无运行时用途的旧 `care_deliveries` 表。
 - 健康记录和同步状态按小米 `userId` 隔离。
 - 主动关心记录和保留期清理按 AstrBot 所有者隔离。
@@ -27,7 +27,10 @@
 - 相关对话在缓存为空或过期时最多等待刷新 5 秒；超时通过 `asyncio.shield` 保留后台任务，当前回复改用已有缓存。
 - 主动关心检查和普通自动同步是独立任务；前者只评估本地状态，不发起小米云同步，后者仅在用户明确开启时运行。
 - 深夜规则只产生候选 finding；发送前必须再经过上下文模型的严格布尔闸门，模型失败或上下文为空时 fail closed。
-- 云端读取设有五分钟安全时限和单数据集记录数量上限。
+- 云端读取设有五分钟安全时限、单响应字节上限、数据集累计字节上限和记录数量上限；去重只保存固定长度 SHA-256 摘要。
+- 区域和数据类型发现只读取每个候选 key 的第一页；成功识别的区域按小米账号摘要持久化，避免每次重载重复跨区域探测。
+- HTTP 429 会建立跨数据集共享冷却并立即停止当前批次，后续任务在服务器指定时间前不会继续请求；对话中的“最新/刷新”也不能绕过硬冷却和近期失败退避。
+- 数据诊断具有 100 秒整体预算，超时会停止探测并关闭本次云端会话。
 - 已经开始的 SQLite 工作线程不会被伪装成“已取消”；事务完成前不会释放同步锁。
 - 单个数据集失败不会删除其他数据集的缓存。
 - 明确鉴权失败会暂停后台同步；普通网络错误使用有上限的退避重试。
@@ -36,11 +39,15 @@
 
 - 所有健康数据入口同时校验使用者 UID、Bot ID 和私聊消息类型。
 - 群聊不会返回健康数据。
-- 向 LLM 提供健康摘要需要用户显式开启授权，默认关闭。
+- 向 LLM 提供健康摘要需要用户显式开启授权，默认关闭；主动判断读取最近私聊使用另一项独立且默认关闭的授权。
+- 插件不注册返回健康明细的 LLM Tool，避免 AstrBot 将 Tool Result 写入运行日志或普通会话历史。自然对话只通过 `on_llm_request` 注入带 `mark_as_temp()` 标记的最小化摘要；不支持临时内容的运行时会安全跳过。
 - 用户关注文本会被限长、压缩为单行并作为不可信数据隔离。
-- 深夜闸门可通过 AstrBot 官方会话管理器、平台消息历史管理器或混合模式读取当前所有者私聊。配置范围为 0～50 条，总量仍限制为 4000 字符；可选择排除 assistant/Bot 文本，图片、工具结果和系统消息始终不会传入。刚收到但尚未落入 AstrBot 历史的所有者文本仅在插件内存中短暂补充，不写入插件 SQLite。
+- 获得独立私聊授权后，深夜闸门可通过 AstrBot 官方会话管理器、平台消息历史管理器或混合模式读取当前所有者私聊。平台历史记录必须携带可核验的消息类型或完整 UMO，否则丢弃并安全回退。配置范围为 0～50 条，总量仍限制为 4000 字符；可选择排除 assistant/Bot 文本，图片、工具结果和系统消息始终不会传入。刚收到但尚未落入 AstrBot 历史的所有者文本仅在插件内存中短暂补充，不写入插件 SQLite。
+- 配置补充回复草稿模型或人格后，相关最小化健康摘要会额外发送给该草稿使用的 Provider；配置页与 README 会明确披露第三方模型可能处理或保存这些内容。
 - 日志和用户可见错误会脱敏 Cookie、Token、授权头、签名参数和常见模型密钥格式。
-- 主动消息只发送到已记录且与配置 Bot ID 匹配的统一会话标识。
+- 处理过私聊或健康 prompt 的模型异常只记录异常类型，不记录可能回显请求体的异常正文。
+- 主动消息只发送到数据库中已绑定、消息类型精确为 `FriendMessage` 且 Bot ID 完全匹配的统一会话标识；模型生成内容还会拒绝 URL、群体提及、控制字符和命令格式。
+- AstrBot 最低版本为 4.24.2，Python 最低版本为 3.11，CI 使用 Python 3.11 和 3.12；若运行时缺少临时 `TextPart` 能力，插件会 fail closed，不把生活数据注入普通会话历史。
 
 ## 配置页约定
 
@@ -50,23 +57,24 @@
 
 `context_decision_prompt` 和 `proactive_decision_prompt` 使用官方 `text` 配置类型。前者只定义生活数据调用任务，后者定义深夜候选时机的发送取舍；代码固定追加允许类别、JSON 输出协议、提示注入隔离和 fail-closed 规则，配置提示词不能移除这些边界。
 
-`proactive_context_source` 支持 `conversation_history`、`platform_message_history` 与 `hybrid`。平台流水通过 AstrBot 官方 `message_history_manager.get()` 读取；读取前会将完整 UMO 与插件数据库中由所有者事件绑定的私聊会话进行精确匹配，而不是假设 UMO 第三段必然等于 UID。读取失败或为空时回退到当前对话历史。`proactive_context_prompt` 支持 `{{context_lines}}` 占位符，缺少占位符时插件会自动在末尾追加序列化上下文。
+`proactive_context_source` 支持 `conversation_history`、`platform_message_history` 与 `hybrid`。平台流水通过 AstrBot 官方 `message_history_manager.get()` 读取；记录必须包含精确匹配的完整 UMO 或 `FriendMessage` 类型，不能证明私聊来源的记录不会进入模型。读取失败或为空时回退到当前对话历史。`proactive_context_prompt` 支持 `{{context_lines}}` 占位符，缺少占位符时插件会自动在末尾追加序列化上下文。
 
-主动关心使用 `proactive_reminder_provider_id` 选择的模型执行两步流程：先读取受限的当前会话文字上下文并输出 `{"send_care": boolean}`，通过后才结合人格生成最终消息。留空 provider 时两步均沿用当前私聊模型。
+主动关心使用 `proactive_reminder_provider_id` 选择的模型执行两步流程：先读取受限的当前会话文字上下文并输出 `{"send_care": boolean}`，通过后才结合人格生成最终消息。留空 provider 时两步均沿用当前私聊模型；显式选择其他 Provider 但未选择人格时使用内置短风格，不会隐式转交当前会话的完整 system prompt。
 
 `passToken` 可以从插件配置读取，也可以在配置留空时通过 `MI_FITNESS_PASS_TOKEN` 环境变量提供。配置页密码遮罩不等于静态加密；AstrBot 配置、SQLite、WAL、备份和环境变量都需要按宿主机权限模型保护。部署者应限制配置目录和数据目录权限，并在需要时使用磁盘加密。
 
 ## 本地验证
 
-测试不连接真实小米服务。在仓库目录的上一级执行：
+测试不连接真实小米服务。在仓库根目录执行：
 
 ```powershell
-python -m unittest discover -s .\astrbot_plugin_mi_fitness_health\tests -v
-python -m ruff check .\astrbot_plugin_mi_fitness_health
-python -m ruff format --check .\astrbot_plugin_mi_fitness_health
+python -m pip install -r requirements.txt pytest ruff
+python -m pytest
+python -m ruff check .
+python -m ruff format --check .
 ```
 
-测试覆盖授权边界、云端字段解析、睡眠链路、心率范围、活动覆盖保护、SQLite 迁移、同步并发、超时语义、自然刷新、主动关心和隐私脱敏。
+`pyproject.toml` 提供统一 pytest/Ruff 配置，`tests/conftest.py` 允许任意 ZIP 解压目录名下收集测试，GitHub Actions 使用 Python 3.11 和 3.12 复现以上检查。测试覆盖授权边界、云端字段解析、响应预算、限流熔断、睡眠链路、心率范围、活动覆盖保护、SQLite 归属、取消写入竞态、超时语义、自然刷新、主动关心和隐私脱敏。
 
 真实小米账号、设备字段和区域兼容性必须由维护者在受控环境验证。不要把真实 Cookie、原始健康数据或个人截图加入 fixture、日志或 Issue。
 

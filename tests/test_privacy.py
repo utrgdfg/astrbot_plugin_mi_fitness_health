@@ -10,6 +10,13 @@ from astrbot_plugin_mi_fitness_health.utils.privacy import redact_error
 
 
 class PrivacyTest(unittest.TestCase):
+    def test_release_requires_temporary_context_capable_astrbot(self) -> None:
+        metadata = (Path(__file__).parents[1] / "metadata.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("version: v0.8.2", metadata)
+        self.assertIn('astrbot_version: ">=4.24.2,<5"', metadata)
+
     def test_sensitive_llm_authorization_defaults_to_false_in_schema(self) -> None:
         schema = json.loads(
             (Path(__file__).parents[1] / "_conf_schema.json").read_text(
@@ -17,6 +24,7 @@ class PrivacyTest(unittest.TestCase):
             )
         )
         self.assertIs(schema["allow_health_data_to_llm"]["default"], False)
+        self.assertIs(schema["allow_proactive_chat_context"]["default"], False)
         self.assertEqual(
             schema["context_decision_provider_id"]["_special"], "select_provider"
         )
@@ -43,6 +51,26 @@ class PrivacyTest(unittest.TestCase):
         )
         self.assertIs(schema["proactive_context_include_bot_messages"]["default"], True)
         self.assertIs(schema["enable_auto_sync"]["default"], False)
+        self.assertIn(
+            "生活数据摘要",
+            schema["health_dialogue_provider_id"]["hint"],
+        )
+        self.assertIn(
+            "处理或保存",
+            schema["health_dialogue_provider_id"]["hint"],
+        )
+
+    def test_sqlite_health_cache_artifacts_are_ignored(self) -> None:
+        patterns = set(
+            (Path(__file__).parents[1] / ".gitignore")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        for suffix in ("sqlite3", "sqlite", "db"):
+            self.assertIn(f"*.{suffix}", patterns)
+            self.assertIn(f"*.{suffix}-wal", patterns)
+            self.assertIn(f"*.{suffix}-shm", patterns)
+            self.assertIn(f"*.{suffix}-journal", patterns)
 
     def test_common_xiaomi_and_provider_secrets_are_redacted(self) -> None:
         synthetic_secret = "synthetic-secret-value"

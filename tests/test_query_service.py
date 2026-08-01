@@ -9,7 +9,6 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import astrbot_test_stub  # noqa: F401
-
 from astrbot_plugin_mi_fitness_health.models import (
     BodyMeasurement,
     DailyActivity,
@@ -45,6 +44,10 @@ class QueryServiceTest(unittest.TestCase):
             ("heart_rate", "sleep"),
         )
         self.assertEqual(
+            service.sync_types_for_focus("步"),
+            ("daily_activity",),
+        )
+        self.assertEqual(
             set(service.sync_types_for_focus("综合概况")),
             {
                 "daily_activity",
@@ -55,6 +58,83 @@ class QueryServiceTest(unittest.TestCase):
                 "stress",
             },
         )
+
+    def test_llm_focus_fails_closed_for_empty_and_unknown_text(self) -> None:
+        service = QueryService(_RecordingDatabase(), "user", "Asia/Shanghai")
+
+        for focus in (
+            "",
+            "   ",
+            "overall health overview",
+            "something unknown",
+            "我刚同步完",
+        ):
+            with self.subTest(focus=focus):
+                self.assertEqual(service.llm_categories_for_focus(focus), ())
+                self.assertEqual(service.normalize_llm_focus(focus), "")
+                self.assertEqual(service.llm_sync_types_for_focus(focus), ())
+                self.assertEqual(
+                    asyncio.run(service.llm_care_snapshot(focus)),
+                    "",
+                )
+
+    def test_llm_focus_limits_ordinary_requests_to_first_two_categories(self) -> None:
+        service = QueryService(_RecordingDatabase(), "user", "Asia/Shanghai")
+
+        self.assertEqual(
+            service.llm_categories_for_focus("昨天睡眠、心率和步数"),
+            ("sleep", "heart"),
+        )
+        self.assertEqual(
+            service.normalize_llm_focus("昨天睡眠、心率和步数"),
+            "昨天 睡眠 心率",
+        )
+        self.assertEqual(
+            service.llm_sync_types_for_focus("昨天睡眠、心率和步数"),
+            ("sleep", "heart_rate"),
+        )
+        self.assertEqual(
+            service.llm_categories_for_focus("身体数据"),
+            ("body",),
+        )
+
+    def test_llm_focus_allows_all_only_for_explicit_chinese_comprehensive_intent(
+        self,
+    ) -> None:
+        service = QueryService(_RecordingDatabase(), "user", "Asia/Shanghai")
+
+        self.assertEqual(
+            service.llm_categories_for_focus("请给我今天的综合概况"),
+            tuple(service.CATEGORY_SYNC_TYPES),
+        )
+        self.assertEqual(
+            set(service.llm_sync_types_for_focus("请给我今天的综合概况")),
+            set(service.CATEGORY_SYNC_TYPES.values()),
+        )
+        self.assertEqual(
+            service.llm_categories_for_focus("health"),
+            (),
+        )
+
+    def test_existing_care_snapshot_keeps_generic_all_category_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            service = QueryService(database, "user", "Asia/Shanghai")
+            now = datetime.now(UTC)
+            database.upsert_activity(
+                "user", DailyActivity(service.today(), 4321, 3000, 210, now)
+            )
+            database.upsert_measurement("user", BodyMeasurement("weight", now, 60.0))
+
+            snapshot = asyncio.run(service.care_snapshot("未指定类别"))
+
+            self.assertIn("4321 步", snapshot)
+            self.assertIn("体重", snapshot)
+            self.assertEqual(
+                set(service.sync_types_for_focus("未指定类别")),
+                set(service.CATEGORY_SYNC_TYPES.values()),
+            )
 
     def test_conversation_snapshot_only_returns_requested_category(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

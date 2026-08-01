@@ -21,6 +21,66 @@ class QueryService:
         "spo2": "spo2",
         "stress": "stress",
     }
+    CATEGORY_FOCUS_KEYWORDS = {
+        "activity": (
+            "步数",
+            "步行",
+            "计步",
+            "散步",
+            "跑步",
+            "多少步",
+            "几步",
+            "走",
+            "运动",
+            "活动",
+            "距离",
+            "热量",
+            "卡路里",
+        ),
+        "heart": ("心率", "心跳", "bpm"),
+        "body": (
+            "身体数据",
+            "身体成分",
+            "体重",
+            "体脂",
+            "bmi",
+            "肌肉",
+            "水分",
+            "骨量",
+            "代谢",
+            "身体年龄",
+        ),
+        "sleep": ("睡", "失眠", "入睡", "醒"),
+        "spo2": ("血氧", "spo2"),
+        "stress": ("压力", "焦虑", "stress"),
+    }
+    CATEGORY_FOCUS_LABELS = {
+        "activity": "活动",
+        "heart": "心率",
+        "body": "身体数据",
+        "sleep": "睡眠",
+        "spo2": "血氧",
+        "stress": "压力",
+    }
+    COMPREHENSIVE_FOCUS_CUES = (
+        "综合概况",
+        "综合情况",
+        "综合状态",
+        "整体概况",
+        "整体情况",
+        "整体状态",
+        "总体概况",
+        "总体情况",
+        "总体状态",
+        "健康概况",
+        "健康全貌",
+        "全部健康数据",
+        "所有健康数据",
+        "全部身体数据",
+        "所有身体数据",
+        "全部数据",
+        "所有数据",
+    )
 
     def __init__(self, database: Database, user_id: str, timezone_name: str):
         """Create a query service using a user-local timezone.
@@ -135,36 +195,92 @@ class QueryService:
         )
 
     @staticmethod
-    def requested_categories(focus: str) -> tuple[dict[str, bool], bool]:
+    def _compact_focus(focus: object) -> str:
+        """Normalize a bounded focus string for deterministic category matching."""
+        return "".join(str(focus or "").lower().split())
+
+    @classmethod
+    def requested_categories(cls, focus: str) -> tuple[dict[str, bool], bool]:
         """Map natural wording to the smallest required health categories."""
-        compact = focus.lower().replace(" ", "")
+        compact = cls._compact_focus(focus)
         requested = {
-            "activity": any(
-                word in compact
-                for word in ("步", "走", "运动", "活动", "距离", "热量", "卡路里")
-            ),
-            "heart": any(word in compact for word in ("心率", "心跳", "bpm")),
-            "body": any(
-                word in compact
-                for word in (
-                    "体重",
-                    "体脂",
-                    "bmi",
-                    "肌肉",
-                    "水分",
-                    "骨量",
-                    "代谢",
-                    "身体年龄",
-                )
-            ),
-            "sleep": any(word in compact for word in ("睡", "失眠", "入睡", "醒")),
-            "spo2": any(word in compact for word in ("血氧", "spo2")),
-            "stress": any(word in compact for word in ("压力", "焦虑", "stress")),
+            category: any(word in compact for word in keywords)
+            for category, keywords in cls.CATEGORY_FOCUS_KEYWORDS.items()
         }
+        # Keep the historical command/query shorthand without exposing the
+        # ambiguous single character to the stricter LLM focus parser.
+        requested["activity"] = requested["activity"] or "步" in compact
         explicitly_requested = any(requested.values())
         if not explicitly_requested:
             requested = {key: True for key in requested}
         return requested, explicitly_requested
+
+    @classmethod
+    def llm_categories_for_focus(cls, focus: str) -> tuple[str, ...]:
+        """Return a fail-closed, minimal category set for an LLM-generated focus.
+
+        Ordinary model output is limited to the first two explicitly mentioned
+        categories.  Only an unambiguous Chinese comprehensive-data cue may
+        request every category.  Empty, unknown, or generic English wording
+        returns no categories instead of expanding to all sensitive records.
+        """
+        compact = cls._compact_focus(focus)
+        if not compact:
+            return ()
+        if any(cue in compact for cue in cls.COMPREHENSIVE_FOCUS_CUES):
+            return tuple(cls.CATEGORY_SYNC_TYPES)
+
+        matches: list[tuple[int, int, str]] = []
+        for declaration_order, (category, keywords) in enumerate(
+            cls.CATEGORY_FOCUS_KEYWORDS.items()
+        ):
+            positions = [
+                position for word in keywords if (position := compact.find(word)) >= 0
+            ]
+            if positions:
+                matches.append((min(positions), declaration_order, category))
+        matches.sort()
+        return tuple(category for _, _, category in matches[:2])
+
+    @classmethod
+    def normalize_llm_focus(cls, focus: str) -> str:
+        """Convert an LLM focus into a safe focus accepted by existing queries."""
+        categories = cls.llm_categories_for_focus(focus)
+        if not categories:
+            return ""
+        compact = cls._compact_focus(focus)
+        if "昨天" in compact or "昨日" in compact:
+            scope = "昨天"
+        elif "最近" in compact or "近" in compact or "这两天" in compact:
+            scope = "最近"
+        elif "今天" in compact or "今日" in compact:
+            scope = "今天"
+        else:
+            scope = ""
+        labels = (cls.CATEGORY_FOCUS_LABELS[category] for category in categories)
+        return " ".join(part for part in (scope, *labels) if part)
+
+    def llm_sync_types_for_focus(self, focus: str) -> tuple[str, ...]:
+        """Return only cloud datasets authorized by a validated LLM focus."""
+        return tuple(
+            self.CATEGORY_SYNC_TYPES[category]
+            for category in self.llm_categories_for_focus(focus)
+        )
+
+    async def llm_care_snapshot(
+        self,
+        focus: str,
+        *,
+        include_missing_notice: bool = False,
+    ) -> str:
+        """Return a minimal LLM snapshot without changing command query behavior."""
+        safe_focus = self.normalize_llm_focus(focus)
+        if not safe_focus:
+            return ""
+        return await self.care_snapshot(
+            safe_focus,
+            include_missing_notice=include_missing_notice,
+        )
 
     def sync_types_for_focus(self, focus: str) -> tuple[str, ...]:
         """Return storage sync keys needed to answer one natural-language focus."""

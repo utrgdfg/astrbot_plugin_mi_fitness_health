@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import UTC, datetime, time, timedelta, tzinfo
 from pathlib import Path
 from typing import Any
@@ -17,22 +17,34 @@ from ..models import (
 )
 
 SCHEMA_VERSION = 7
+APPLICATION_ID = 0x4D464854  # "MFHT"
+OWNERSHIP_TABLE = "mi_fitness_plugin_metadata"
+OWNERSHIP_KEY = "application"
+OWNERSHIP_VALUE = "astrbot_plugin_mi_fitness_health"
+CUSTOM_DATABASE_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
+SQLITE_HEADER = b"SQLite format 3\x00"
 
 
 class Database:
     """Persist one account's cloud records with bounded, owner-controlled retention."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, custom_path: bool = False):
         """Open or migrate a SQLite database.
 
         Args:
             path: Database file location.
+            custom_path: Apply strict path and ownership checks to a user override.
         """
-        self.path = path
+        self.path = Path(path)
+        self.custom_path = custom_path
 
     def initialize(self) -> None:
         """Create the schema and apply forward-only migrations."""
+        if self.custom_path:
+            self._validate_custom_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.custom_path:
+            self._assert_no_link_components()
         if not self.path.exists():
             try:
                 descriptor = os.open(
@@ -46,7 +58,9 @@ class Database:
         except OSError:
             # Some Windows filesystems expose ACLs rather than POSIX modes.
             pass
-        with self._connect() as connection:
+        with self._connect(allow_unclaimed=True) as connection:
+            if self.custom_path:
+                self._assert_initializable_connection(connection)
             connection.execute("PRAGMA journal_mode=WAL")
             connection.execute("PRAGMA secure_delete=ON")
             connection.execute(
@@ -60,6 +74,11 @@ class Database:
                 current = 0
             else:
                 current = int(row[0])
+            if current > SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"本地健康数据库版本 {current} 高于当前插件支持的 "
+                    f"v{SCHEMA_VERSION}，已拒绝降级打开"
+                )
             if current < 1:
                 connection.executescript(
                     """
@@ -226,15 +245,361 @@ class Database:
                 connection.execute(
                     "UPDATE schema_version SET version = ?", (SCHEMA_VERSION,)
                 )
+            connection.execute(f"PRAGMA application_id={APPLICATION_ID}")
+            connection.execute(
+                f"""CREATE TABLE IF NOT EXISTS {OWNERSHIP_TABLE} (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                f"""INSERT INTO {OWNERSHIP_TABLE}(key,value) VALUES(?,?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (OWNERSHIP_KEY, OWNERSHIP_VALUE),
+            )
+
+    def _validate_custom_path(self) -> None:
+        """Reject ambiguous or foreign files before opening a user-selected path."""
+        if not self.path.is_absolute():
+            raise ValueError("自定义健康数据库路径必须是绝对路径")
+        if self.path.suffix.lower() not in CUSTOM_DATABASE_SUFFIXES:
+            raise ValueError(
+                "自定义健康数据库文件必须使用 .sqlite3、.sqlite 或 .db 后缀"
+            )
+        self._assert_no_link_components()
+        if not self.path.exists():
+            return
+        if not self.path.is_file():
+            raise ValueError("自定义健康数据库路径必须指向普通文件")
+        if self.path.stat().st_size == 0:
+            return
+        try:
+            with self.path.open("rb") as stream:
+                header = stream.read(len(SQLITE_HEADER))
+        except OSError as error:
+            raise ValueError("无法安全读取自定义健康数据库文件") from error
+        if header != SQLITE_HEADER:
+            raise ValueError("自定义健康数据库路径指向的现有文件不是 SQLite 数据库")
+        self._assert_plugin_database_ownership()
+
+    def _assert_no_link_components(self) -> None:
+        """Reject symlinks and Windows junctions in a custom database path."""
+        for candidate in (self.path, *self.path.parents):
+            try:
+                is_link = candidate.is_symlink()
+                is_junction = bool(
+                    candidate.exists()
+                    and hasattr(candidate, "is_junction")
+                    and candidate.is_junction()
+                )
+            except OSError as error:
+                raise ValueError("无法验证自定义健康数据库路径") from error
+            if is_link or is_junction:
+                raise ValueError("自定义健康数据库路径不能包含符号链接或目录联接")
+
+    def _assert_plugin_database_ownership(self) -> None:
+        """Accept this plugin's marker or a strict fingerprint of its legacy schema."""
+        try:
+            with closing(sqlite3.connect(self.path, timeout=5.0)) as connection:
+                connection.execute("PRAGMA query_only=ON")
+                self._assert_initializable_connection(connection)
+        except ValueError:
+            raise
+        except sqlite3.DatabaseError as error:
+            raise ValueError("无法验证自定义 SQLite 数据库的插件归属") from error
+
+    @staticmethod
+    def _assert_initializable_connection(connection: sqlite3.Connection) -> None:
+        """Validate a custom database on the same handle that migrations will use."""
+        application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if OWNERSHIP_TABLE in tables:
+            row = connection.execute(
+                f"SELECT value FROM {OWNERSHIP_TABLE} WHERE key=?",
+                (OWNERSHIP_KEY,),
+            ).fetchone()
+            if not row or row[0] != OWNERSHIP_VALUE:
+                raise ValueError("自定义 SQLite 数据库的插件归属标记不匹配")
+            if application_id not in (0, APPLICATION_ID):
+                raise ValueError("自定义 SQLite 数据库属于其他应用")
+            return
+        if application_id == APPLICATION_ID:
+            return
+        if application_id != 0:
+            raise ValueError("自定义 SQLite 数据库属于其他应用")
+        if not tables:
+            return
+        if Database._legacy_schema_matches(connection, tables):
+            return
+        raise ValueError("自定义 SQLite 数据库不是本插件创建的数据库；已拒绝写入")
+
+    @staticmethod
+    def _legacy_schema_matches(
+        connection: sqlite3.Connection, tables: set[str]
+    ) -> bool:
+        """Recognize only an exact pre-marker schema produced by this plugin."""
+        try:
+            version_rows = connection.execute(
+                "SELECT version FROM schema_version"
+            ).fetchall()
+            if len(version_rows) != 1:
+                return False
+            version = int(version_rows[0][0])
+            if not 1 <= version <= SCHEMA_VERSION:
+                return False
+
+            columns: dict[str, tuple[str, ...]] = {
+                "schema_version": ("version",),
+                "daily_activity": (
+                    "user_id",
+                    "date",
+                    "steps",
+                    "distance_m",
+                    "active_kcal",
+                    "collected_at",
+                    "updated_at",
+                ),
+                "heart_rate_samples": (
+                    "user_id",
+                    "record_id",
+                    "timestamp",
+                    "bpm",
+                    "sample_type",
+                    "is_workout",
+                    "updated_at",
+                ),
+                "body_measurements": (
+                    "user_id",
+                    "record_id",
+                    "timestamp",
+                    "weight_kg",
+                    "bmi",
+                    "body_fat_pct",
+                    "muscle_mass_kg",
+                    "water_pct",
+                    "bone_mass_kg",
+                    "visceral_fat_score",
+                    "basal_metabolism_kcal",
+                    "metabolic_age",
+                    "updated_at",
+                ),
+                "sync_state": (
+                    (
+                        "user_id",
+                        "data_type",
+                        "last_sync_at",
+                        "last_record_at",
+                    )
+                    if version >= 6
+                    else ("data_type", "last_sync_at", "last_record_at")
+                ),
+                "alerts": (
+                    "id",
+                    "alert_type",
+                    "created_at",
+                    "message",
+                    *(("event_key",) if version >= 4 else ()),
+                    *(("owner_platform_id",) if version >= 6 else ()),
+                ),
+            }
+            primary_keys: dict[str, tuple[str, ...]] = {
+                "schema_version": (),
+                "daily_activity": ("user_id", "date"),
+                "heart_rate_samples": ("user_id", "record_id"),
+                "body_measurements": ("user_id", "record_id"),
+                "sync_state": (
+                    ("user_id", "data_type") if version >= 6 else ("data_type",)
+                ),
+                "alerts": ("id",),
+            }
+            if version >= 2:
+                columns.update(
+                    {
+                        "sleep_sessions": (
+                            "user_id",
+                            "record_id",
+                            "start_at",
+                            "end_at",
+                            "duration_minutes",
+                            "asleep_minutes",
+                            "awake_minutes",
+                            "score",
+                            "updated_at",
+                        ),
+                        "spo2_samples": (
+                            "user_id",
+                            "record_id",
+                            "timestamp",
+                            "percent",
+                            "updated_at",
+                        ),
+                        "stress_samples": (
+                            "user_id",
+                            "record_id",
+                            "timestamp",
+                            "score",
+                            "updated_at",
+                        ),
+                    }
+                )
+                primary_keys.update(
+                    {
+                        "sleep_sessions": ("user_id", "record_id"),
+                        "spo2_samples": ("user_id", "record_id"),
+                        "stress_samples": ("user_id", "record_id"),
+                    }
+                )
+            if version >= 3:
+                columns["private_owner_sessions"] = (
+                    "owner_platform_id",
+                    "session",
+                    "updated_at",
+                )
+                primary_keys["private_owner_sessions"] = ("owner_platform_id",)
+            if 3 <= version < 7:
+                columns["care_deliveries"] = (
+                    "reminder_type",
+                    "local_date",
+                    "created_at",
+                )
+                primary_keys["care_deliveries"] = (
+                    "reminder_type",
+                    "local_date",
+                )
+            if version >= 5:
+                columns["sync_failures"] = (
+                    (
+                        "user_id",
+                        "data_type",
+                        "last_attempt_at",
+                        "last_error",
+                    )
+                    if version >= 6
+                    else ("data_type", "last_attempt_at", "last_error")
+                )
+                primary_keys["sync_failures"] = (
+                    ("user_id", "data_type") if version >= 6 else ("data_type",)
+                )
+
+            if tables.difference({"sqlite_sequence"}) != set(columns):
+                return False
+            for table, expected_columns in columns.items():
+                info = connection.execute(f"PRAGMA table_info({table})").fetchall()
+                if tuple(str(row[1]) for row in info) != expected_columns:
+                    return False
+                actual_primary_key = tuple(
+                    str(row[1])
+                    for row in sorted(
+                        (row for row in info if int(row[5]) > 0),
+                        key=lambda row: int(row[5]),
+                    )
+                )
+                if actual_primary_key != primary_keys[table]:
+                    return False
+
+            expected_indexes = {
+                "idx_heart_rate_timestamp",
+                "idx_body_timestamp",
+            }
+            if version >= 4:
+                expected_indexes.add("idx_alert_event")
+            if version >= 5:
+                expected_indexes.update(
+                    {
+                        "idx_sleep_end",
+                        "idx_spo2_timestamp",
+                        "idx_stress_timestamp",
+                        "idx_alert_created",
+                    }
+                )
+            if version >= 7:
+                expected_indexes.remove("idx_alert_created")
+                expected_indexes.add("idx_alert_owner_type_created")
+            actual_indexes = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='index' AND sql IS NOT NULL"
+                ).fetchall()
+            }
+            return actual_indexes == expected_indexes
+        except (IndexError, TypeError, ValueError, sqlite3.DatabaseError):
+            return False
+
+    @staticmethod
+    def _metadata_key(key: str) -> str:
+        """Validate one bounded plugin-owned metadata key."""
+        normalized = str(key).strip()
+        if not normalized or len(normalized) > 160:
+            raise ValueError("插件元数据键必须为 1 到 160 个字符")
+        if normalized == OWNERSHIP_KEY:
+            raise ValueError("插件数据库归属标记不能通过元数据接口修改")
+        return normalized
+
+    @staticmethod
+    def _assert_owned_connection(connection: sqlite3.Connection) -> None:
+        """Require both ownership signals before metadata can be read or changed."""
+        application_id = int(connection.execute("PRAGMA application_id").fetchone()[0])
+        if application_id != APPLICATION_ID:
+            raise RuntimeError("本地健康数据库缺少有效的应用归属标记")
+        try:
+            row = connection.execute(
+                f"SELECT value FROM {OWNERSHIP_TABLE} WHERE key=?",
+                (OWNERSHIP_KEY,),
+            ).fetchone()
+        except sqlite3.DatabaseError as error:
+            raise RuntimeError("本地健康数据库缺少插件归属信息") from error
+        if not row or row[0] != OWNERSHIP_VALUE:
+            raise RuntimeError("本地健康数据库的插件归属信息不匹配")
+
+    def get_metadata(self, key: str) -> str | None:
+        """Read bounded plugin metadata only from a verified plugin database."""
+        normalized = self._metadata_key(key)
+        with self._connect() as connection:
+            self._assert_owned_connection(connection)
+            row = connection.execute(
+                f"SELECT value FROM {OWNERSHIP_TABLE} WHERE key=?",
+                (normalized,),
+            ).fetchone()
+        return str(row["value"]) if row else None
+
+    def set_metadata(self, key: str, value: str | None) -> None:
+        """Set or delete bounded plugin metadata after verifying database ownership."""
+        normalized = self._metadata_key(key)
+        with self._connect() as connection:
+            self._assert_owned_connection(connection)
+            if value is None:
+                connection.execute(
+                    f"DELETE FROM {OWNERSHIP_TABLE} WHERE key=?",
+                    (normalized,),
+                )
+                return
+            text = str(value)
+            if len(text) > 4096:
+                raise ValueError("插件元数据值不能超过 4096 个字符")
+            connection.execute(
+                f"""INSERT INTO {OWNERSHIP_TABLE}(key,value) VALUES(?,?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (normalized, text),
+            )
 
     @contextmanager
-    def _connect(self):
+    def _connect(self, *, allow_unclaimed: bool = False):
         """Yield a transaction connection and always close its Windows file handle."""
+        if self.custom_path:
+            self._assert_no_link_components()
         connection = sqlite3.connect(self.path, timeout=30.0)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=30000")
         connection.execute("PRAGMA secure_delete=ON")
         try:
+            if self.custom_path and not allow_unclaimed:
+                self._assert_owned_connection(connection)
             yield connection
             connection.commit()
         except Exception:
@@ -980,8 +1345,12 @@ class Database:
 
     def compact(self) -> None:
         """Truncate the WAL and reclaim pages after an explicit full purge."""
+        if self.custom_path:
+            self._assert_no_link_components()
         connection = sqlite3.connect(self.path, timeout=30.0)
         try:
+            if self.custom_path:
+                self._assert_owned_connection(connection)
             connection.execute("PRAGMA secure_delete=ON")
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             connection.execute("VACUUM")

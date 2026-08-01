@@ -2,7 +2,17 @@ __pycache__/
 *.py[cod]
 .venv/
 *.sqlite3
+*.sqlite
 *.db
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.db-wal
+*.db-shm
+*.db-journal
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
