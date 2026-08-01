@@ -1164,8 +1164,16 @@ class MiFitnessCloudAdapter(DataAdapter):
     async def iter_sleep(
         self, start: datetime, end: datetime
     ) -> AsyncIterator[SleepSession]:
-        """Yield validated cloud sleep sessions when the account exposes the sleep key."""
-        for item in await self._fetch_key("sleep", start, end, self.region):
+        """Yield completed sessions even when Xiaomi indexes today's summary later."""
+        requested_end = (
+            end.replace(tzinfo=UTC) if end.tzinfo is None else end.astimezone(UTC)
+        )
+        # Xiaomi can index a completed morning sleep session at the end of the
+        # local summary day rather than at its actual wake-up time.  Looking one
+        # day ahead retrieves that envelope without accepting a future session:
+        # the nested wake-up timestamp is still bounded by ``requested_end``.
+        fetch_end = requested_end + timedelta(days=1)
+        for item in await self._fetch_key("sleep", start, fetch_end, self.region):
             value = self._value(item)
             begin_time = self._timestamp_datetime(
                 value.get("bedtime")
@@ -1179,6 +1187,8 @@ class MiFitnessCloudAdapter(DataAdapter):
                 or item.get("time")
             )
             if begin_time is None or finish_time is None:
+                continue
+            if finish_time > requested_end:
                 continue
             begin = int(begin_time.timestamp())
             finish = int(finish_time.timestamp())

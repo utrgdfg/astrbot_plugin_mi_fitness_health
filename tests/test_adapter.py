@@ -424,6 +424,51 @@ class AdapterTest(unittest.TestCase):
             self.assertIn(wake_local.date().isoformat(), snapshot)
             self.assertIn("结束 07:30", snapshot)
 
+    def test_sleep_fetches_later_daily_index_but_rejects_future_session(self) -> None:
+        """Today's completed sleep may be indexed later without admitting future data."""
+        requested_end = datetime(2026, 8, 1, 7, 0, tzinfo=UTC)
+        completed_wake = requested_end - timedelta(minutes=15)
+        future_wake = requested_end + timedelta(hours=2)
+        observed_end: list[datetime] = []
+
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
+                observed_end.append(end)
+                return [
+                    {
+                        "time": int((requested_end + timedelta(hours=12)).timestamp()),
+                        "value": {
+                            "bedtime": int(
+                                (completed_wake - timedelta(hours=7)).timestamp()
+                            ),
+                            "wake_up_time": int(completed_wake.timestamp()),
+                        },
+                    },
+                    {
+                        "time": int((requested_end + timedelta(hours=14)).timestamp()),
+                        "value": {
+                            "bedtime": int(
+                                (future_wake - timedelta(hours=7)).timestamp()
+                            ),
+                            "wake_up_time": int(future_wake.timestamp()),
+                        },
+                    },
+                ]
+
+        async def collect():
+            adapter = FixtureAdapter("user", "token", "cn")
+            return [
+                record
+                async for record in adapter.iter_sleep(
+                    requested_end - timedelta(days=3), requested_end
+                )
+            ]
+
+        records = asyncio.run(collect())
+        self.assertEqual(observed_end, [requested_end + timedelta(days=1)])
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].end_at, completed_wake)
+
     def test_sync_propagates_authentication_failure(self) -> None:
         """An expired connected session reaches the monitor pause logic."""
 
