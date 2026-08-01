@@ -8,13 +8,192 @@ import unittest
 from contextlib import closing
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from astrbot_plugin_mi_fitness_health.models import DailyActivity, HeartRateSample
 from astrbot_plugin_mi_fitness_health.storage import Database
+from astrbot_plugin_mi_fitness_health.storage.database import (
+    APPLICATION_ID,
+    OWNERSHIP_KEY,
+    OWNERSHIP_TABLE,
+    OWNERSHIP_VALUE,
+)
 
 
 class DatabaseTest(unittest.TestCase):
     """Verify migration and precise insert/update accounting."""
+
+    def test_database_records_ownership_and_protects_generic_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "health.sqlite3"
+            database = Database(path)
+            database.initialize()
+            database.set_metadata("xiaomi_region:user", "cn")
+            self.assertEqual(database.get_metadata("xiaomi_region:user"), "cn")
+            database.set_metadata("xiaomi_region:user", None)
+            self.assertIsNone(database.get_metadata("xiaomi_region:user"))
+            with self.assertRaises(ValueError):
+                database.set_metadata(OWNERSHIP_KEY, "other")
+            with closing(sqlite3.connect(path)) as connection:
+                self.assertEqual(
+                    connection.execute("PRAGMA application_id").fetchone()[0],
+                    APPLICATION_ID,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        f"SELECT value FROM {OWNERSHIP_TABLE} WHERE key=?",
+                        (OWNERSHIP_KEY,),
+                    ).fetchone()[0],
+                    OWNERSHIP_VALUE,
+                )
+
+    def test_custom_path_rejects_non_database_and_foreign_sqlite_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            text_path = Path(directory) / "notes.sqlite3"
+            text_path.write_text("do not overwrite", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "不是 SQLite"):
+                Database(text_path, custom_path=True).initialize()
+            self.assertEqual(text_path.read_text(encoding="utf-8"), "do not overwrite")
+
+            foreign_path = Path(directory) / "foreign.sqlite3"
+            with closing(sqlite3.connect(foreign_path)) as connection:
+                connection.execute("CREATE TABLE unrelated(value TEXT)")
+                connection.execute("INSERT INTO unrelated VALUES('kept')")
+                connection.commit()
+            with self.assertRaisesRegex(ValueError, "不是本插件"):
+                Database(foreign_path, custom_path=True).initialize()
+            with closing(sqlite3.connect(foreign_path)) as connection:
+                self.assertEqual(
+                    connection.execute("SELECT value FROM unrelated").fetchone()[0],
+                    "kept",
+                )
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE name='schema_version'"
+                    ).fetchone()
+                )
+
+    def test_custom_path_rejects_table_name_only_legacy_imitation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "imitation.sqlite3"
+            with closing(sqlite3.connect(path)) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE schema_version(version INTEGER NOT NULL);
+                    INSERT INTO schema_version VALUES(1);
+                    CREATE TABLE daily_activity(value TEXT);
+                    CREATE TABLE heart_rate_samples(value TEXT);
+                    CREATE TABLE body_measurements(value TEXT);
+                    CREATE TABLE sync_state(value TEXT);
+                    CREATE TABLE alerts(value TEXT);
+                    """
+                )
+                connection.commit()
+
+            with self.assertRaisesRegex(ValueError, "不是本插件"):
+                Database(path, custom_path=True).initialize()
+            with closing(sqlite3.connect(path)) as connection:
+                self.assertEqual(
+                    tuple(
+                        row[1]
+                        for row in connection.execute(
+                            "PRAGMA table_info(daily_activity)"
+                        ).fetchall()
+                    ),
+                    ("value",),
+                )
+
+    def test_custom_path_accepts_and_claims_a_legacy_plugin_database(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.sqlite3"
+            Database(path).initialize()
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute(f"DROP TABLE {OWNERSHIP_TABLE}")
+                connection.execute("PRAGMA application_id=0")
+                connection.commit()
+
+            database = Database(path, custom_path=True)
+            database.initialize()
+            database.set_metadata("xiaomi_region:user", "sg")
+            self.assertEqual(database.get_metadata("xiaomi_region:user"), "sg")
+
+    def test_custom_path_revalidates_the_open_handle_before_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "health.sqlite3"
+            Database(path).initialize()
+            database = Database(path, custom_path=True)
+            validate = database._validate_custom_path
+
+            def validate_then_replace() -> None:
+                validate()
+                path.unlink()
+                with closing(sqlite3.connect(path)) as connection:
+                    connection.execute("CREATE TABLE unrelated(value TEXT)")
+                    connection.execute("INSERT INTO unrelated VALUES('kept')")
+                    connection.commit()
+
+            with (
+                patch.object(
+                    database,
+                    "_validate_custom_path",
+                    side_effect=validate_then_replace,
+                ),
+                self.assertRaisesRegex(ValueError, "不是本插件"),
+            ):
+                database.initialize()
+
+            with closing(sqlite3.connect(path)) as connection:
+                self.assertEqual(
+                    connection.execute("SELECT value FROM unrelated").fetchone()[0],
+                    "kept",
+                )
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE name='schema_version'"
+                    ).fetchone()
+                )
+
+    def test_custom_path_rejects_runtime_database_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "health.sqlite3"
+            database = Database(path, custom_path=True)
+            database.initialize()
+            replacement = Path(directory) / "replacement.sqlite3"
+            with closing(sqlite3.connect(replacement)) as connection:
+                connection.execute("CREATE TABLE unrelated(value TEXT)")
+                connection.execute("INSERT INTO unrelated VALUES('kept')")
+                connection.commit()
+            path.unlink()
+            replacement.replace(path)
+
+            with self.assertRaisesRegex(RuntimeError, "归属"):
+                database.get_metadata("xiaomi_region:user")
+            with self.assertRaisesRegex(RuntimeError, "归属"):
+                database.compact()
+            with closing(sqlite3.connect(path)) as connection:
+                self.assertEqual(
+                    connection.execute("SELECT value FROM unrelated").fetchone()[0],
+                    "kept",
+                )
+
+    def test_custom_path_requires_an_absolute_database_filename(self) -> None:
+        with self.assertRaisesRegex(ValueError, "绝对路径"):
+            Database(Path("relative.sqlite3"), custom_path=True).initialize()
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "后缀"):
+                Database(Path(directory) / "health.txt", custom_path=True).initialize()
+
+    def test_newer_schema_is_not_opened_by_an_older_plugin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "future.sqlite3"
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute(
+                    "CREATE TABLE schema_version(version INTEGER NOT NULL)"
+                )
+                connection.execute("INSERT INTO schema_version VALUES(999)")
+                connection.commit()
+            with self.assertRaisesRegex(RuntimeError, "拒绝降级"):
+                Database(path).initialize()
 
     def test_activity_upsert_and_migration(self) -> None:
         """Database preserves the row and reports added then updated."""

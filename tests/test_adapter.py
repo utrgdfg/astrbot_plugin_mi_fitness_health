@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import tempfile
 import unittest
@@ -12,15 +13,63 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import astrbot_test_stub  # noqa: F401
-
+import httpx
 from astrbot_plugin_mi_fitness_health.adapters.mi_fitness_cloud import (
+    LOGIN_PREFIX,
     MiFitnessAuthenticationError,
+    MiFitnessBudgetError,
     MiFitnessCloudAdapter,
+    MiFitnessRateLimitError,
     MiFitnessResponseError,
+    _OperationBudget,
     _rc4_crypt,
 )
 from astrbot_plugin_mi_fitness_health.services import QueryService, SyncService
 from astrbot_plugin_mi_fitness_health.storage import Database
+
+
+def _http_response(
+    status_code: int,
+    *,
+    content: bytes = b"",
+    headers: dict[str, str] | None = None,
+) -> httpx.Response:
+    """Build a fully bound response suitable for raise_for_status and streaming."""
+    return httpx.Response(
+        status_code,
+        content=content,
+        headers=headers,
+        request=httpx.Request("GET", "https://example.invalid"),
+    )
+
+
+class _StreamContext:
+    """Minimal async context manager returned by AsyncClient.stream."""
+
+    def __init__(self, response: httpx.Response):
+        self.response = response
+
+    async def __aenter__(self) -> httpx.Response:
+        return self.response
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        await self.response.aclose()
+
+
+class _StreamingClient:
+    """Small deterministic stream-only HTTP client used by adapter unit tests."""
+
+    def __init__(self, *responses: httpx.Response):
+        self.responses = list(responses)
+        self.calls = 0
+        self.closed = False
+
+    def stream(self, *args, **kwargs) -> _StreamContext:
+        self.calls += 1
+        return _StreamContext(self.responses.pop(0))
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 class AdapterTest(unittest.TestCase):
@@ -50,7 +99,7 @@ class AdapterTest(unittest.TestCase):
 
     def test_malformed_sleep_timestamps_skip_only_bad_records(self) -> None:
         class FixtureAdapter(MiFitnessCloudAdapter):
-            async def _fetch_key(self, key, start, end, region):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
                 now = int(datetime.now(UTC).timestamp())
                 return [
                     {
@@ -84,7 +133,7 @@ class AdapterTest(unittest.TestCase):
         """Resting-heart-rate data remains available when the sampled key is empty."""
 
         class FixtureAdapter(MiFitnessCloudAdapter):
-            async def _fetch_key(self, key, start, end, region):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
                 if key == "resting_heart_rate":
                     return [
                         {
@@ -113,7 +162,7 @@ class AdapterTest(unittest.TestCase):
         """One account-specific key failure does not hide a working fallback."""
 
         class FixtureAdapter(MiFitnessCloudAdapter):
-            async def _fetch_key(self, key, start, end, region):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
                 if key == "heart_rate":
                     raise RuntimeError("unsupported key")
                 return [
@@ -141,7 +190,7 @@ class AdapterTest(unittest.TestCase):
         """Dedicated calorie records replace, rather than duplicate, step calories."""
 
         class FixtureAdapter(MiFitnessCloudAdapter):
-            async def _fetch_key(self, key, start, end, region):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
                 if key == "steps":
                     return [
                         {
@@ -179,7 +228,7 @@ class AdapterTest(unittest.TestCase):
         """A working steps key remains usable when the calorie key fails."""
 
         class FixtureAdapter(MiFitnessCloudAdapter):
-            async def _fetch_key(self, key, start, end, region):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
                 if key == "calories":
                     raise RuntimeError("unsupported key")
                 return [
@@ -207,7 +256,7 @@ class AdapterTest(unittest.TestCase):
         """A failed required steps request must not produce a zero-step update."""
 
         class FixtureAdapter(MiFitnessCloudAdapter):
-            async def _fetch_key(self, key, start, end, region):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
                 if key == "steps":
                     raise RuntimeError("steps unavailable")
                 return [
@@ -232,7 +281,7 @@ class AdapterTest(unittest.TestCase):
         """An optional calorie row cannot create a destructive zero-step day."""
 
         class FixtureAdapter(MiFitnessCloudAdapter):
-            async def _fetch_key(self, key, start, end, region):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
                 if key == "steps":
                     return []
                 return [
@@ -256,7 +305,7 @@ class AdapterTest(unittest.TestCase):
         class FixtureAdapter(MiFitnessCloudAdapter):
             calls = 0
 
-            async def _request(self, host, path, payload):
+            async def _request(self, host, path, payload, *, budget=None):
                 self.calls += 1
                 value = (
                     '{"bedtime":1784664000,"wake_up_time":1784692800}'
@@ -287,7 +336,7 @@ class AdapterTest(unittest.TestCase):
         """Valid zero scores must not be treated as missing by truthiness fallbacks."""
 
         class FixtureAdapter(MiFitnessCloudAdapter):
-            async def _fetch_key(self, key, start, end, region):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
                 now = int(datetime.now(UTC).timestamp())
                 if key == "sleep":
                     return [
@@ -319,7 +368,7 @@ class AdapterTest(unittest.TestCase):
         """A partial steps page must never overwrite a complete cached daily total."""
 
         class FixtureAdapter(MiFitnessCloudAdapter):
-            async def _request(self, host, path, payload):
+            async def _request(self, host, path, payload, *, budget=None):
                 return {
                     "data_list": [{"time": 1784692800, "value": '{"steps":12}'}],
                     "has_more": True,
@@ -349,7 +398,7 @@ class AdapterTest(unittest.TestCase):
                 def is_connected(self):
                     return True
 
-                async def _fetch_key(self, key, start, end, region):
+                async def _fetch_key(self, key, start, end, region, *, budget=None):
                     if key != "sleep":
                         return []
                     return [
@@ -428,75 +477,216 @@ class AdapterTest(unittest.TestCase):
 
     def test_login_http_401_is_classified_as_authentication_failure(self) -> None:
         """The account endpoint's 401 must not be downgraded to a temporary error."""
-
-        class Response:
-            status_code = 401
-
-            def raise_for_status(self):
-                raise AssertionError("401 should be classified before raise_for_status")
-
-        class Client:
-            async def get(self, *args, **kwargs):
-                return Response()
-
         adapter = MiFitnessCloudAdapter("user", "token", "cn")
-        adapter._client = Client()
+        adapter._client = _StreamingClient(_http_response(401))
         with self.assertRaises(MiFitnessAuthenticationError):
             asyncio.run(adapter._login_with_token())
 
-    def test_non_transient_http_error_is_not_retried(self) -> None:
-        class Response:
-            status_code = 400
-            headers = {}
-            text = ""
-
-            def raise_for_status(self):
-                raise AssertionError("400 must be classified before raise_for_status")
-
-        class Client:
-            calls = 0
-
-            async def post(self, *args, **kwargs):
-                self.calls += 1
-                return Response()
-
+    def test_login_rate_limit_sets_cooldown_and_is_not_swallowed(self) -> None:
         adapter = MiFitnessCloudAdapter("user", "token", "cn")
-        adapter._client = Client()
+        adapter._client = _StreamingClient(
+            _http_response(429, headers={"Retry-After": "120"})
+        )
+        with self.assertRaises(MiFitnessRateLimitError) as raised:
+            asyncio.run(adapter._login_with_token())
+        self.assertGreaterEqual(raised.exception.retry_after_seconds, 119)
+        self.assertEqual(adapter._client.calls, 1)
+
+    def test_login_rejects_a_different_returned_account(self) -> None:
+        login_payload = {
+            "ssecurity": base64.b64encode(b"s" * 16).decode(),
+            "location": "https://hlth.io.mi.com/session",
+            "userId": "different-user",
+            "passToken": "replacement-token",
+        }
+        adapter = MiFitnessCloudAdapter("configured-user", "original-token", "cn")
+        adapter._client = _StreamingClient(
+            _http_response(
+                200,
+                content=LOGIN_PREFIX + json.dumps(login_payload).encode(),
+            )
+        )
+
+        with self.assertRaisesRegex(MiFitnessAuthenticationError, "账号与配置"):
+            asyncio.run(adapter._login_with_token())
+
+        self.assertEqual(adapter.user_id, "configured-user")
+        self.assertEqual(adapter.pass_token, "original-token")
+
+    def test_login_rejects_untrusted_redirect_variants(self) -> None:
+        for location in (
+            "http://hlth.io.mi.com/session",
+            "https://hlth.io.mi.com:444/session",
+            "https://user@hlth.io.mi.com/session",
+            "https://hlth.io.mi.com.example.invalid/session",
+        ):
+            with self.subTest(location=location):
+                payload = {
+                    "ssecurity": base64.b64encode(b"s" * 16).decode(),
+                    "location": location,
+                }
+                adapter = MiFitnessCloudAdapter("user", "token", "cn")
+                adapter._client = _StreamingClient(
+                    _http_response(
+                        200,
+                        content=LOGIN_PREFIX + json.dumps(payload).encode(),
+                    )
+                )
+
+                with self.assertRaisesRegex(
+                    MiFitnessAuthenticationError, "HTTPS.*受信任域"
+                ):
+                    asyncio.run(adapter._login_with_token())
+                self.assertEqual(adapter._client.calls, 1)
+
+    def test_login_keeps_returned_token_uncommitted_until_session_validation(
+        self,
+    ) -> None:
+        payload = {
+            "ssecurity": base64.b64encode(b"s" * 16).decode(),
+            "location": "https://api.io.mi.com/session",
+            "userId": "user",
+            "passToken": "replacement-token",
+        }
+        adapter = MiFitnessCloudAdapter("user", "original-token", "cn")
+        adapter._client = _StreamingClient(
+            _http_response(
+                200,
+                content=LOGIN_PREFIX + json.dumps(payload).encode(),
+            ),
+            _http_response(
+                200,
+                headers={"Set-Cookie": "serviceToken=synthetic; Secure; HttpOnly"},
+            ),
+        )
+
+        candidate = asyncio.run(adapter._login_with_token())
+
+        self.assertEqual(candidate, ("user", "replacement-token"))
+        self.assertEqual(adapter.pass_token, "original-token")
+        self.assertEqual(adapter._client.calls, 2)
+
+    def test_connect_commits_login_credentials_only_after_health_api_probe(
+        self,
+    ) -> None:
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _login_with_token(self):
+                self._ssecurity = b"synthetic-security"
+                self._cookies = "serviceToken=synthetic"
+                return self.user_id, "replacement-token"
+
+            async def _discover_data_types(self, budget=None):
+                self.asserted_original_token = self.pass_token
+                return ["sleep"]
+
+        adapter = FixtureAdapter("user", "original-token", "cn")
+
+        self.assertTrue(asyncio.run(adapter.connect()))
+        self.assertEqual(adapter.asserted_original_token, "original-token")
+        self.assertEqual(adapter.pass_token, "replacement-token")
+
+    def test_failed_health_api_validation_keeps_configured_credentials(self) -> None:
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _login_with_token(self):
+                self._ssecurity = b"synthetic-security"
+                self._cookies = "serviceToken=synthetic"
+                return self.user_id, "replacement-token"
+
+            async def _discover_data_types(self, budget=None):
+                raise RuntimeError("synthetic probe failure")
+
+        adapter = FixtureAdapter("user", "original-token", "cn")
+
+        self.assertFalse(asyncio.run(adapter.connect()))
+        self.assertEqual(adapter.user_id, "user")
+        self.assertEqual(adapter.pass_token, "original-token")
+
+    def test_connect_propagates_rate_limit_and_closes_session(self) -> None:
+        class RateLimitedAdapter(MiFitnessCloudAdapter):
+            async def _establish_session(self) -> None:
+                self._set_rate_limit(60)
+                raise MiFitnessRateLimitError(60)
+
+        adapter = RateLimitedAdapter("user", "token", "cn")
+        with self.assertRaises(MiFitnessRateLimitError):
+            asyncio.run(adapter.connect())
+        self.assertIsNone(adapter._client)
+        self.assertFalse(adapter.is_connected())
+
+    def test_non_transient_http_error_is_not_retried(self) -> None:
+        adapter = MiFitnessCloudAdapter("user", "token", "cn")
+        adapter._client = _StreamingClient(_http_response(400))
         adapter._ssecurity = b"synthetic-security"
         with self.assertRaisesRegex(MiFitnessResponseError, "HTTP 400"):
             asyncio.run(adapter._request("https://example.invalid", "/path", {}))
         self.assertEqual(adapter._client.calls, 1)
 
-    def test_rate_limit_retry_after_is_bounded_and_respected(self) -> None:
-        class Response:
-            def __init__(self, status_code, retry_after=""):
-                self.status_code = status_code
-                self.headers = {"Retry-After": retry_after}
-                self.text = ""
-
-            def raise_for_status(self):
-                raise AssertionError(
-                    "the synthetic final 400 must be classified directly"
-                )
-
-        class Client:
-            def __init__(self):
-                self.responses = [Response(429, "2"), Response(400)]
-
-            async def post(self, *args, **kwargs):
-                return self.responses.pop(0)
-
+    def test_operation_budget_counts_the_entire_encrypted_response(self) -> None:
         adapter = MiFitnessCloudAdapter("user", "token", "cn")
-        adapter._client = Client()
+        adapter._client = _StreamingClient(_http_response(200, content=b"x" * 9))
         adapter._ssecurity = b"synthetic-security"
-        sleep = AsyncMock()
+        budget = _OperationBudget(max_bytes=8, max_records=10)
+
+        with self.assertRaises(MiFitnessBudgetError):
+            asyncio.run(
+                adapter._request(
+                    "https://example.invalid",
+                    "/path",
+                    {},
+                    budget=budget,
+                )
+            )
+        self.assertEqual(adapter._client.calls, 1)
+
+    def test_heart_aliases_share_budget_and_yield_before_next_alias(self) -> None:
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            def __init__(self):
+                super().__init__("user", "token", "cn")
+                self.calls = []
+                self.budgets = []
+
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
+                self.calls.append(key)
+                self.budgets.append(budget)
+                if key == "heart_rate":
+                    return [{"time": 1784692800, "value": {"bpm": 72}}]
+                return []
+
+        async def collect():
+            adapter = FixtureAdapter()
+            iterator = adapter.iter_heart_rate(datetime.now(UTC), datetime.now(UTC))
+            first = await anext(iterator)
+            calls_after_first = list(adapter.calls)
+            remaining = [record async for record in iterator]
+            return adapter, first, calls_after_first, remaining
+
+        adapter, first, calls_after_first, remaining = asyncio.run(collect())
+        self.assertEqual(first.bpm, 72)
+        self.assertEqual(calls_after_first, ["heart_rate"])
+        self.assertEqual(remaining, [])
+        self.assertEqual(len({id(budget) for budget in adapter.budgets}), 1)
+
+    def test_rate_limit_retry_after_is_bounded_and_respected(self) -> None:
+        adapter = MiFitnessCloudAdapter("user", "token", "cn")
+        adapter._client = _StreamingClient(
+            _http_response(429, headers={"Retry-After": "120"})
+        )
+        adapter._ssecurity = b"synthetic-security"
         with patch(
             "astrbot_plugin_mi_fitness_health.adapters.mi_fitness_cloud.asyncio.sleep",
-            sleep,
-        ):
-            with self.assertRaises(MiFitnessResponseError):
+            new_callable=AsyncMock,
+        ) as sleep:
+            with self.assertRaises(MiFitnessRateLimitError) as first:
                 asyncio.run(adapter._request("https://example.invalid", "/path", {}))
-        sleep.assert_awaited_once_with(2.0)
+            self.assertGreaterEqual(first.exception.retry_after_seconds, 119)
+            self.assertEqual(adapter._client.calls, 1)
+            sleep.assert_not_awaited()
+
+            with self.assertRaises(MiFitnessRateLimitError) as second:
+                asyncio.run(adapter._request("https://example.invalid", "/path", {}))
+            self.assertGreater(second.exception.retry_after_seconds, 0)
+            self.assertEqual(adapter._client.calls, 1)
+            sleep.assert_not_awaited()
 
     def test_connection_timeout_closes_client_and_session_material(self) -> None:
         class SlowAdapter(MiFitnessCloudAdapter):
@@ -519,7 +709,7 @@ class AdapterTest(unittest.TestCase):
         """Connection status includes sleep, SpO2, and stress when present."""
 
         class FixtureAdapter(MiFitnessCloudAdapter):
-            async def _fetch_key(self, key, start, end, region):
+            async def _probe_key(self, key, start, end, region, *, budget=None):
                 if key == "heart_rate":
                     return [{"time": 1784692800, "value": {"bpm": 72}}]
                 if key == "spo2":
@@ -542,9 +732,19 @@ class AdapterTest(unittest.TestCase):
             ],
         )
 
+    def test_discovery_requires_at_least_one_successful_health_api_probe(self) -> None:
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _probe_key(self, key, start, end, region, *, budget=None):
+                raise RuntimeError("synthetic probe failure")
+
+        adapter = FixtureAdapter("user", "token", "cn")
+
+        with self.assertRaisesRegex(RuntimeError, "会话未能通过"):
+            asyncio.run(adapter._discover_data_types())
+
     def test_primary_heart_rate_alias_is_used_by_normal_sync(self) -> None:
         class FixtureAdapter(MiFitnessCloudAdapter):
-            async def _fetch_key(self, key, start, end, region):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
                 if key == "heartrate":
                     return [{"time": 1784692800, "value": {"heart_rate": 71}}]
                 return []
@@ -563,7 +763,7 @@ class AdapterTest(unittest.TestCase):
 
     def test_invalid_primary_heart_rate_rows_do_not_hide_valid_alias(self) -> None:
         class FixtureAdapter(MiFitnessCloudAdapter):
-            async def _fetch_key(self, key, start, end, region):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
                 if key == "heart_rate":
                     return [{"time": 1784692800, "value": {"unexpected": 71}}]
                 if key == "heartrate":
@@ -584,13 +784,13 @@ class AdapterTest(unittest.TestCase):
 
     def test_candidate_key_error_is_not_reported_as_empty_success(self) -> None:
         class HeartAdapter(MiFitnessCloudAdapter):
-            async def _fetch_key(self, key, start, end, region):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
                 if key == "heart_rate":
                     raise RuntimeError("synthetic heart endpoint failure")
                 return []
 
         class SpO2Adapter(MiFitnessCloudAdapter):
-            async def _fetch_key(self, key, start, end, region):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
                 if key == "spo2":
                     raise RuntimeError("synthetic spo2 endpoint failure")
                 return []
@@ -618,7 +818,7 @@ class AdapterTest(unittest.TestCase):
 
     def test_blood_oxygen_alias_is_used_by_normal_sync(self) -> None:
         class FixtureAdapter(MiFitnessCloudAdapter):
-            async def _fetch_key(self, key, start, end, region):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
                 if key == "spo2":
                     raise RuntimeError("unsupported key")
                 if key == "blood_oxygen":
@@ -637,7 +837,7 @@ class AdapterTest(unittest.TestCase):
 
     def test_discovery_reports_alias_only_heart_rate_and_spo2(self) -> None:
         class FixtureAdapter(MiFitnessCloudAdapter):
-            async def _fetch_key(self, key, start, end, region):
+            async def _probe_key(self, key, start, end, region, *, budget=None):
                 if key == "heartrate":
                     return [{"time": 1784692800, "value": {"heart_rate": 72}}]
                 if key == "blood_oxygen":
@@ -652,7 +852,7 @@ class AdapterTest(unittest.TestCase):
 
     def test_region_discovery_uses_non_step_data(self) -> None:
         class FixtureAdapter(MiFitnessCloudAdapter):
-            async def _fetch_key(self, key, start, end, region):
+            async def _probe_key(self, key, start, end, region, *, budget=None):
                 if region == "sg" and key == "sleep":
                     return [{"time": 1784692800, "value": {}}]
                 return []
@@ -664,7 +864,7 @@ class AdapterTest(unittest.TestCase):
         self,
     ) -> None:
         class FixtureAdapter(MiFitnessCloudAdapter):
-            async def _fetch_key(self, key, start, end, region):
+            async def _probe_key(self, key, start, end, region, *, budget=None):
                 return []
 
         adapter = FixtureAdapter("user", "token")
@@ -681,7 +881,7 @@ class AdapterTest(unittest.TestCase):
         base = int(datetime(2026, 1, 1, 16, 30, tzinfo=UTC).timestamp())
 
         class FixtureAdapter(MiFitnessCloudAdapter):
-            async def _fetch_key(self, key, start, end, region):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
                 if key == "steps":
                     return [
                         {

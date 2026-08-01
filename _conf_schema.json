@@ -44,7 +44,14 @@
   "allow_health_data_to_llm": {
     "type": "bool",
     "description": "允许聊天模型接收生活数据摘要",
-    "hint": "日常对话增强必须开启此项。插件只会向当前私聊模型提供与话题有关的少量数据，不会要求模型固定输出数据报告。第三方模型服务可能处理或保存内容，请只在信任所用模型时开启。",
+    "hint": "日常对话增强必须开启此项。插件会向当前私聊模型提供与话题有关的少量数据；若配置了“补充回复草稿”，同一摘要还会发送给所选草稿模型服务。第三方模型服务可能处理或保存内容，请只在信任相关模型时开启。",
+    "obvious_hint": true,
+    "default": false
+  },
+  "allow_proactive_chat_context": {
+    "type": "bool",
+    "description": "允许主动判断模型读取最近私聊",
+    "hint": "默认关闭。开启后，主动关心判断模型可接收经过限长的最近文字私聊；这与“允许聊天模型接收生活数据摘要”是两项独立授权。第三方模型服务可能处理或保存聊天内容，请只在信任所选模型时开启。",
     "obvious_hint": true,
     "default": false
   },
@@ -70,14 +77,14 @@
   "health_dialogue_provider_id": {
     "type": "string",
     "description": "补充回复草稿使用的模型（可选）",
-    "hint": "直接选择 AstrBot 中已有的聊天模型。仅在对话需要单独生成生活化回复草稿时使用；普通聊天仍由当前会话模型回复。留空时沿用当前私聊模型。",
+    "hint": "直接选择 AstrBot 中已有的聊天模型。启用后，该模型会收到与当前话题有关的少量生活数据摘要并生成可选草稿；模型服务可能处理或保存摘要。普通聊天仍由当前会话模型回复，选择其他服务商时不会自动转交当前人格全文。",
     "_special": "select_provider",
     "default": ""
   },
   "health_dialogue_persona_id": {
     "type": "string",
     "description": "补充回复草稿使用的人格（可选）",
-    "hint": "直接选择 AstrBot 中已有的人格。仅用于可选的生活化回复草稿；普通聊天仍保持当前私聊人格。留空时沿用当前私聊人格。",
+    "hint": "直接选择 AstrBot 中已有的人格。仅用于可选的生活化回复草稿；普通聊天仍保持当前私聊人格。显式选择后，该人格提示词和相关生活数据摘要会发送给上方所选模型服务；留空且跨模型服务时使用插件内置的简短安全风格。",
     "_special": "select_persona",
     "default": ""
   },
@@ -90,13 +97,13 @@
   "enable_proactive_health_monitor": {
     "type": "bool",
     "description": "开启主动关心检查",
-    "hint": "开启后定期检查已有的本地数据与近期私聊活动，只在合适的日常时机私聊关心；此项不会定期读取小米云。还需要开启“允许聊天模型接收生活数据摘要”。",
+    "hint": "开启后定期检查已有的本地数据与近期私聊活动，只在合适的日常时机私聊关心；此项不会定期读取小米云。还需要分别开启生活数据摘要授权和最近私聊授权。",
     "default": true
   },
   "proactive_reminder_provider_id": {
     "type": "string",
     "description": "主动关心使用的模型（可选）",
-    "hint": "直接选择 AstrBot 中已有的聊天模型。它会先结合最近少量私聊上下文判断是否应该发送，再为通过判断的主动关心生成措辞。留空时沿用当前私聊模型。",
+    "hint": "直接选择 AstrBot 中已有的聊天模型。它会先结合最近少量私聊上下文判断是否应该发送，再为通过判断的主动关心生成措辞。留空时沿用当前私聊模型；选择其他服务商时不会自动转交当前人格全文。",
     "_special": "select_provider",
     "default": ""
   },
@@ -109,7 +116,7 @@
   "proactive_context_source": {
     "type": "string",
     "description": "主动判断的上下文来源",
-    "hint": "“当前 AstrBot LLM 对话历史”适合延续当前会话；“平台真实私聊流水”适合参考最近实际收发的消息；“混合模式”会合并并去重两者。平台流水不可用时会安全回退到当前 LLM 对话历史。",
+    "hint": "“当前 AstrBot LLM 对话历史”适合延续当前会话；平台流水只有在记录包含可核验的私聊类型或完整会话标识时才会使用，否则会安全回退到当前 LLM 对话历史；“混合模式”会合并并去重。",
     "options": [
       "conversation_history",
       "platform_message_history",
@@ -148,7 +155,7 @@
   "proactive_reminder_persona_id": {
     "type": "string",
     "description": "主动关心使用的人格（可选）",
-    "hint": "直接选择 AstrBot 中已有的人格。留空时沿用当前私聊人格。",
+    "hint": "直接选择 AstrBot 中已有的人格。显式选择后，该人格提示词会发送给所选主动关心模型；留空且跨模型服务时使用插件内置的简短安全风格。",
     "_special": "select_persona",
     "default": ""
   },
@@ -221,7 +228,7 @@
   "database_path": {
     "type": "string",
     "description": "本地数据保存位置（高级、可选）",
-    "hint": "普通用户请留空，插件会自动使用 AstrBot 的插件数据目录。",
+    "hint": "普通用户请留空，插件会自动使用 AstrBot 的插件数据目录。这里保存的是未加密健康缓存，请勿放在同步盘、共享目录或公开目录；插件只接受 .sqlite3、.sqlite 或 .db 文件，并会拒绝符号链接及不属于本插件的现有数据库。",
     "default": ""
   }
 }

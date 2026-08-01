@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import threading
 import time
 import unittest
-from datetime import UTC
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 import astrbot_test_stub  # noqa: F401
-
+from astrbot_plugin_mi_fitness_health.adapters import MiFitnessRateLimitError
+from astrbot_plugin_mi_fitness_health.models import SleepSession
 from astrbot_plugin_mi_fitness_health.services import SyncService
 from astrbot_plugin_mi_fitness_health.storage import Database
 
@@ -22,6 +24,7 @@ class _RecordingAdapter:
         self.last_error = None
         self.authentication_failed = False
         self.user_timezone = UTC
+        self.region = ""
         self.calls = []
 
     def is_connected(self):
@@ -79,6 +82,94 @@ class SyncServiceTest(unittest.TestCase):
             self.assertEqual(set(result["details"]), {"sleep"})
             self.assertIsNotNone(database.latest_sync_at("user", ("sleep",)))
             self.assertIsNone(database.latest_sync_at("user", ("heart_rate",)))
+
+    def test_region_cache_loads_only_when_region_was_not_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            adapter = _RecordingAdapter()
+            service = SyncService(adapter, database, "user")
+            database.set_metadata(service._region_metadata_key(), "cn")
+
+            asyncio.run(service.initialize())
+            self.assertEqual(adapter.region, "cn")
+
+            database.set_metadata(service._region_metadata_key(), "CN")
+            invalid_adapter = _RecordingAdapter()
+            invalid_service = SyncService(invalid_adapter, database, "user")
+            asyncio.run(invalid_service.initialize())
+            self.assertEqual(invalid_adapter.region, "")
+
+            explicit_adapter = _RecordingAdapter()
+            explicit_adapter.region = "us"
+            explicit_service = SyncService(explicit_adapter, database, "user")
+            asyncio.run(explicit_service.initialize())
+            self.assertEqual(explicit_adapter.region, "us")
+            asyncio.run(explicit_service.connect())
+            self.assertEqual(
+                database.get_metadata(explicit_service._region_metadata_key()), "us"
+            )
+
+    def test_every_connection_path_persists_a_discovered_region(self) -> None:
+        class DiscoveringAdapter(_RecordingAdapter):
+            def __init__(self, region):
+                super().__init__()
+                self.connected = False
+                self.discovered_region = region
+
+            async def connect(self):
+                self.connected = True
+                self.region = self.discovered_region
+                return True
+
+            async def probe_data_keys(self, start, end):
+                return {}
+
+        for path_name, expected_region in (
+            ("connect", "de"),
+            ("probe", "i2"),
+            ("sync", "sg"),
+        ):
+            with self.subTest(path_name=path_name):
+                with tempfile.TemporaryDirectory() as directory:
+                    database = Database(Path(directory) / "health.sqlite3")
+                    adapter = DiscoveringAdapter(expected_region)
+                    service = SyncService(adapter, database, "user")
+                    asyncio.run(service.initialize())
+                    if path_name == "connect":
+                        self.assertTrue(asyncio.run(service.connect()))
+                    elif path_name == "probe":
+                        asyncio.run(
+                            service.probe_data_keys(
+                                datetime.now(UTC), datetime.now(UTC)
+                            )
+                        )
+                    else:
+                        asyncio.run(service.sync(1, {"sleep"}))
+                    self.assertEqual(
+                        database.get_metadata(service._region_metadata_key()),
+                        expected_region,
+                    )
+
+    def test_rate_limit_stops_the_batch_after_recording_current_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+
+            class RateLimitedAdapter(_RecordingAdapter):
+                async def _empty(self, name):
+                    self.calls.append(name)
+                    if name == "sleep":
+                        raise MiFitnessRateLimitError(60)
+                    if False:
+                        yield None
+
+            adapter = RateLimitedAdapter()
+            service = SyncService(adapter, database, "user")
+            with self.assertRaises(MiFitnessRateLimitError):
+                asyncio.run(service.sync(1, {"sleep", "stress"}))
+            self.assertEqual(adapter.calls, ["sleep"])
+            self.assertIsNotNone(database.latest_sync_failure_at("user", ("sleep",)))
 
     def test_connection_and_sync_share_one_operation_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -196,3 +287,83 @@ class SyncServiceTest(unittest.TestCase):
 
             self.assertEqual(result["details"]["sleep"]["fetched"], 0)
             self.assertIsNotNone(database.latest_sync_at("user", ("sleep",)))
+
+    def test_cancelled_write_finishes_before_purge_can_acquire_the_lock(self) -> None:
+        """Cancellation cannot let a stale SQLite thread reinsert rows after purge."""
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            started = threading.Event()
+            release = threading.Event()
+            original = database.upsert_many
+
+            class OneSleepAdapter(_RecordingAdapter):
+                async def _sleep(self):
+                    end = datetime.now(UTC)
+                    yield SleepSession(
+                        "sleep-1",
+                        end - timedelta(hours=8),
+                        end,
+                        480,
+                        450,
+                        30,
+                        80,
+                    )
+
+                def iter_sleep(self, start, end):
+                    return self._sleep()
+
+            def slow_write(*args):
+                started.set()
+                release.wait(timeout=2)
+                return original(*args)
+
+            service = SyncService(OneSleepAdapter(), database, "user")
+
+            async def run():
+                sync_task = asyncio.create_task(service.sync(1, {"sleep"}))
+                self.assertTrue(await asyncio.to_thread(started.wait, 1))
+                sync_task.cancel()
+                purge_task = asyncio.create_task(service.purge_local_data("owner"))
+                await asyncio.sleep(0.02)
+                self.assertFalse(purge_task.done())
+                release.set()
+                with self.assertRaises(asyncio.CancelledError):
+                    await sync_task
+                await purge_task
+
+            with patch.object(database, "upsert_many", side_effect=slow_write):
+                asyncio.run(run())
+
+            self.assertEqual(database.recent_sleep("user"), [])
+            self.assertIsNone(database.latest_sync_at("user"))
+
+    def test_diagnostic_deadline_closes_the_shared_client(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+
+            class SlowDiagnosticAdapter(_RecordingAdapter):
+                def __init__(self):
+                    super().__init__()
+                    self.closed = 0
+
+                async def probe_data_keys(self, start, end):
+                    await asyncio.sleep(1)
+                    return {}
+
+                async def close(self):
+                    self.closed += 1
+                    self.connected = False
+
+            adapter = SlowDiagnosticAdapter()
+            service = SyncService(adapter, database, "user")
+            with patch(
+                "astrbot_plugin_mi_fitness_health.services.sync_service.DIAGNOSTIC_TIMEOUT_SECONDS",
+                0.001,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "数据诊断超过"):
+                    asyncio.run(
+                        service.probe_data_keys(datetime.now(UTC), datetime.now(UTC))
+                    )
+            self.assertEqual(adapter.closed, 1)

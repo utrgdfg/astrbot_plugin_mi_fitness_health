@@ -1,7 +1,6 @@
-"""Owner-only access checks shared by commands and conversational tools."""
+"""Owner-only access checks shared by commands and conversational context."""
 
 from __future__ import annotations
-
 
 _WRAPPERS = (
     ("[", "]"),
