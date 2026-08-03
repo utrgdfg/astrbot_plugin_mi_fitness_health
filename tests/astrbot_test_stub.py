@@ -81,6 +81,8 @@ def install_logger_stub() -> None:
     class ProviderRequest:
         def __init__(self):
             self.extra_user_content_parts = []
+            self.contexts = []
+            self.conversation = None
 
     provider_module.ProviderRequest = ProviderRequest
 
