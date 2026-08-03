@@ -687,7 +687,9 @@ class MainLifecycleTest(unittest.TestCase):
             side_effect=RuntimeError("prompt contained 私聊敏感原文")
         )
 
-        with patch("astrbot_plugin_mi_fitness_health.main.logger") as log:
+        with patch(
+            "astrbot_plugin_mi_fitness_health.features.proactive_care.logger"
+        ) as log:
             decision = asyncio.run(
                 plugin._should_send_proactive_care(
                     "bot:FriendMessage:owner", ["深夜仍有私聊活动"]
@@ -1132,7 +1134,9 @@ class MainLifecycleTest(unittest.TestCase):
         plugin._active_refresh_types = set()
         plugin._sync = AsyncMock(return_value={"errors": 0})
 
-        with patch("astrbot_plugin_mi_fitness_health.main.logger") as log:
+        with patch(
+            "astrbot_plugin_mi_fitness_health.features.conversation_routing.logger"
+        ) as log:
             refreshed = asyncio.run(plugin._natural_refresh_worker())
 
         self.assertTrue(refreshed)
@@ -1159,7 +1163,9 @@ class MainLifecycleTest(unittest.TestCase):
             }
         )
 
-        with patch("astrbot_plugin_mi_fitness_health.main.logger") as log:
+        with patch(
+            "astrbot_plugin_mi_fitness_health.features.conversation_routing.logger"
+        ) as log:
             refreshed = asyncio.run(plugin._natural_refresh_worker())
 
         self.assertTrue(refreshed)
@@ -1187,7 +1193,9 @@ class MainLifecycleTest(unittest.TestCase):
 
         plugin.query_service = Query()
 
-        with patch("astrbot_plugin_mi_fitness_health.main.logger") as log:
+        with patch(
+            "astrbot_plugin_mi_fitness_health.features.conversation_routing.logger"
+        ) as log:
             refreshed = asyncio.run(
                 plugin._refresh_for_natural_question(
                     "昨天睡眠",
@@ -1226,7 +1234,9 @@ class MainLifecycleTest(unittest.TestCase):
 
         plugin.query_service = Query()
 
-        with patch("astrbot_plugin_mi_fitness_health.main.logger") as log:
+        with patch(
+            "astrbot_plugin_mi_fitness_health.features.conversation_routing.logger"
+        ) as log:
             refreshed = asyncio.run(
                 plugin._refresh_for_natural_question(
                     "最近心率",
