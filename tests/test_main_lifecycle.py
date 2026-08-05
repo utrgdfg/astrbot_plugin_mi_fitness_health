@@ -1628,19 +1628,25 @@ class MainLifecycleTest(unittest.TestCase):
         results, running = asyncio.run(run())
 
         self.assertTrue(running)
-        self.assertEqual(len(results), 1)
-        self.assertIn("后台检查", results[0])
+        self.assertEqual(results, [])
         plugin.database.touch_private_owner_session.assert_called_once_with(
             "123", "qq:FriendMessage:123"
         )
 
-    def test_health_connection_does_not_queue_behind_busy_cloud_operation(
+    def test_health_connection_queues_in_background_behind_busy_cloud_operation(
         self,
     ) -> None:
         plugin = self._bare_plugin()
         plugin.user_id = "synthetic-user"
         plugin.pass_token = "synthetic-token"
-        plugin._connection_worker = AsyncMock()
+        release = asyncio.Event()
+
+        async def blocked_worker(session):
+            await release.wait()
+
+        plugin._connection_worker = blocked_worker
+        plugin.database = Mock()
+        plugin.owner_platform_id = "123"
 
         async def allow_guard(event):
             if False:
@@ -1648,21 +1654,56 @@ class MainLifecycleTest(unittest.TestCase):
 
         plugin._guard = allow_guard
         event = Mock()
+        event.unified_msg_origin = "qq:FriendMessage:123"
         event.plain_result.side_effect = lambda text: text
 
         async def run():
             await plugin.sync_service.lock.acquire()
             try:
-                return [item async for item in plugin.health_connection(event)]
+                results = [item async for item in plugin.health_connection(event)]
+                await asyncio.sleep(0)
+                running = (
+                    plugin._connection_task is not None
+                    and not plugin._connection_task.done()
+                )
             finally:
                 plugin.sync_service.lock.release()
+            release.set()
+            await plugin._connection_task
+            return results, running
 
-        results = asyncio.run(run())
+        results, running = asyncio.run(run())
 
-        self.assertEqual(len(results), 1)
-        self.assertIn("正在执行其他操作", results[0])
-        plugin._connection_worker.assert_not_awaited()
-        self.assertIsNone(plugin._connection_task)
+        self.assertEqual(results, [])
+        self.assertTrue(running)
+        plugin.database.touch_private_owner_session.assert_called_once_with(
+            "123", "qq:FriendMessage:123"
+        )
+
+    def test_repeated_health_connection_is_silent_while_check_is_running(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        plugin.user_id = "synthetic-user"
+        plugin.pass_token = "synthetic-token"
+
+        async def allow_guard(event):
+            if False:
+                yield None
+
+        plugin._guard = allow_guard
+        event = Mock()
+
+        async def run():
+            release = asyncio.Event()
+            plugin._connection_task = asyncio.create_task(release.wait())
+            try:
+                return [item async for item in plugin.health_connection(event)]
+            finally:
+                release.set()
+                await plugin._connection_task
+
+        self.assertEqual(asyncio.run(run()), [])
 
     def test_background_connection_sends_terminal_result_to_verified_session(
         self,

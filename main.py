@@ -666,14 +666,6 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
             )
             return
         if self._connection_task is not None and not self._connection_task.done():
-            yield event.plain_result(
-                "健康连接正在后台检查；普通聊天可以继续，完成后会发送结果。"
-            )
-            return
-        if self.sync_service.lock.locked():
-            yield event.plain_result(
-                "小米云正在执行其他操作，请稍后再试；普通聊天不受影响。"
-            )
             return
         session = str(event.unified_msg_origin)
         try:
@@ -688,9 +680,6 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
         self._connection_task = asyncio.create_task(
             self._connection_worker(session),
             name=f"{self.name}-connection-check",
-        )
-        yield event.plain_result(
-            "正在后台检查小米云连接；普通聊天可以继续，完成后会发送结果。"
         )
 
     @filter.command("健康同步")
