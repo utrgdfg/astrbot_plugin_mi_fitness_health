@@ -43,7 +43,7 @@ https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health
 
 ### 从文件安装
 
-从 GitHub Releases 下载插件 ZIP，或者在仓库页面选择“Code → Download ZIP”。不要解压，在 AstrBot 的“安装插件 → 从文件安装”中上传 ZIP。
+从 GitHub Releases 下载名称形如 `astrbot_plugin_mi_fitness_health-vX.Y.Z.zip` 的正式插件安装包。不要解压，在 AstrBot 的“安装插件 → 从文件安装”中直接上传 ZIP。GitHub 自动生成的 `Source code (zip)` 不是本项目指定的安装包；如果没有看到正式安装包，请优先使用上面的仓库链接安装。
 
 ## 第一次配置
 
