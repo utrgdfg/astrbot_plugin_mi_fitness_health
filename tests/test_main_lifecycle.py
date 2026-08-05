@@ -30,6 +30,10 @@ class MainLifecycleTest(unittest.TestCase):
         plugin.context_decision_message_count = 8
         plugin.context_decision_include_bot_messages = True
         plugin._last_proactive_delivery_at = None
+        plugin._connection_task = None
+        plugin._detached_tasks = set()
+        plugin.sync_service = Mock()
+        plugin.sync_service.lock = asyncio.Lock()
         return plugin
 
     def test_focus_is_single_line_and_bounded_before_model_use(self) -> None:
@@ -302,7 +306,7 @@ class MainLifecycleTest(unittest.TestCase):
             "今天 睡眠",
             wait_for_result=True,
             force_refresh=False,
-            wait_timeout=5.0,
+            wait_timeout=2.0,
         )
         self.assertEqual(len(request.extra_user_content_parts), 1)
         injected = request.extra_user_content_parts[0]
@@ -740,6 +744,44 @@ class MainLifecycleTest(unittest.TestCase):
 
         self.assertEqual(decision, (True, "睡眠 心率"))
 
+    def test_context_model_hard_timeout_does_not_wait_for_provider_cleanup(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        plugin.context_decision_provider_id = "stuck-classifier"
+        plugin.context = Mock()
+
+        async def run():
+            release_cleanup = asyncio.Event()
+
+            async def stuck_provider(**kwargs):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    # Simulate a provider that performs slow cancellation cleanup.
+                    await release_cleanup.wait()
+                    raise
+
+            plugin.context.llm_generate = stuck_provider
+            started = asyncio.get_running_loop().time()
+            with patch(
+                "astrbot_plugin_mi_fitness_health.features.conversation_routing.CONTEXT_DECISION_TIMEOUT_SECONDS",
+                0.01,
+            ):
+                decision = await plugin._decide_context_focus(
+                    "qq:FriendMessage:123", "今天好累"
+                )
+            elapsed = asyncio.get_running_loop().time() - started
+            release_cleanup.set()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return decision, elapsed
+
+        decision, elapsed = asyncio.run(run())
+
+        self.assertEqual(decision, (True, "睡眠 心率"))
+        self.assertLess(elapsed, 0.1)
+
     def test_context_model_failure_uses_bounded_backoff_and_resets(self) -> None:
         plugin = self._bare_plugin()
         plugin.context_decision_provider_id = "fast-classifier"
@@ -933,7 +975,7 @@ class MainLifecycleTest(unittest.TestCase):
 
         self.assertEqual(request.extra_user_content_parts, [])
 
-    def test_llm_context_waits_up_to_five_seconds_for_cloud_refresh(self) -> None:
+    def test_casual_llm_context_waits_up_to_two_seconds_for_cloud_refresh(self) -> None:
         plugin = self._bare_plugin()
         plugin.care_dialogue_enabled = True
         plugin.allow_health_data_to_llm = True
@@ -963,7 +1005,7 @@ class MainLifecycleTest(unittest.TestCase):
             "今天 睡眠 心率",
             wait_for_result=True,
             force_refresh=False,
-            wait_timeout=5.0,
+            wait_timeout=2.0,
         )
 
     def test_explicit_sleep_question_restricts_broader_model_focus(self) -> None:
@@ -1128,6 +1170,77 @@ class MainLifecycleTest(unittest.TestCase):
         self.assertTrue(still_running)
         self.assertTrue(completed)
 
+    def test_natural_refresh_skips_immediately_while_cloud_operation_is_busy(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        plugin._natural_refresh_task = None
+        plugin._pending_refresh_types = set()
+        plugin._active_refresh_types = set()
+        plugin.query_service = Mock()
+        plugin.query_service.llm_sync_types_for_focus.return_value = ("sleep",)
+        plugin.query_service.latest_sync_at = AsyncMock()
+        plugin._sync = AsyncMock()
+
+        async def run():
+            await plugin.sync_service.lock.acquire()
+            try:
+                return await plugin._refresh_for_natural_question(
+                    "昨天睡眠", wait_for_result=True
+                )
+            finally:
+                plugin.sync_service.lock.release()
+
+        self.assertFalse(asyncio.run(run()))
+        plugin.query_service.latest_sync_at.assert_not_awaited()
+        plugin._sync.assert_not_awaited()
+        self.assertIsNone(plugin._natural_refresh_task)
+
+    def test_natural_refresh_skips_before_background_connection_takes_lock(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        plugin._natural_refresh_task = None
+        plugin._pending_refresh_types = set()
+        plugin._active_refresh_types = set()
+        plugin.query_service = Mock()
+        plugin.query_service.llm_sync_types_for_focus.return_value = ("sleep",)
+        plugin.query_service.latest_sync_at = AsyncMock()
+        plugin._sync = AsyncMock()
+
+        async def run():
+            release = asyncio.Event()
+            plugin._connection_task = asyncio.create_task(release.wait())
+            try:
+                return await plugin._refresh_for_natural_question(
+                    "昨天睡眠", wait_for_result=True
+                )
+            finally:
+                release.set()
+                await plugin._connection_task
+
+        self.assertFalse(asyncio.run(run()))
+        plugin.query_service.latest_sync_at.assert_not_awaited()
+        plugin._sync.assert_not_awaited()
+
+    def test_natural_refresh_worker_drops_batch_if_lock_becomes_busy(self) -> None:
+        plugin = self._bare_plugin()
+        plugin._pending_refresh_types = {"sleep"}
+        plugin._active_refresh_types = set()
+        plugin._sync = AsyncMock()
+
+        async def run():
+            await plugin.sync_service.lock.acquire()
+            try:
+                return await plugin._natural_refresh_worker()
+            finally:
+                plugin.sync_service.lock.release()
+
+        self.assertFalse(asyncio.run(run()))
+        plugin._sync.assert_not_awaited()
+        self.assertEqual(plugin._pending_refresh_types, set())
+        self.assertEqual(plugin._active_refresh_types, set())
+
     def test_natural_refresh_logs_one_start_and_success_per_batch(self) -> None:
         plugin = self._bare_plugin()
         plugin._pending_refresh_types = {"sleep", "heart_rate"}
@@ -1286,7 +1399,7 @@ class MainLifecycleTest(unittest.TestCase):
             "今天 睡眠",
             wait_for_result=True,
             force_refresh=True,
-            wait_timeout=5.0,
+            wait_timeout=2.0,
         )
 
     def test_optional_health_dialogue_draft_stays_in_temporary_context(self) -> None:
@@ -1477,6 +1590,107 @@ class MainLifecycleTest(unittest.TestCase):
 
         plugin.sync_service.close.assert_awaited_once()
         plugin.adapter.close.assert_not_awaited()
+
+    def test_health_connection_releases_command_pipeline_before_cloud_result(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        plugin.user_id = "synthetic-user"
+        plugin.pass_token = "synthetic-token"
+        release = asyncio.Event()
+
+        async def allow_guard(event):
+            if False:
+                yield None
+
+        async def blocked_worker(session):
+            await release.wait()
+
+        plugin._guard = allow_guard
+        plugin._connection_worker = blocked_worker
+        plugin.database = Mock()
+        plugin.owner_platform_id = "123"
+        event = Mock()
+        event.unified_msg_origin = "qq:FriendMessage:123"
+        event.plain_result.side_effect = lambda text: text
+
+        async def run():
+            results = [item async for item in plugin.health_connection(event)]
+            await asyncio.sleep(0)
+            running = (
+                plugin._connection_task is not None
+                and not plugin._connection_task.done()
+            )
+            release.set()
+            await plugin._connection_task
+            return results, running
+
+        results, running = asyncio.run(run())
+
+        self.assertTrue(running)
+        self.assertEqual(len(results), 1)
+        self.assertIn("后台检查", results[0])
+        plugin.database.touch_private_owner_session.assert_called_once_with(
+            "123", "qq:FriendMessage:123"
+        )
+
+    def test_health_connection_does_not_queue_behind_busy_cloud_operation(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        plugin.user_id = "synthetic-user"
+        plugin.pass_token = "synthetic-token"
+        plugin._connection_worker = AsyncMock()
+
+        async def allow_guard(event):
+            if False:
+                yield None
+
+        plugin._guard = allow_guard
+        event = Mock()
+        event.plain_result.side_effect = lambda text: text
+
+        async def run():
+            await plugin.sync_service.lock.acquire()
+            try:
+                return [item async for item in plugin.health_connection(event)]
+            finally:
+                plugin.sync_service.lock.release()
+
+        results = asyncio.run(run())
+
+        self.assertEqual(len(results), 1)
+        self.assertIn("正在执行其他操作", results[0])
+        plugin._connection_worker.assert_not_awaited()
+        self.assertIsNone(plugin._connection_task)
+
+    def test_background_connection_sends_terminal_result_to_verified_session(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        plugin.sync_service.connect = AsyncMock(return_value=True)
+        plugin._is_configured_owner_private_session = AsyncMock(return_value=True)
+        plugin.context = Mock()
+        plugin.context.send_message = AsyncMock(return_value=True)
+        plugin.adapter = Mock()
+        plugin.adapter.region = "cn"
+        plugin.adapter.get_available_data_types.return_value = ["sleep"]
+        plugin._ensure_background_task = Mock()
+
+        async def run():
+            task = asyncio.create_task(
+                plugin._connection_worker("qq:FriendMessage:123")
+            )
+            plugin._connection_task = task
+            await task
+
+        asyncio.run(run())
+
+        plugin.context.send_message.assert_awaited_once()
+        sent = plugin.context.send_message.await_args.args
+        self.assertEqual(sent[0], "qq:FriendMessage:123")
+        self.assertIn("健康连接成功", sent[1])
+        self.assertIsNone(plugin._connection_task)
 
     def test_terminate_continues_after_a_background_task_cleanup_failure(self) -> None:
         plugin = self._bare_plugin()

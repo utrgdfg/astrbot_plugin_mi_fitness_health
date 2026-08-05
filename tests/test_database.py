@@ -348,6 +348,40 @@ class DatabaseTest(unittest.TestCase):
                 database.latest_sync_at("user", ("daily_activity", "sleep"))
             )
 
+    def test_empty_success_preserves_incremental_record_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            record_at = datetime.now(UTC) - timedelta(hours=1)
+
+            database.update_sync_state("user", "sleep", record_at)
+            database.update_sync_state("user", "sleep", None)
+
+            self.assertEqual(
+                database.sync_record_at("user", "sleep"), record_at.isoformat()
+            )
+
+            database.update_sync_state("user", "sleep", record_at - timedelta(days=1))
+            self.assertEqual(
+                database.sync_record_at("user", "sleep"), record_at.isoformat()
+            )
+
+    def test_empty_first_success_uses_attempt_time_as_incremental_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+
+            database.update_sync_state("user", "spo2", None)
+
+            cursor = database.sync_record_at("user", "spo2")
+            self.assertIsNotNone(cursor)
+            self.assertLess(
+                abs(
+                    (datetime.fromisoformat(cursor) - datetime.now(UTC)).total_seconds()
+                ),
+                2,
+            )
+
     def test_sync_state_is_isolated_between_xiaomi_accounts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Database(Path(directory) / "health.sqlite3")

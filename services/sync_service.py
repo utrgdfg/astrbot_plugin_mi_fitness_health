@@ -15,7 +15,9 @@ from ..storage import Database
 from ..utils.privacy import redact_error
 
 SYNC_TIMEOUT_SECONDS = 300
+DATASET_TIMEOUT_SECONDS = 30
 DIAGNOSTIC_TIMEOUT_SECONDS = 100
+INCREMENTAL_OVERLAP_DAYS = 2
 MAX_RECORDS_PER_DATASET = 100_000
 KNOWN_REGIONS = frozenset({"cn", "ru", "de", "i2", "sg", "us"})
 
@@ -149,6 +151,13 @@ class SyncService:
             raise ValueError("没有可同步的健康数据类型")
         async with self.lock:
             self._ensure_open()
+            # Login and one-time region discovery have their own adapter timeout
+            # and must not consume the data-download budget below.
+            if not await self._ensure_connected():
+                reason = self.adapter.last_error or "小米健康云连接失败"
+                if getattr(self.adapter, "authentication_failed", False):
+                    raise MiFitnessAuthenticationError(reason)
+                raise RuntimeError(reason)
             deadline = asyncio.get_running_loop().time() + SYNC_TIMEOUT_SECONDS
             try:
                 return await self._sync_locked(days, allowed_types, deadline)
@@ -162,29 +171,30 @@ class SyncService:
         self, days: int, allowed_types: set[str], deadline: float
     ) -> dict[str, object]:
         """Run one bounded sync while the caller owns the operation lock."""
-        if not await self._ensure_connected(deadline):
-            reason = self.adapter.last_error or "小米健康云连接失败"
-            if getattr(self.adapter, "authentication_failed", False):
-                raise MiFitnessAuthenticationError(reason)
-            raise RuntimeError(reason)
         end = datetime.now(UTC)
-        start = end - timedelta(days=days + 2)  # delayed uploads and corrections
+        full_start = end - timedelta(days=days + 2)
         counters = {"added": 0, "updated": 0, "errors": 0}
         details: dict[str, dict[str, object]] = {}
         first_error = ""
-        for data_type, iterator in (
-            ("daily_activity", self.adapter.iter_daily_activity(start, end)),
-            ("heart_rate", self.adapter.iter_heart_rate(start, end)),
-            ("body_measurements", self.adapter.iter_body_measurements(start, end)),
-            ("sleep", self.adapter.iter_sleep(start, end)),
-            ("spo2", self.adapter.iter_spo2(start, end)),
-            ("stress", self.adapter.iter_stress(start, end)),
+        for data_type, iterator_factory in (
+            ("daily_activity", self.adapter.iter_daily_activity),
+            ("heart_rate", self.adapter.iter_heart_rate),
+            ("body_measurements", self.adapter.iter_body_measurements),
+            ("sleep", self.adapter.iter_sleep),
+            ("spo2", self.adapter.iter_spo2),
+            ("stress", self.adapter.iter_stress),
         ):
             if data_type not in allowed_types:
                 continue
             try:
+                start = await self._incremental_start(data_type, full_start, end)
+                dataset_deadline = min(
+                    deadline,
+                    asyncio.get_running_loop().time() + DATASET_TIMEOUT_SECONDS,
+                )
                 records = await self._await_cloud(
-                    self._collect_records(iterator, data_type), deadline
+                    self._collect_records(iterator_factory(start, end), data_type),
+                    dataset_deadline,
                 )
                 if data_type == "daily_activity":
                     outcome = await self._await_database(
@@ -236,13 +246,19 @@ class SyncService:
                 )
                 raise
             except TimeoutError:
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise
+                counters["errors"] += 1
+                reason = "小米健康云读取超时，已跳过该数据类别"
+                first_error = first_error or reason
+                details[data_type] = {"error": reason}
                 await self._await_database(
                     self.database.update_sync_failure,
                     self.user_id,
                     data_type,
-                    "小米健康云读取超时",
+                    reason,
                 )
-                raise
+                continue
             except Exception as error:
                 counters["errors"] += 1
                 reason = redact_error(error)
@@ -272,6 +288,27 @@ class SyncService:
             "details": details,
             "pruned": pruned,
         }
+
+    async def _incremental_start(
+        self, data_type: str, full_start: datetime, end: datetime
+    ) -> datetime:
+        """Reuse a bounded overlap around the last stored record after first sync."""
+        cursor = await self._await_database(
+            self.database.sync_record_at, self.user_id, data_type
+        )
+        if not cursor:
+            return full_start
+        try:
+            parsed = datetime.fromisoformat(cursor)
+            parsed = parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+            incremental_start = parsed.astimezone(UTC) - timedelta(
+                days=INCREMENTAL_OVERLAP_DAYS
+            )
+        except (TypeError, ValueError, OverflowError):
+            return full_start
+        if incremental_start >= end:
+            return full_start
+        return max(full_start, incremental_start)
 
     @staticmethod
     async def _collect_records(iterator, data_type: str) -> list[object]:
