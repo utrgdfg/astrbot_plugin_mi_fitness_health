@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.platform import MessageType
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools
@@ -30,7 +30,10 @@ from .utils.access import (
     normalize_identifier,
     owner_access_denial_reason,
 )
+from .utils.async_tools import await_with_hard_timeout
 from .utils.privacy import redact_error
+
+CONNECTION_COMMAND_TIMEOUT_SECONDS = 120.0
 
 
 def _config_bool(
@@ -253,6 +256,8 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
         self._auto_task: asyncio.Task[None] | None = None
         self._monitor_task: asyncio.Task[None] | None = None
         self._natural_refresh_task: asyncio.Task[bool] | None = None
+        self._connection_task: asyncio.Task[None] | None = None
+        self._detached_tasks: set[asyncio.Task] = set()
         self._pending_refresh_types: set[str] = set()
         self._active_refresh_types: set[str] = set()
         self._auto_sync_paused = False
@@ -297,8 +302,16 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
 
     async def terminate(self) -> None:
         """Cancel the periodic task and close plugin-owned HTTP resources."""
-        for attribute in ("_auto_task", "_monitor_task", "_natural_refresh_task"):
+        for attribute in (
+            "_auto_task",
+            "_monitor_task",
+            "_natural_refresh_task",
+            "_connection_task",
+        ):
             await self._cancel_owned_task(attribute)
+        for task in tuple(self._detached_tasks):
+            task.cancel()
+        self._detached_tasks.clear()
         try:
             await self.sync_service.close()
         except Exception as error:
@@ -358,6 +371,72 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
     ) -> dict[str, object]:
         """Run one synchronized Xiaomi cloud refresh."""
         return await self.sync_service.sync(days or self.sync_days, data_types)
+
+    async def _send_connection_result(self, session: str, text: str) -> None:
+        """Send one background connection result only to the verified owner chat."""
+        if not await self._is_configured_owner_private_session(session):
+            logger.warning(
+                "Mi Fitness connection result target failed the owner private-session check"
+            )
+            return
+        try:
+            await self.context.send_message(session, MessageChain().message(text))
+        except Exception as error:
+            logger.warning(
+                "Mi Fitness background connection result could not be delivered (%s)",
+                type(error).__name__,
+            )
+
+    async def _connection_worker(self, session: str) -> None:
+        """Check Xiaomi connectivity without occupying the command pipeline."""
+        current_task = asyncio.current_task()
+        try:
+            connected = await await_with_hard_timeout(
+                self.sync_service.connect(force=True),
+                CONNECTION_COMMAND_TIMEOUT_SECONDS,
+                registry=self._detached_tasks,
+            )
+            if not connected:
+                text = (
+                    "健康连接失败："
+                    f"{redact_error(self.adapter.last_error or '未知错误')}\n"
+                    "遇到验证码、二次验证或风控时，请在浏览器完成验证后更新 Cookie。"
+                )
+            else:
+                self._auto_sync_paused = False
+                self._ensure_background_task()
+                labels = {
+                    "daily_activity": "步数/距离/活动消耗",
+                    "heart_rate": "心率",
+                    "body_measurements": "体重/身体成分",
+                    "sleep": "睡眠",
+                    "spo2": "血氧",
+                    "stress": "压力",
+                }
+                types = (
+                    "、".join(
+                        labels.get(item, item)
+                        for item in self.adapter.get_available_data_types()
+                    )
+                    or "未发现最近 30 天数据"
+                )
+                text = (
+                    "健康连接成功\n"
+                    f"区域：{self.adapter.region}\n"
+                    f"可用数据：{types}\n"
+                    "不显示账号、Token、Cookie 或 ssecurity。"
+                )
+        except TimeoutError:
+            text = "健康连接检查超过 120 秒，已停止等待；请稍后重试。"
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            text = f"健康连接失败：{redact_error(error)}"
+        try:
+            await self._send_connection_result(session, text)
+        finally:
+            if self._connection_task is current_task:
+                self._connection_task = None
 
     async def _health_monitor_loop(self) -> None:
         """Evaluate cached private findings at the configured bounded interval."""
@@ -491,7 +570,7 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
             focus,
             wait_for_result=True,
             force_refresh=self._wants_fresh_cloud_data(question),
-            wait_timeout=5.0,
+            wait_timeout=5.0 if health_question else 2.0,
         )
         snapshot = await self.query_service.llm_care_snapshot(
             focus,
@@ -577,7 +656,7 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
 
     @filter.command("健康连接")
     async def health_connection(self, event: AstrMessageEvent):
-        """Authenticate and show only a credential-safe connection state."""
+        """Start a bounded background connection check and release the pipeline."""
         async for result in self._guard(event):
             yield result
             return
@@ -586,31 +665,32 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
                 "未配置 user_id 或 pass_token。请在插件配置页填写后重新加载插件。"
             )
             return
-        if not await self.sync_service.connect(force=True):
+        if self._connection_task is not None and not self._connection_task.done():
             yield event.plain_result(
-                f"健康连接失败：{redact_error(self.adapter.last_error or '未知错误')}\n"
-                "遇到验证码、二次验证或风控时，请在浏览器完成验证后更新 Cookie。"
+                "健康连接正在后台检查；普通聊天可以继续，完成后会发送结果。"
             )
             return
-        self._auto_sync_paused = False
-        self._ensure_background_task()
-        labels = {
-            "daily_activity": "步数/距离/活动消耗",
-            "heart_rate": "心率",
-            "body_measurements": "体重/身体成分",
-            "sleep": "睡眠",
-            "spo2": "血氧",
-            "stress": "压力",
-        }
-        types = (
-            "、".join(
-                labels.get(item, item)
-                for item in self.adapter.get_available_data_types()
+        if self.sync_service.lock.locked():
+            yield event.plain_result(
+                "小米云正在执行其他操作，请稍后再试；普通聊天不受影响。"
             )
-            or "未发现最近 30 天数据"
+            return
+        session = str(event.unified_msg_origin)
+        try:
+            await asyncio.to_thread(
+                self.database.touch_private_owner_session,
+                self.owner_platform_id,
+                session,
+            )
+        except Exception as error:
+            yield event.plain_result(f"健康连接检查无法启动：{redact_error(error)}")
+            return
+        self._connection_task = asyncio.create_task(
+            self._connection_worker(session),
+            name=f"{self.name}-connection-check",
         )
         yield event.plain_result(
-            f"健康连接成功\n区域：{self.adapter.region}\n可用数据：{types}\n不显示账号、Token、Cookie 或 ssecurity。"
+            "正在后台检查小米云连接；普通聊天可以继续，完成后会发送结果。"
         )
 
     @filter.command("健康同步")
@@ -774,6 +854,7 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
                 "_auto_task",
                 "_monitor_task",
                 "_natural_refresh_task",
+                "_connection_task",
             ):
                 await self._cancel_owned_task(attribute)
             self._pending_refresh_types.clear()

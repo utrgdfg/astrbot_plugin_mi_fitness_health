@@ -83,6 +83,100 @@ class SyncServiceTest(unittest.TestCase):
             self.assertIsNotNone(database.latest_sync_at("user", ("sleep",)))
             self.assertIsNone(database.latest_sync_at("user", ("heart_rate",)))
 
+    def test_one_dataset_timeout_does_not_abort_other_selected_datasets(self) -> None:
+        class PartiallySlowAdapter(_RecordingAdapter):
+            async def _empty(self, name):
+                self.calls.append(name)
+                if name == "sleep":
+                    await asyncio.sleep(1)
+                if False:
+                    yield None
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            adapter = PartiallySlowAdapter()
+            service = SyncService(adapter, database, "user")
+            with (
+                patch(
+                    "astrbot_plugin_mi_fitness_health.services.sync_service.DATASET_TIMEOUT_SECONDS",
+                    0.01,
+                ),
+                patch(
+                    "astrbot_plugin_mi_fitness_health.services.sync_service.SYNC_TIMEOUT_SECONDS",
+                    1,
+                ),
+            ):
+                result = asyncio.run(service.sync(1, {"sleep", "stress"}))
+
+            self.assertEqual(adapter.calls, ["sleep", "stress"])
+            self.assertEqual(result["errors"], 1)
+            self.assertIn("error", result["details"]["sleep"])
+            self.assertEqual(result["details"]["stress"]["fetched"], 0)
+
+    def test_successful_sync_reuses_last_record_with_two_day_overlap(self) -> None:
+        class WindowRecordingAdapter(_RecordingAdapter):
+            def __init__(self, record):
+                super().__init__()
+                self.record = record
+                self.starts = []
+
+            def iter_sleep(self, start, end):
+                self.starts.append(start)
+
+                async def records():
+                    if len(self.starts) == 1:
+                        yield self.record
+
+                return records()
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            end_at = datetime.now(UTC) - timedelta(hours=1)
+            record = SleepSession(
+                "sleep-incremental",
+                end_at - timedelta(hours=8),
+                end_at,
+                480,
+                450,
+                30,
+                80,
+            )
+            adapter = WindowRecordingAdapter(record)
+            service = SyncService(adapter, database, "user")
+
+            asyncio.run(service.sync(7, {"sleep"}))
+            asyncio.run(service.sync(7, {"sleep"}))
+
+            self.assertEqual(len(adapter.starts), 2)
+            expected = end_at - timedelta(days=2)
+            self.assertLess(abs((adapter.starts[1] - expected).total_seconds()), 2)
+            self.assertIsNotNone(database.sync_record_at("user", "sleep"))
+
+    def test_connection_time_does_not_consume_download_deadline(self) -> None:
+        class SlowConnectAdapter(_RecordingAdapter):
+            def __init__(self):
+                super().__init__()
+                self.connected = False
+
+            async def connect(self):
+                await asyncio.sleep(0.15)
+                self.connected = True
+                return True
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            service = SyncService(SlowConnectAdapter(), database, "user")
+            with patch(
+                "astrbot_plugin_mi_fitness_health.services.sync_service.SYNC_TIMEOUT_SECONDS",
+                0.1,
+            ):
+                result = asyncio.run(service.sync(1, {"sleep"}))
+
+            self.assertEqual(result["details"]["sleep"]["fetched"], 0)
+
     def test_region_cache_loads_only_when_region_was_not_configured(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Database(Path(directory) / "health.sqlite3")

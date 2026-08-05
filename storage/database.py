@@ -880,6 +880,17 @@ class Database:
     ) -> None:
         """Record a successful completion and clear any older failure."""
         with self._connect() as connection:
+            old = connection.execute(
+                "SELECT last_record_at FROM sync_state WHERE user_id=? AND data_type=?",
+                (user_id, data_type),
+            ).fetchone()
+            cursor_candidates = self._valid_utc_timestamps(
+                (
+                    old["last_record_at"] if old else None,
+                    last_record_at.isoformat() if last_record_at else None,
+                )
+            )
+            cursor = max(cursor_candidates).isoformat() if cursor_candidates else None
             connection.execute(
                 """INSERT INTO sync_state(user_id,data_type,last_sync_at,last_record_at) VALUES(?,?,?,?)
                    ON CONFLICT(user_id,data_type) DO UPDATE SET last_sync_at=excluded.last_sync_at,
@@ -888,13 +899,28 @@ class Database:
                     user_id,
                     data_type,
                     self._now(),
-                    last_record_at.isoformat() if last_record_at else None,
+                    cursor,
                 ),
             )
             connection.execute(
                 "DELETE FROM sync_failures WHERE user_id=? AND data_type=?",
                 (user_id, data_type),
             )
+
+    def sync_record_at(self, user_id: str, data_type: str) -> str | None:
+        """Return a record cursor, falling back to the last successful attempt."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT last_record_at,last_sync_at FROM sync_state WHERE user_id=? AND data_type=?",
+                (user_id, data_type),
+            ).fetchone()
+        if not row:
+            return None
+        for field in ("last_record_at", "last_sync_at"):
+            timestamps = self._valid_utc_timestamps((row[field],))
+            if timestamps:
+                return timestamps[0].isoformat()
+        return None
 
     def update_sync_failure(self, user_id: str, data_type: str, reason: str) -> None:
         """Record a sanitized dataset failure without replacing its last success."""

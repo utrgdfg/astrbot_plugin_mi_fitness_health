@@ -11,7 +11,10 @@ from astrbot.api import logger
 from astrbot.api.provider import ProviderRequest
 
 from ..adapters import MiFitnessAuthenticationError
+from ..utils.async_tools import await_with_hard_timeout
 from ..utils.privacy import redact_error
+
+CONTEXT_DECISION_TIMEOUT_SECONDS = 3.0
 
 DEFAULT_CONTEXT_DECISION_PROMPT = (
     "结合最近对话与当前消息，判断小米运动健康生活数据是否可能让 Bot 的本轮回复"
@@ -335,7 +338,7 @@ class ConversationRoutingMixin:
             f"<current_user_message>{escaped_message}</current_user_message>"
         )
         try:
-            response = await asyncio.wait_for(
+            response = await await_with_hard_timeout(
                 self.context.llm_generate(
                     chat_provider_id=provider_id,
                     prompt=prompt,
@@ -346,7 +349,8 @@ class ConversationRoutingMixin:
                         "你只能按指定结构输出一个 JSON 对象。"
                     ),
                 ),
-                timeout=8,
+                CONTEXT_DECISION_TIMEOUT_SECONDS,
+                registry=getattr(self, "_detached_tasks", None),
             )
             decision = self._parse_context_decision(
                 getattr(response, "completion_text", None)
@@ -395,6 +399,12 @@ class ConversationRoutingMixin:
             data_types = set(self._pending_refresh_types)
             self._pending_refresh_types.difference_update(data_types)
             self._active_refresh_types.update(data_types)
+            # The lock can become busy after the caller's initial check but
+            # before this background worker starts. Drop this refresh instead
+            # of silently queuing a conversation behind another cloud action.
+            if self.sync_service.lock.locked():
+                self._active_refresh_types.difference_update(data_types)
+                continue
             data_label = self._sync_type_log_label(data_types)
             logger.info(
                 "[小米运动健康] 对话需要最新生活数据，正在拉取小米云数据（%s）",
@@ -465,6 +475,16 @@ class ConversationRoutingMixin:
         )
         data_types = set(selector(text))
         if not data_types:
+            return False
+        # Never queue a conversational refresh behind connection, diagnosis,
+        # manual sync, or another cloud operation. Existing cache (if any) is
+        # enough for this turn; otherwise the LLM hook silently skips context.
+        connection_task = getattr(self, "_connection_task", None)
+        if (
+            connection_task is not None
+            and not connection_task.done()
+            or self.sync_service.lock.locked()
+        ):
             return False
         data_label = self._sync_type_log_label(data_types)
         last_sync = await self.query_service.latest_sync_at(tuple(sorted(data_types)))
