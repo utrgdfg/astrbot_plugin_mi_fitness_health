@@ -217,70 +217,6 @@ class ConversationRoutingMixin:
             return True, self._care_focus(message)
         return False, ""
 
-    @classmethod
-    def _direct_current_message_decision(cls, message: str) -> tuple[bool, str]:
-        """Keep direct owner-state statements from being vetoed by a classifier."""
-        compact = message.lower().replace(" ", "")
-        if not cls._is_care_conversation(compact):
-            return False, ""
-        if any(
-            cue in compact
-            for cue in (
-                "帮我写",
-                "写一段",
-                "写一个",
-                "代码",
-                "脚本",
-                "函数",
-                "翻译",
-                "故事",
-                "小说",
-                "文案",
-                "科普",
-                "教程",
-            )
-        ):
-            return False, ""
-        if compact.startswith(("他", "她", "朋友", "同事", "同学", "孩子", "家人")):
-            return False, ""
-        if any(
-            cue in compact for cue in ("我朋友", "我同事", "我同学", "我孩子", "我家人")
-        ):
-            return False, ""
-        direct_cues = (
-            "我",
-            "今天",
-            "今晚",
-            "昨晚",
-            "昨天",
-            "刚",
-            "现在",
-            "还在",
-            "已经",
-            "没有",
-            "没",
-            "不",
-            "又",
-            "早安",
-            "早啊",
-            "早呀",
-            "早上好",
-            "晚安",
-            "起床",
-            "熬夜了",
-            "通宵了",
-            "运动完",
-            "散步回来",
-            "跑步回来",
-            "健身完",
-            "锻炼完",
-        )
-        if any(cue in compact for cue in direct_cues):
-            return True, cls._care_focus(message)
-        if compact in {"好困", "犯困", "好累", "累死", "疲惫", "没精神", "睡不着"}:
-            return True, cls._care_focus(message)
-        return False, ""
-
     def _context_decision_is_backing_off(self) -> bool:
         """Return whether recent classifier failures should bypass the provider."""
         retry_at = getattr(self, "_context_decision_retry_at", None)
@@ -366,9 +302,8 @@ class ConversationRoutingMixin:
         message: str,
         recent_context: list[dict[str, str]] | None = None,
     ) -> tuple[bool, str]:
-        """Let an optional provider expand, but never veto, direct local cues."""
+        """Ask the selected provider, falling back locally only when unavailable."""
         fallback = self._fallback_context_decision(message)
-        direct_decision = self._direct_current_message_decision(message)
         if self._is_health_question(message):
             return fallback
         provider_id = getattr(self, "context_decision_provider_id", "")
@@ -426,12 +361,6 @@ class ConversationRoutingMixin:
             )
             if decision is not None:
                 self._reset_context_decision_backoff()
-                # Direct current-message cues are a high-recall floor.  The
-                # optional model may find implicit relevance in conversation
-                # history, but a false classification must not suppress an
-                # already recognized sleep/activity/energy cue in this turn.
-                if not decision[0] and direct_decision[0]:
-                    return direct_decision
                 return decision
             self._record_context_decision_failure()
             logger.warning(
