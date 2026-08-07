@@ -26,6 +26,8 @@ DEFAULT_CONTEXT_DECISION_PROMPT = (
     "还要理解依赖前文的简短回答：例如 Bot 问今天是否补觉，用户只回答‘今天补了’，"
     "这是可由今日睡眠记录辅助核对的本人生活状态，应选择 today 和 sleep。"
     "当生活数据可以核实、补充或温和纠正用户刚陈述的状态时，也应调用。"
+    "用户明确询问本人某项生活数据时必须调用；但代码、写作、知识问答或第三方语境"
+    "即使出现‘睡眠’‘压力’等词，也不应调用。"
     "不适合调用：无关闲聊、知识问答、代码任务、第三方情况、医疗紧急情况，"
     "或生活数据明显无法帮助当前回复时。不要因为当前一句表达含蓄就忽略前文；"
     "也不要为了展示功能而在明确无关的对话里调用。"
@@ -307,8 +309,6 @@ class ConversationRoutingMixin:
     ) -> tuple[bool, str]:
         """Ask the selected provider, falling back locally only when unavailable."""
         fallback = self._fallback_context_decision(message)
-        if self._is_health_question(message):
-            return fallback
         provider_id = getattr(self, "context_decision_provider_id", "")
         if not provider_id:
             return fallback
@@ -335,6 +335,9 @@ class ConversationRoutingMixin:
             "必须理解依赖前文的省略回答；例如 Bot 问‘今天补觉了吗’，用户回答"
             '‘今天补了’，应返回 use_data=true、categories=["sleep"]、'
             'time_scope="today"，让当前聊天模型参考记录核对这项陈述。'
+            "用户明确询问本人睡眠、活动、心率等生活数据时必须返回 use_data=true；"
+            "技术压力测试、睡眠算法代码、主题写作或第三方情况必须按真实语义判断，"
+            "不能仅因出现健康词语就调用。"
             "只选择回答当前消息真正需要的类别，最多两个："
             "activity、heart、body、sleep、spo2、stress。"
             "time_scope 只能是 today、yesterday、recent、none。"
