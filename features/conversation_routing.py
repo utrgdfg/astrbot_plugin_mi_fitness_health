@@ -215,7 +215,7 @@ class ConversationRoutingMixin:
         return True, " ".join(label for label in labels if label)
 
     def _fallback_context_decision(self, message: str) -> tuple[bool, str]:
-        """Use deterministic cues when no classifier is selected or usable."""
+        """Use lightweight deterministic cues only when no classifier is selected."""
         compact = message.lower().replace(" ", "")
         non_owner_contexts = (
             "压力测试",
@@ -341,13 +341,12 @@ class ConversationRoutingMixin:
         message: str,
         recent_context: list[dict[str, str]] | None = None,
     ) -> tuple[bool, str]:
-        """Ask the selected provider, falling back locally only when unavailable."""
-        fallback = self._fallback_context_decision(message)
+        """Let the selected provider own routing; fail closed when it is unavailable."""
         provider_id = getattr(self, "context_decision_provider_id", "")
         if not provider_id:
-            return fallback
+            return self._fallback_context_decision(message)
         if self._context_decision_is_backing_off():
-            return fallback
+            return False, ""
         escaped_message = html.escape(
             self._sanitize_focus(self._decision_context_text(message)), quote=True
         )
@@ -408,15 +407,16 @@ class ConversationRoutingMixin:
             self._record_context_decision_failure()
             logger.warning(
                 "Mi Fitness context decision model returned an invalid response; "
-                "using local cues"
+                "skipping health context for this turn"
             )
         except Exception as error:
             self._record_context_decision_failure()
             logger.warning(
-                "Mi Fitness context decision model failed; using local cues (%s)",
+                "Mi Fitness context decision model failed; "
+                "skipping health context for this turn (%s)",
                 type(error).__name__,
             )
-        return fallback
+        return False, ""
 
     @staticmethod
     def _wants_fresh_cloud_data(text: str) -> bool:

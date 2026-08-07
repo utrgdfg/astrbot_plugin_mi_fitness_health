@@ -958,7 +958,7 @@ class MainLifecycleTest(unittest.TestCase):
         plugin._refresh_for_natural_question.assert_not_awaited()
         plugin.query_service.llm_care_snapshot.assert_not_called()
 
-    def test_context_model_failure_falls_back_to_local_cues(self) -> None:
+    def test_context_model_failure_skips_health_context(self) -> None:
         plugin = self._bare_plugin()
         plugin.context_decision_provider_id = "fast-classifier"
         plugin.context = Mock()
@@ -968,11 +968,19 @@ class MainLifecycleTest(unittest.TestCase):
             plugin._decide_context_focus("qq:FriendMessage:123", "今天好累")
         )
 
+        self.assertEqual(decision, (False, ""))
+
+    def test_context_without_selected_model_uses_local_cues(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.context_decision_provider_id = ""
+
+        decision = asyncio.run(
+            plugin._decide_context_focus("qq:FriendMessage:123", "今天好累")
+        )
+
         self.assertEqual(decision, (True, "睡眠 心率"))
 
-    def test_context_model_failure_does_not_expose_data_for_non_owner_contexts(
-        self,
-    ) -> None:
+    def test_context_without_selected_model_avoids_non_owner_contexts(self) -> None:
         examples = (
             "这个接口的压力测试结果怎么样？",
             "帮我看看这段睡眠排序代码",
@@ -982,15 +990,11 @@ class MainLifecycleTest(unittest.TestCase):
             "服务心跳怎么样？",
             "写个关于睡眠的小说",
         )
+        plugin = self._bare_plugin()
+        plugin.context_decision_provider_id = ""
+
         for message in examples:
             with self.subTest(message=message):
-                plugin = self._bare_plugin()
-                plugin.context_decision_provider_id = "offline-classifier"
-                plugin.context = Mock()
-                plugin.context.llm_generate = AsyncMock(
-                    side_effect=RuntimeError("offline")
-                )
-
                 decision = asyncio.run(
                     plugin._decide_context_focus(
                         "qq:FriendMessage:123",
@@ -1035,7 +1039,7 @@ class MainLifecycleTest(unittest.TestCase):
 
         decision, elapsed = asyncio.run(run())
 
-        self.assertEqual(decision, (True, "睡眠 心率"))
+        self.assertEqual(decision, (False, ""))
         self.assertLess(elapsed, 0.1)
 
     def test_context_model_failure_uses_bounded_backoff_and_resets(self) -> None:
@@ -1062,7 +1066,7 @@ class MainLifecycleTest(unittest.TestCase):
             delays.append(
                 (plugin._context_decision_retry_at - datetime.now(UTC)).total_seconds()
             )
-            # Backoff bypasses the provider and returns local rules immediately.
+            # Backoff bypasses the provider and skips health context immediately.
             during_backoff = await plugin._decide_context_focus("session", "今天好累")
             for _ in range(2):
                 plugin._context_decision_retry_at = datetime.now(UTC)
@@ -1078,7 +1082,7 @@ class MainLifecycleTest(unittest.TestCase):
 
         delays, during_backoff, recovered = asyncio.run(run())
         self.assertEqual(plugin.context.llm_generate.await_count, 4)
-        self.assertEqual(during_backoff, (True, "睡眠 心率"))
+        self.assertEqual(during_backoff, (False, ""))
         self.assertEqual(recovered, (True, "最近 睡眠"))
         self.assertEqual(plugin._context_decision_failures, 0)
         self.assertIsNone(plugin._context_decision_retry_at)
