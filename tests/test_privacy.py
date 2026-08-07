@@ -14,7 +14,7 @@ class PrivacyTest(unittest.TestCase):
         metadata = (Path(__file__).parents[1] / "metadata.yaml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("version: v0.8.3", metadata)
+        self.assertIn("version: v0.8.4", metadata)
         self.assertIn('astrbot_version: ">=4.24.2,<5"', metadata)
 
     def test_sensitive_llm_authorization_defaults_to_false_in_schema(self) -> None:
