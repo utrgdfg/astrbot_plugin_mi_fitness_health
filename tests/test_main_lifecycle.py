@@ -27,6 +27,8 @@ class MainLifecycleTest(unittest.TestCase):
         plugin.allow_proactive_chat_context = True
         plugin.health_dialogue_provider_id = ""
         plugin.health_dialogue_persona_id = ""
+        plugin.conversation_health_mode = "auto"
+        plugin.context_decision_provider_id = ""
         plugin.context_decision_timeout_seconds = 8
         plugin.natural_query_cloud_wait_seconds = 5
         plugin.context_decision_message_count = 8
@@ -417,6 +419,8 @@ class MainLifecycleTest(unittest.TestCase):
 
     def test_llm_hook_passes_recent_conversation_to_decision_model(self) -> None:
         plugin = self._bare_plugin()
+        plugin.conversation_health_mode = "decision_model"
+        plugin.context_decision_provider_id = "classifier"
         plugin.care_dialogue_enabled = True
         plugin.allow_health_data_to_llm = True
         plugin._is_private_owner_event = Mock(return_value=True)
@@ -441,6 +445,153 @@ class MainLifecycleTest(unittest.TestCase):
             ],
         )
         self.assertEqual(request.extra_user_content_parts, [])
+
+    def test_main_model_mode_injects_overview_without_decision_model(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.conversation_health_mode = "main_model"
+        plugin.context_decision_provider_id = "unused-classifier"
+        plugin.natural_query_cloud_wait_seconds = 11
+        plugin.care_dialogue_enabled = True
+        plugin.allow_health_data_to_llm = True
+        plugin._is_private_owner_event = Mock(return_value=True)
+        plugin._decide_context_focus = AsyncMock()
+        plugin._main_model_refresh_focus = AsyncMock(return_value="综合概况")
+        plugin._refresh_for_natural_question = AsyncMock(return_value=True)
+        plugin._compose_health_dialogue = AsyncMock()
+        plugin.query_service = Mock()
+        plugin.query_service.llm_overview_snapshot = AsyncMock(
+            return_value="今日活动 4321 步；今日心率最新 72 bpm"
+        )
+        plugin.query_service.sync_at_for_focus = AsyncMock(return_value=None)
+        event = Mock()
+        event.unified_msg_origin = "qq:FriendMessage:123"
+        event.get_message_str.return_value = "早上好"
+        request = ProviderRequest()
+
+        asyncio.run(plugin.add_owner_health_context(event, request))
+
+        plugin._decide_context_focus.assert_not_awaited()
+        plugin._refresh_for_natural_question.assert_awaited_once_with(
+            "综合概况",
+            wait_for_result=True,
+            force_refresh=False,
+            wait_timeout=11.0,
+        )
+        plugin.query_service.llm_overview_snapshot.assert_awaited_once_with("综合概况")
+        plugin._compose_health_dialogue.assert_not_awaited()
+        self.assertEqual(len(request.extra_user_content_parts), 1)
+        self.assertIn("4321 步", request.extra_user_content_parts[0].text)
+        self.assertTrue(request.extra_user_content_parts[0]._no_save)
+
+    def test_main_model_mode_zero_cloud_wait_only_starts_background_refresh(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        plugin.conversation_health_mode = "main_model"
+        plugin.natural_query_cloud_wait_seconds = 0
+        plugin.care_dialogue_enabled = True
+        plugin.allow_health_data_to_llm = True
+        plugin._is_private_owner_event = Mock(return_value=True)
+        plugin._main_model_refresh_focus = AsyncMock(return_value="综合概况")
+        plugin._refresh_for_natural_question = AsyncMock(return_value=False)
+        plugin.query_service = Mock()
+        plugin.query_service.llm_overview_snapshot = AsyncMock(return_value="")
+        event = Mock()
+        event.unified_msg_origin = "qq:FriendMessage:123"
+        event.get_message_str.return_value = "你好"
+        request = ProviderRequest()
+
+        asyncio.run(plugin.add_owner_health_context(event, request))
+
+        plugin._refresh_for_natural_question.assert_awaited_once_with(
+            "综合概况",
+            wait_for_result=False,
+            force_refresh=False,
+            wait_timeout=0.001,
+        )
+        self.assertEqual(request.extra_user_content_parts, [])
+
+    def test_main_model_mode_does_not_use_message_keywords_to_force_refresh(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        plugin.conversation_health_mode = "main_model"
+        plugin.care_dialogue_enabled = True
+        plugin.allow_health_data_to_llm = True
+        plugin._is_private_owner_event = Mock(return_value=True)
+        plugin._main_model_refresh_focus = AsyncMock(return_value="今天 睡眠")
+        plugin._refresh_for_natural_question = AsyncMock(return_value=False)
+        plugin.query_service = Mock()
+        plugin.query_service.llm_overview_snapshot = AsyncMock(return_value="")
+        event = Mock()
+        event.unified_msg_origin = "qq:FriendMessage:123"
+        event.get_message_str.return_value = "帮我刷新一下网页"
+        request = ProviderRequest()
+
+        asyncio.run(plugin.add_owner_health_context(event, request))
+
+        plugin._main_model_refresh_focus.assert_awaited_once_with()
+        plugin._refresh_for_natural_question.assert_awaited_once_with(
+            "今天 睡眠",
+            wait_for_result=True,
+            force_refresh=False,
+            wait_timeout=5.0,
+        )
+
+    def test_main_model_mode_prioritizes_missing_morning_sleep(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.query_service = Mock()
+        plugin.query_service.timezone = UTC
+        plugin.query_service.has_sleep_ending_today = AsyncMock(return_value=False)
+
+        with patch(
+            "astrbot_plugin_mi_fitness_health.features.conversation_routing.datetime"
+        ) as mocked_datetime:
+            mocked_datetime.now.return_value = datetime(2026, 8, 7, 7, tzinfo=UTC)
+            focus = asyncio.run(plugin._main_model_refresh_focus())
+
+        self.assertEqual(focus, "今天 睡眠")
+
+    def test_main_model_mode_omits_old_sleep_when_today_sleep_is_missing(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.conversation_health_mode = "main_model"
+        plugin.care_dialogue_enabled = True
+        plugin.allow_health_data_to_llm = True
+        plugin._is_private_owner_event = Mock(return_value=True)
+        plugin._main_model_refresh_focus = AsyncMock(return_value="今天 睡眠")
+        plugin._refresh_for_natural_question = AsyncMock(return_value=False)
+        plugin.query_service = Mock()
+        plugin.query_service.llm_overview_snapshot = AsyncMock(return_value="")
+        event = Mock()
+        event.unified_msg_origin = "qq:FriendMessage:123"
+        event.get_message_str.return_value = "早上好"
+        request = ProviderRequest()
+
+        asyncio.run(plugin.add_owner_health_context(event, request))
+
+        plugin._refresh_for_natural_question.assert_awaited_once_with(
+            "今天 睡眠",
+            wait_for_result=True,
+            force_refresh=False,
+            wait_timeout=5.0,
+        )
+        plugin.query_service.llm_overview_snapshot.assert_awaited_once_with(
+            "今天 综合概况"
+        )
+        self.assertEqual(request.extra_user_content_parts, [])
+
+    def test_conversation_health_mode_auto_preserves_existing_behavior(self) -> None:
+        plugin = self._bare_plugin()
+        self.assertEqual(plugin._effective_conversation_health_mode(), "local_rules")
+
+        plugin.context_decision_provider_id = "classifier"
+        self.assertEqual(
+            plugin._effective_conversation_health_mode(),
+            "decision_model",
+        )
+
+        plugin.conversation_health_mode = "main_model"
+        self.assertEqual(plugin._effective_conversation_health_mode(), "main_model")
 
     def test_conversation_decision_fetches_and_injects_data_for_ambiguous_turn(
         self,
@@ -1246,6 +1397,8 @@ class MainLifecycleTest(unittest.TestCase):
 
     def test_llm_context_fails_closed_without_temporary_part_support(self) -> None:
         plugin = self._bare_plugin()
+        plugin.conversation_health_mode = "decision_model"
+        plugin.context_decision_provider_id = "classifier"
         plugin.care_dialogue_enabled = True
         plugin.allow_health_data_to_llm = True
         plugin._is_private_owner_event = Mock(return_value=True)
@@ -1312,6 +1465,8 @@ class MainLifecycleTest(unittest.TestCase):
 
     def test_explicit_sleep_question_restricts_broader_model_focus(self) -> None:
         plugin = self._bare_plugin()
+        plugin.conversation_health_mode = "decision_model"
+        plugin.context_decision_provider_id = "classifier"
         plugin.care_dialogue_enabled = True
         plugin.allow_health_data_to_llm = True
         plugin._is_private_owner_event = Mock(return_value=True)
@@ -1375,6 +1530,8 @@ class MainLifecycleTest(unittest.TestCase):
 
     def test_empty_cache_refresh_is_visible_to_current_llm_request(self) -> None:
         plugin = self._bare_plugin()
+        plugin.conversation_health_mode = "decision_model"
+        plugin.context_decision_provider_id = "classifier"
         plugin.care_dialogue_enabled = True
         plugin.allow_health_data_to_llm = True
         plugin.natural_query_sync_minutes = 15
@@ -1670,6 +1827,8 @@ class MainLifecycleTest(unittest.TestCase):
 
     def test_original_just_synced_intent_forces_model_selected_refresh(self) -> None:
         plugin = self._bare_plugin()
+        plugin.conversation_health_mode = "decision_model"
+        plugin.context_decision_provider_id = "classifier"
         plugin.care_dialogue_enabled = True
         plugin.allow_health_data_to_llm = True
         plugin._is_private_owner_event = Mock(return_value=True)
@@ -1706,6 +1865,8 @@ class MainLifecycleTest(unittest.TestCase):
 
     def test_optional_health_dialogue_draft_stays_in_temporary_context(self) -> None:
         plugin = self._bare_plugin()
+        plugin.conversation_health_mode = "decision_model"
+        plugin.context_decision_provider_id = "classifier"
         plugin.care_dialogue_enabled = True
         plugin.allow_health_data_to_llm = True
         plugin._is_private_owner_event = Mock(return_value=True)
@@ -2349,6 +2510,7 @@ class MainLifecycleTest(unittest.TestCase):
                     "enable_care_dialogue": "0",
                     "allow_health_data_to_llm": "not-a-bool",
                     "allow_proactive_chat_context": "true",
+                    "conversation_health_mode": "invalid-mode",
                     "health_check_interval_minutes": "broken",
                     "natural_query_sync_minutes": None,
                     "context_decision_timeout_seconds": "broken",
@@ -2362,6 +2524,7 @@ class MainLifecycleTest(unittest.TestCase):
         self.assertFalse(plugin.care_dialogue_enabled)
         self.assertFalse(plugin.allow_health_data_to_llm)
         self.assertTrue(plugin.allow_proactive_chat_context)
+        self.assertEqual(plugin.conversation_health_mode, "auto")
         self.assertEqual(plugin.monitor_interval, 30)
         self.assertEqual(plugin.natural_query_sync_minutes, 15)
         self.assertEqual(plugin.context_decision_timeout_seconds, 8)
@@ -2375,13 +2538,15 @@ class MainLifecycleTest(unittest.TestCase):
                 Mock(),
                 {
                     "database_path": str(Path(directory) / "timeouts.sqlite3"),
+                    "conversation_health_mode": "main_model",
                     "context_decision_timeout_seconds": 12,
-                    "natural_query_cloud_wait_seconds": 18,
+                    "natural_query_cloud_wait_seconds": 0,
                 },
             )
 
         self.assertEqual(plugin.context_decision_timeout_seconds, 12)
-        self.assertEqual(plugin.natural_query_cloud_wait_seconds, 18)
+        self.assertEqual(plugin.conversation_health_mode, "main_model")
+        self.assertEqual(plugin.natural_query_cloud_wait_seconds, 0)
 
     def test_failed_manual_sync_does_not_start_cooldown(self) -> None:
         plugin = self._bare_plugin()

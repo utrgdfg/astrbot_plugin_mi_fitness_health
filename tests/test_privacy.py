@@ -29,6 +29,15 @@ class PrivacyTest(unittest.TestCase):
             schema["context_decision_provider_id"]["_special"], "select_provider"
         )
         self.assertEqual(schema["context_decision_provider_id"]["default"], "")
+        self.assertEqual(schema["conversation_health_mode"]["default"], "auto")
+        self.assertIn(
+            "main_model",
+            schema["conversation_health_mode"]["options"],
+        )
+        self.assertEqual(
+            schema["natural_query_cloud_wait_seconds"]["slider"]["min"],
+            0,
+        )
         self.assertEqual(schema["context_decision_prompt"]["type"], "text")
         self.assertTrue(schema["context_decision_prompt"]["default"])
         self.assertEqual(schema["proactive_decision_prompt"]["type"], "text")

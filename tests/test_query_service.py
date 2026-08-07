@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import astrbot_test_stub  # noqa: F401
 from astrbot_plugin_mi_fitness_health.models import (
@@ -77,6 +78,44 @@ class QueryServiceTest(unittest.TestCase):
                     asyncio.run(service.llm_care_snapshot(focus)),
                     "",
                 )
+
+    def test_main_model_overview_is_bounded_and_uses_no_missing_notices(self) -> None:
+        service = QueryService(_RecordingDatabase(), "user", "Asia/Shanghai")
+        service.care_snapshot = AsyncMock(
+            return_value="；".join(f"第{index}项生活数据" for index in range(100))
+        )
+
+        snapshot = asyncio.run(service.llm_overview_snapshot("综合概况", 200))
+
+        service.care_snapshot.assert_awaited_once_with(
+            "综合概况",
+            include_missing_notice=False,
+        )
+        self.assertLessEqual(len(snapshot), 200)
+        self.assertFalse(snapshot.endswith("；"))
+
+    def test_today_sleep_presence_uses_local_wake_date(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            service = QueryService(database, "user", "Asia/Shanghai")
+            wake = datetime.now(service.timezone).replace(second=0, microsecond=0)
+            database.upsert_sleep(
+                "user",
+                SleepSession(
+                    "today",
+                    (wake - timedelta(hours=7)).astimezone(UTC),
+                    wake.astimezone(UTC),
+                    450,
+                    420,
+                    30,
+                    88,
+                ),
+            )
+
+            available = asyncio.run(service.has_sleep_ending_today())
+
+        self.assertTrue(available)
 
     def test_llm_focus_limits_ordinary_requests_to_first_two_categories(self) -> None:
         service = QueryService(_RecordingDatabase(), "user", "Asia/Shanghai")

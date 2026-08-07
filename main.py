@@ -119,6 +119,11 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
         "醒了",
         "睡醒",
     )
+    _CONVERSATION_HEALTH_MODE_LABELS = {
+        "main_model": "主模型直接判断",
+        "decision_model": "独立判断模型",
+        "local_rules": "本地轻量规则",
+    }
 
     def __init__(self, context: Context, config: AstrBotConfig):
         """Configure one Xiaomi account and one AstrBot data owner.
@@ -186,6 +191,20 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
             False,
             fail_closed=True,
         )
+        conversation_health_mode = str(
+            config.get("conversation_health_mode") or "auto"
+        ).strip()
+        if conversation_health_mode not in {
+            "auto",
+            "main_model",
+            "decision_model",
+            "local_rules",
+        }:
+            logger.warning(
+                "[小米运动健康] 配置项 conversation_health_mode 无效，已使用兼容模式"
+            )
+            conversation_health_mode = "auto"
+        self.conversation_health_mode = conversation_health_mode
         self.context_decision_provider_id = str(
             config.get("context_decision_provider_id") or ""
         ).strip()
@@ -244,7 +263,7 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
             config, "natural_query_sync_minutes", 15, 1, 120
         )
         self.natural_query_cloud_wait_seconds = _config_int(
-            config, "natural_query_cloud_wait_seconds", 5, 1, 30
+            config, "natural_query_cloud_wait_seconds", 5, 0, 30
         )
         self.sync_days = _config_int(config, "default_sync_days", 7, 1, 90)
         self.sync_interval = _config_int(config, "sync_interval_minutes", 60, 5, 1440)
@@ -559,40 +578,65 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
         question = self._sanitize_focus(raw_question) if raw_question else ""
         if not question:
             return
-        use_data, focus = await self._decide_context_focus(
-            event.unified_msg_origin,
-            question,
-            self._decision_history_from_request(req, question),
-        )
-        if not use_data:
-            return
-        message_focus = self.query_service.normalize_llm_focus(question)
-        focus = message_focus or self.query_service.normalize_llm_focus(focus)
-        if not focus:
-            return
-        focus = self._normalize_context_focus_for_message(question, focus)
-        health_question = self._is_health_question(question)
-        await self._refresh_for_natural_question(
-            focus,
-            wait_for_result=True,
-            force_refresh=self._wants_fresh_cloud_data(question),
-            wait_timeout=float(self.natural_query_cloud_wait_seconds),
-        )
-        snapshot = await self.query_service.llm_care_snapshot(
-            focus,
-            include_missing_notice=False,
-        )
+        mode = self._effective_conversation_health_mode()
+        wait_seconds = float(self.natural_query_cloud_wait_seconds)
+        if mode == "main_model":
+            force_refresh = False
+            refresh_focus = await self._main_model_refresh_focus()
+            focus = "今天 综合概况" if refresh_focus == "今天 睡眠" else "综合概况"
+            await self._refresh_for_natural_question(
+                refresh_focus,
+                wait_for_result=wait_seconds > 0,
+                force_refresh=force_refresh,
+                wait_timeout=max(wait_seconds, 0.001),
+            )
+            snapshot = await self.query_service.llm_overview_snapshot(focus)
+            health_question = False
+        else:
+            force_refresh = self._wants_fresh_cloud_data(question)
+            if mode == "decision_model":
+                if not self.context_decision_provider_id:
+                    return
+                use_data, focus = await self._decide_context_focus(
+                    event.unified_msg_origin,
+                    question,
+                    self._decision_history_from_request(req, question),
+                )
+            else:
+                use_data, focus = self._fallback_context_decision(question)
+            if not use_data:
+                return
+            message_focus = self.query_service.normalize_llm_focus(question)
+            focus = message_focus or self.query_service.normalize_llm_focus(focus)
+            if not focus:
+                return
+            focus = self._normalize_context_focus_for_message(question, focus)
+            health_question = self._is_health_question(question)
+            await self._refresh_for_natural_question(
+                focus,
+                wait_for_result=wait_seconds > 0,
+                force_refresh=force_refresh,
+                wait_timeout=max(wait_seconds, 0.001),
+            )
+            snapshot = await self.query_service.llm_care_snapshot(
+                focus,
+                include_missing_notice=False,
+            )
         if not snapshot:
             return
         last_sync = await self.query_service.sync_at_for_focus(focus)
         displayed_last_sync = (
             self.query_service.display_timestamp(last_sync) if last_sync else None
         )
-        dialogue = await self._compose_health_dialogue(
-            event.unified_msg_origin,
-            focus,
-            snapshot,
-            displayed_last_sync,
+        dialogue = (
+            None
+            if mode == "main_model"
+            else await self._compose_health_dialogue(
+                event.unified_msg_origin,
+                focus,
+                snapshot,
+                displayed_last_sync,
+            )
         )
         escaped_snapshot = html.escape(snapshot, quote=True)
         escaped_last_sync = (
@@ -608,15 +652,22 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
             else ""
         )
         instruction = (
-            "Answer the owner's question directly in Chinese from these records; avoid diagnosis and do not claim medical certainty."
-            if health_question
+            "Use this compact recent overview only when it is relevant to the current "
+            "conversation. Decide relevance from the full conversation and persona; "
+            "otherwise ignore it completely. Do not enumerate unrelated values, mention "
+            "the plugin, or make a diagnosis."
+            if mode == "main_model"
             else (
-                "This is an ordinary chat. Use one relevant record naturally when it helps "
-                "understand, verify, or gently correct the owner's current statement; do not "
-                "enumerate data, mention the plugin, or make a diagnosis. If the listed records "
-                "do not show a claimed event, only say that Xiaomi's records do not show it; "
-                "missing or incomplete records are not proof that the event did not happen, and "
-                "must never be framed as dishonesty."
+                "Answer the owner's question directly in Chinese from these records; avoid diagnosis and do not claim medical certainty."
+                if health_question
+                else (
+                    "This is an ordinary chat. Use one relevant record naturally when it helps "
+                    "understand, verify, or gently correct the owner's current statement; do not "
+                    "enumerate data, mention the plugin, or make a diagnosis. If the listed records "
+                    "do not show a claimed event, only say that Xiaomi's records do not show it; "
+                    "missing or incomplete records are not proof that the event did not happen, and "
+                    "must never be framed as dishonesty."
+                )
             )
         )
         text = (
@@ -656,11 +707,14 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
         async for result in self._guard(event):
             yield result
             return
+        mode_label = self._CONVERSATION_HEALTH_MODE_LABELS[
+            self._effective_conversation_health_mode()
+        ]
         yield event.plain_result(
             "小米运动健康（仅所有者可用）\n"
             "健康连接｜健康同步｜健康状态｜今日健康｜心率记录 [小时]｜身体数据｜健康趋势 [天]\n"
             "平时只需正常聊天；出现作息、疲劳、运动或早晚问候等线索时，插件会在后台准备相关生活数据，让机器人按当前人格自然回应。\n"
-            f"生活数据调用判断：{'使用已选模型' if self.context_decision_provider_id else '使用本地规则'}。\n"
+            f"日常对话数据方式：{mode_label}。\n"
             "直接查询和以上命令主要用于核对数据或排查连接问题。\n"
             f"主动关心检查：{'每 ' + str(self.monitor_interval) + ' 分钟检查本地状态' if self.proactive_monitor_enabled else '关闭'}；只在自然时机且冷却结束时私聊一次。\n"
             f"主动判断读取最近私聊：{'已授权' if self.allow_proactive_chat_context else '未授权（主动关心保持静默）'}。\n"
@@ -818,6 +872,9 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
             background_status = "未开启（按需同步）"
         else:
             background_status = "未运行"
+        mode_label = self._CONVERSATION_HEALTH_MODE_LABELS[
+            self._effective_conversation_health_mode()
+        ]
         yield event.plain_result(
             f"健康状态\n连接：{'已连接' if self.adapter.is_connected() else '未连接/待验证'}\n"
             f"区域：{self.adapter.region or '自动探测'}\n最近同步完成时间：{self.query_service.display_timestamp(last_sync) if last_sync else '暂无'}\n"
@@ -827,7 +884,7 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
             f"（每 {self.monitor_interval} 分钟，仅检查本地数据）\n"
             f"主动私聊目标：{'已记录' if private_state else '待所有者先私聊一次'}\n"
             f"对话触发的数据刷新间隔：{self.natural_query_sync_minutes} 分钟\n"
-            f"生活数据调用判断：{'已选模型' if self.context_decision_provider_id else '内置规则'}\n"
+            f"日常对话数据方式：{mode_label}\n"
             f"判断模型等待上限：{self.context_decision_timeout_seconds} 秒\n"
             f"对话云端刷新等待上限：{self.natural_query_cloud_wait_seconds} 秒\n"
             f"对话生活数据授权：{'开启' if self.allow_health_data_to_llm else '关闭'}\n"

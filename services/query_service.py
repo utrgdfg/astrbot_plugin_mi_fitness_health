@@ -282,6 +282,36 @@ class QueryService:
             include_missing_notice=include_missing_notice,
         )
 
+    async def llm_overview_snapshot(
+        self,
+        focus: str = "综合概况",
+        max_characters: int = 1000,
+    ) -> str:
+        """Return a bounded recent overview for an explicitly selected main-model mode."""
+        snapshot = await self.care_snapshot(
+            focus,
+            include_missing_notice=False,
+        )
+        limit = max(200, min(int(max_characters), 2000))
+        if len(snapshot) <= limit:
+            return snapshot
+        bounded = snapshot[:limit]
+        separator = bounded.rfind("；")
+        return bounded[:separator] if separator >= limit // 2 else bounded
+
+    async def has_sleep_ending_today(self) -> bool:
+        """Return whether cache contains a sleep session whose wake time is today."""
+        today = datetime.now(self.timezone).date()
+        start, end = self.local_day_bounds(today)
+        rows = await asyncio.to_thread(
+            self.database.sleep_ending_between,
+            self.user_id,
+            start,
+            end,
+            1,
+        )
+        return bool(rows)
+
     def sync_types_for_focus(self, focus: str) -> tuple[str, ...]:
         """Return storage sync keys needed to answer one natural-language focus."""
         requested, _ = self.requested_categories(focus)
