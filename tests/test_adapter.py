@@ -422,7 +422,11 @@ class AdapterTest(unittest.TestCase):
             self.assertIn("睡眠 430 分钟", snapshot)
             self.assertIn("评分 82", snapshot)
             self.assertIn(wake_local.date().isoformat(), snapshot)
-            self.assertIn("结束 07:30", snapshot)
+            self.assertIn(
+                f"入睡 {wake_local.replace(hour=0, minute=0).strftime('%Y-%m-%d %H:%M')}",
+                snapshot,
+            )
+            self.assertIn(f"起床 {wake_local.strftime('%Y-%m-%d %H:%M')}", snapshot)
 
     def test_sleep_fetches_later_daily_index_but_rejects_future_session(self) -> None:
         """Today's completed sleep may be indexed later without admitting future data."""

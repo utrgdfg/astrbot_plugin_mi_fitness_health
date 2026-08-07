@@ -300,11 +300,15 @@ class QueryService:
         return local_timestamp(value, self.timezone)
 
     def _format_sleep_row(self, sleep: dict) -> str | None:
-        """Format one sleep row by its local wake date, skipping malformed history."""
+        """Format explicit local sleep boundaries, skipping malformed history."""
         try:
+            started = datetime.fromisoformat(str(sleep["start_at"]))
             ended = datetime.fromisoformat(str(sleep["end_at"]))
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=UTC)
             if ended.tzinfo is None:
                 ended = ended.replace(tzinfo=UTC)
+            started = started.astimezone(self.timezone)
             ended = ended.astimezone(self.timezone)
             score = sleep["score"] if sleep["score"] is not None else "未提供"
             asleep_minutes = sleep["asleep_minutes"]
@@ -318,7 +322,8 @@ class QueryService:
             return None
         return (
             f"{ended.date()} 睡眠 {asleep_minutes} 分钟"
-            f"（结束 {ended.strftime('%H:%M')}，评分 {score}）"
+            f"（入睡 {started.strftime('%Y-%m-%d %H:%M')}，"
+            f"起床 {ended.strftime('%Y-%m-%d %H:%M')}，评分 {score}）"
         )
 
     async def care_snapshot(
