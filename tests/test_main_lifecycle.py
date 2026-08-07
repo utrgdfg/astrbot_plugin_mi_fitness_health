@@ -229,6 +229,34 @@ class MainLifecycleTest(unittest.TestCase):
             "今天 睡眠",
         )
 
+    def test_context_model_resolves_an_elliptical_sleep_claim_from_history(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        plugin.context_decision_provider_id = "fast-classifier"
+        plugin.context = Mock()
+        plugin.context.llm_generate = AsyncMock(
+            return_value=Mock(
+                completion_text=(
+                    '{"use_data":true,"categories":["sleep"],"time_scope":"today"}'
+                )
+            )
+        )
+
+        decision = asyncio.run(
+            plugin._decide_context_focus(
+                "qq:FriendMessage:123",
+                "今天补了",
+                [{"role": "assistant", "text": "今天补觉了吗？"}],
+            )
+        )
+
+        self.assertEqual(decision, (True, "今天 睡眠"))
+        prompt = plugin.context.llm_generate.await_args.kwargs["prompt"]
+        self.assertIn("今天补觉了吗", prompt)
+        self.assertIn("今天补了", prompt)
+        self.assertIn("依赖前文的省略回答", prompt)
+
     def test_context_model_can_skip_a_task_that_only_mentions_a_care_word(
         self,
     ) -> None:
@@ -431,6 +459,53 @@ class MainLifecycleTest(unittest.TestCase):
         injected = request.extra_user_content_parts[0]
         self.assertTrue(injected._no_save)
         self.assertIn("今日睡眠 420 分钟", injected.text)
+
+    def test_elliptical_sleep_claim_injects_records_for_the_chat_model(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.care_dialogue_enabled = True
+        plugin.allow_health_data_to_llm = True
+        plugin.context_decision_provider_id = "fast-classifier"
+        plugin.context_decision_prompt = "结合整段对话判断。"
+        plugin._is_private_owner_event = Mock(return_value=True)
+        plugin._refresh_for_natural_question = AsyncMock(return_value=True)
+        plugin._compose_health_dialogue = AsyncMock(return_value=None)
+        plugin.context = Mock()
+        plugin.context.llm_generate = AsyncMock(
+            return_value=Mock(
+                completion_text=(
+                    '{"use_data":true,"categories":["sleep"],"time_scope":"today"}'
+                )
+            )
+        )
+        plugin.query_service = Mock()
+        plugin.query_service.normalize_llm_focus.side_effect = (
+            QueryService.normalize_llm_focus
+        )
+        plugin.query_service.llm_care_snapshot = AsyncMock(
+            return_value="2026-08-07 睡眠 420 分钟（结束 07:10，评分 88）"
+        )
+        plugin.query_service.sync_at_for_focus = AsyncMock(return_value=None)
+        event = Mock()
+        event.unified_msg_origin = "qq:FriendMessage:123"
+        event.get_message_str.return_value = "今天补了"
+        request = ProviderRequest()
+        request.contexts = [
+            {"role": "assistant", "content": "今天补觉了吗？"},
+        ]
+
+        asyncio.run(plugin.add_owner_health_context(event, request))
+
+        plugin._refresh_for_natural_question.assert_awaited_once_with(
+            "今天 睡眠",
+            wait_for_result=True,
+            force_refresh=False,
+            wait_timeout=2.0,
+        )
+        self.assertEqual(len(request.extra_user_content_parts), 1)
+        injected = request.extra_user_content_parts[0].text
+        self.assertIn("2026-08-07 睡眠 420 分钟", injected)
+        self.assertIn("only say that Xiaomi's records do not show it", injected)
+        self.assertIn("missing or incomplete records are not proof", injected)
 
     def test_proactive_decision_parser_accepts_only_boolean_json(self) -> None:
         self.assertTrue(

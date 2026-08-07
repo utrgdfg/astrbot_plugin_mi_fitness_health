@@ -604,7 +604,14 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
         instruction = (
             "Answer the owner's question directly in Chinese from these records; avoid diagnosis and do not claim medical certainty."
             if health_question
-            else "This is an ordinary chat. Only weave in one relevant fact if it makes the reply warmer or more natural; do not enumerate data, mention the plugin, or make a diagnosis."
+            else (
+                "This is an ordinary chat. Use one relevant record naturally when it helps "
+                "understand, verify, or gently correct the owner's current statement; do not "
+                "enumerate data, mention the plugin, or make a diagnosis. If the listed records "
+                "do not show a claimed event, only say that Xiaomi's records do not show it; "
+                "missing or incomplete records are not proof that the event did not happen, and "
+                "must never be framed as dishonesty."
+            )
         )
         text = (
             "<private_life_context>\n"
