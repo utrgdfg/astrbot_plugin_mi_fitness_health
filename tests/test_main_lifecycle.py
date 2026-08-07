@@ -978,6 +978,9 @@ class MainLifecycleTest(unittest.TestCase):
             "帮我看看这段睡眠排序代码",
             "帮我写一个熬夜主题的故事",
             "昨天我朋友没睡好",
+            "朋友昨晚没睡好",
+            "服务心跳怎么样？",
+            "写个关于睡眠的小说",
         )
         for message in examples:
             with self.subTest(message=message):

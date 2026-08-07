@@ -536,3 +536,54 @@ class DatabaseTest(unittest.TestCase):
                 "user", (yesterday_sample - timedelta(minutes=1)).isoformat()
             )
             self.assertEqual([row["record_id"] for row in rows], ["today"])
+
+    def test_v8_migration_removes_historical_proactive_message_bodies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "health.sqlite3"
+            database = Database(path)
+            database.initialize()
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute("UPDATE schema_version SET version=7")
+                connection.execute(
+                    """INSERT INTO alerts(
+                           alert_type,created_at,message,event_key,owner_platform_id
+                       ) VALUES(?,?,?,?,?)""",
+                    (
+                        "late_night_activity",
+                        "2026-08-07T01:30:00+00:00",
+                        "所有者在 01:30 仍有私聊活动",
+                        "2026-08-07",
+                        "owner",
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO alerts(
+                           alert_type,created_at,message,event_key,owner_platform_id
+                       ) VALUES(?,?,?,?,?)""",
+                    (
+                        "proactive_message",
+                        "2026-08-07T01:35:00+00:00",
+                        "今晚早点休息吧",
+                        None,
+                        "owner",
+                    ),
+                )
+                connection.commit()
+
+            database.initialize()
+
+            with closing(sqlite3.connect(path)) as connection:
+                version = connection.execute(
+                    "SELECT version FROM schema_version"
+                ).fetchone()[0]
+                rows = connection.execute(
+                    "SELECT alert_type,message FROM alerts ORDER BY id"
+                ).fetchall()
+            self.assertEqual(version, 8)
+            self.assertEqual(
+                rows,
+                [
+                    ("late_night_activity", "已发送深夜活跃关心"),
+                    ("proactive_message", "已发送主动关心"),
+                ],
+            )

@@ -16,7 +16,7 @@ from ..models import (
     SleepSession,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 APPLICATION_ID = 0x4D464854  # "MFHT"
 OWNERSHIP_TABLE = "mi_fitness_plugin_metadata"
 OWNERSHIP_KEY = "application"
@@ -241,6 +241,19 @@ class Database:
                     CREATE INDEX IF NOT EXISTS idx_alert_owner_type_created
                         ON alerts(owner_platform_id,alert_type,created_at);
                     """
+                )
+                connection.execute("UPDATE schema_version SET version = 7")
+                current = 7
+            if current < 8:
+                # Cooldown and deduplication need only type, time and event key.
+                # Remove health-related candidate/generated text retained by
+                # earlier releases without changing the public schema.
+                connection.execute(
+                    """UPDATE alerts SET message = CASE alert_type
+                       WHEN 'late_night_activity' THEN '已发送深夜活跃关心'
+                       WHEN 'proactive_message' THEN '已发送主动关心'
+                       ELSE message END
+                       WHERE alert_type IN ('late_night_activity','proactive_message')"""
                 )
                 connection.execute(
                     "UPDATE schema_version SET version = ?", (SCHEMA_VERSION,)
