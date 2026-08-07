@@ -21,6 +21,8 @@ DEFAULT_CONTEXT_DECISION_PROMPT = (
     "更准确、更自然。用户不需要直接询问数据；只要对话正在涉及用户本人的作息、"
     "睡眠、疲劳、精力、活动、运动恢复、心率、体重、身体成分、血氧或压力，"
     "并且相关数据可能帮助理解语境，就应调用。"
+    "例如用户说自己今天没熬夜、昨晚没睡好、刚醒、很累或刚运动完时，"
+    "即使没有询问具体数值，也应选择相关数据。"
     "不适合调用：无关闲聊、知识问答、代码任务、第三方情况、医疗紧急情况，"
     "或生活数据明显无法帮助当前回复时。不要因为当前一句表达含蓄就忽略前文；"
     "也不要为了展示功能而在明确无关的对话里调用。"
@@ -215,6 +217,70 @@ class ConversationRoutingMixin:
             return True, self._care_focus(message)
         return False, ""
 
+    @classmethod
+    def _direct_current_message_decision(cls, message: str) -> tuple[bool, str]:
+        """Keep direct owner-state statements from being vetoed by a classifier."""
+        compact = message.lower().replace(" ", "")
+        if not cls._is_care_conversation(compact):
+            return False, ""
+        if any(
+            cue in compact
+            for cue in (
+                "帮我写",
+                "写一段",
+                "写一个",
+                "代码",
+                "脚本",
+                "函数",
+                "翻译",
+                "故事",
+                "小说",
+                "文案",
+                "科普",
+                "教程",
+            )
+        ):
+            return False, ""
+        if compact.startswith(("他", "她", "朋友", "同事", "同学", "孩子", "家人")):
+            return False, ""
+        if any(
+            cue in compact for cue in ("我朋友", "我同事", "我同学", "我孩子", "我家人")
+        ):
+            return False, ""
+        direct_cues = (
+            "我",
+            "今天",
+            "今晚",
+            "昨晚",
+            "昨天",
+            "刚",
+            "现在",
+            "还在",
+            "已经",
+            "没有",
+            "没",
+            "不",
+            "又",
+            "早安",
+            "早啊",
+            "早呀",
+            "早上好",
+            "晚安",
+            "起床",
+            "熬夜了",
+            "通宵了",
+            "运动完",
+            "散步回来",
+            "跑步回来",
+            "健身完",
+            "锻炼完",
+        )
+        if any(cue in compact for cue in direct_cues):
+            return True, cls._care_focus(message)
+        if compact in {"好困", "犯困", "好累", "累死", "疲惫", "没精神", "睡不着"}:
+            return True, cls._care_focus(message)
+        return False, ""
+
     def _context_decision_is_backing_off(self) -> bool:
         """Return whether recent classifier failures should bypass the provider."""
         retry_at = getattr(self, "_context_decision_retry_at", None)
@@ -300,8 +366,9 @@ class ConversationRoutingMixin:
         message: str,
         recent_context: list[dict[str, str]] | None = None,
     ) -> tuple[bool, str]:
-        """Ask an optional provider whether conversation-aware data would help."""
+        """Let an optional provider expand, but never veto, direct local cues."""
         fallback = self._fallback_context_decision(message)
+        direct_decision = self._direct_current_message_decision(message)
         if self._is_health_question(message):
             return fallback
         provider_id = getattr(self, "context_decision_provider_id", "")
@@ -325,6 +392,8 @@ class ConversationRoutingMixin:
             "必须结合最近对话与当前消息判断本轮是否需要数据，不能只按当前一句的"
             "字面关键词分类。用户不需要直接询问指标；如果前后文正在谈论用户本人的"
             "生活状态且数据可能改善回复，可以调用。"
+            "用户直接陈述本人今天没熬夜、昨晚没睡好、刚醒、很累或刚运动完等"
+            "生活状态时，应返回 use_data=true，不能因为用户没有追问数值而跳过。"
             "只选择回答当前消息真正需要的类别，最多两个："
             "activity、heart、body、sleep、spo2、stress。"
             "time_scope 只能是 today、yesterday、recent、none。"
@@ -357,6 +426,12 @@ class ConversationRoutingMixin:
             )
             if decision is not None:
                 self._reset_context_decision_backoff()
+                # Direct current-message cues are a high-recall floor.  The
+                # optional model may find implicit relevance in conversation
+                # history, but a false classification must not suppress an
+                # already recognized sleep/activity/energy cue in this turn.
+                if not decision[0] and direct_decision[0]:
+                    return direct_decision
                 return decision
             self._record_context_decision_failure()
             logger.warning(
