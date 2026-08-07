@@ -349,10 +349,28 @@ class QueryServiceTest(unittest.TestCase):
             )
 
             snapshot = asyncio.run(service.care_snapshot("睡眠"))
+            expected_start = start_utc.astimezone(service.timezone)
             expected = end_utc.astimezone(service.timezone)
 
             self.assertIn(expected.date().isoformat(), snapshot)
-            self.assertIn(f"结束 {expected.strftime('%H:%M')}", snapshot)
+            self.assertIn(f"入睡 {expected_start.strftime('%Y-%m-%d %H:%M')}", snapshot)
+            self.assertIn(f"起床 {expected.strftime('%Y-%m-%d %H:%M')}", snapshot)
+
+    def test_sleep_snapshot_keeps_cross_midnight_start_and_wake_dates(self) -> None:
+        service = QueryService(_RecordingDatabase(), "user", "Asia/Shanghai")
+
+        formatted = service._format_sleep_row(
+            {
+                "start_at": "2026-08-06T15:30:00+00:00",
+                "end_at": "2026-08-06T23:30:00+00:00",
+                "asleep_minutes": 450,
+                "score": 88,
+            }
+        )
+
+        self.assertIsNotNone(formatted)
+        self.assertIn("入睡 2026-08-06 23:30", formatted)
+        self.assertIn("起床 2026-08-07 07:30", formatted)
 
     def test_display_timestamps_use_configured_user_timezone(self) -> None:
         """UTC storage timestamps must display as local time, not raw +00:00 text."""

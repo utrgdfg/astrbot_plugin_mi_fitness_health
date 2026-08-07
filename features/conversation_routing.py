@@ -21,6 +21,13 @@ DEFAULT_CONTEXT_DECISION_PROMPT = (
     "更准确、更自然。用户不需要直接询问数据；只要对话正在涉及用户本人的作息、"
     "睡眠、疲劳、精力、活动、运动恢复、心率、体重、身体成分、血氧或压力，"
     "并且相关数据可能帮助理解语境，就应调用。"
+    "例如用户说自己今天没熬夜、昨晚没睡好、刚醒、很累或刚运动完时，"
+    "即使没有询问具体数值，也应选择相关数据。"
+    "还要理解依赖前文的简短回答：例如 Bot 问今天是否补觉，用户只回答‘今天补了’，"
+    "这是可由今日睡眠记录辅助核对的本人生活状态，应选择 today 和 sleep。"
+    "当生活数据可以核实、补充或温和纠正用户刚陈述的状态时，也应调用。"
+    "用户明确询问本人某项生活数据时必须调用；但代码、写作、知识问答或第三方语境"
+    "即使出现‘睡眠’‘压力’等词，也不应调用。"
     "不适合调用：无关闲聊、知识问答、代码任务、第三方情况、医疗紧急情况，"
     "或生活数据明显无法帮助当前回复时。不要因为当前一句表达含蓄就忽略前文；"
     "也不要为了展示功能而在明确无关的对话里调用。"
@@ -208,7 +215,41 @@ class ConversationRoutingMixin:
         return True, " ".join(label for label in labels if label)
 
     def _fallback_context_decision(self, message: str) -> tuple[bool, str]:
-        """Use deterministic cues when no classifier is selected or usable."""
+        """Use lightweight deterministic cues only when no classifier is selected."""
+        compact = message.lower().replace(" ", "")
+        non_owner_contexts = (
+            "压力测试",
+            "性能测试",
+            "睡眠算法",
+            "睡眠排序",
+            "睡眠代码",
+            "心率算法",
+            "心率代码",
+            "健康接口",
+            "健康数据接口",
+            "服务健康检查",
+            "系统健康检查",
+            "接口健康检查",
+            "服务心跳",
+            "进程心跳",
+            "接口心跳",
+            "熬夜主题的故事",
+            "睡眠主题的故事",
+            "故事",
+            "小说",
+            "文案",
+            "翻译",
+            "改写",
+            "朋友",
+            "同事",
+            "同学",
+            "室友",
+            "家人",
+            "他昨晚",
+            "她昨晚",
+        )
+        if any(cue in compact for cue in non_owner_contexts):
+            return False, ""
         if self._is_health_question(message):
             return True, message
         if self._is_care_conversation(message):
@@ -300,15 +341,12 @@ class ConversationRoutingMixin:
         message: str,
         recent_context: list[dict[str, str]] | None = None,
     ) -> tuple[bool, str]:
-        """Ask an optional provider whether conversation-aware data would help."""
-        fallback = self._fallback_context_decision(message)
-        if self._is_health_question(message):
-            return fallback
+        """Let the selected provider own routing; fail closed when it is unavailable."""
         provider_id = getattr(self, "context_decision_provider_id", "")
         if not provider_id:
-            return fallback
+            return self._fallback_context_decision(message)
         if self._context_decision_is_backing_off():
-            return fallback
+            return False, ""
         escaped_message = html.escape(
             self._sanitize_focus(self._decision_context_text(message)), quote=True
         )
@@ -325,6 +363,14 @@ class ConversationRoutingMixin:
             "必须结合最近对话与当前消息判断本轮是否需要数据，不能只按当前一句的"
             "字面关键词分类。用户不需要直接询问指标；如果前后文正在谈论用户本人的"
             "生活状态且数据可能改善回复，可以调用。"
+            "用户直接陈述本人今天没熬夜、昨晚没睡好、刚醒、很累或刚运动完等"
+            "生活状态时，应返回 use_data=true，不能因为用户没有追问数值而跳过。"
+            "必须理解依赖前文的省略回答；例如 Bot 问‘今天补觉了吗’，用户回答"
+            '‘今天补了’，应返回 use_data=true、categories=["sleep"]、'
+            'time_scope="today"，让当前聊天模型参考记录核对这项陈述。'
+            "用户明确询问本人睡眠、活动、心率等生活数据时必须返回 use_data=true；"
+            "技术压力测试、睡眠算法代码、主题写作或第三方情况必须按真实语义判断，"
+            "不能仅因出现健康词语就调用。"
             "只选择回答当前消息真正需要的类别，最多两个："
             "activity、heart、body、sleep、spo2、stress。"
             "time_scope 只能是 today、yesterday、recent、none。"
@@ -361,15 +407,16 @@ class ConversationRoutingMixin:
             self._record_context_decision_failure()
             logger.warning(
                 "Mi Fitness context decision model returned an invalid response; "
-                "using local cues"
+                "skipping health context for this turn"
             )
         except Exception as error:
             self._record_context_decision_failure()
             logger.warning(
-                "Mi Fitness context decision model failed; using local cues (%s)",
+                "Mi Fitness context decision model failed; "
+                "skipping health context for this turn (%s)",
                 type(error).__name__,
             )
-        return fallback
+        return False, ""
 
     @staticmethod
     def _wants_fresh_cloud_data(text: str) -> bool:

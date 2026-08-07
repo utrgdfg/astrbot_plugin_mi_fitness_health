@@ -508,3 +508,82 @@ class DatabaseTest(unittest.TestCase):
                 "user", (now - timedelta(days=3)).isoformat()
             )
             self.assertEqual([row["record_id"] for row in rows], ["current"])
+
+    def test_one_day_retention_keeps_only_the_current_local_date(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            today = datetime.now(UTC).date()
+            yesterday = today - timedelta(days=1)
+            yesterday_sample = datetime.combine(
+                yesterday, datetime.min.time(), tzinfo=UTC
+            ) + timedelta(hours=12)
+            today_sample = datetime.combine(
+                today, datetime.min.time(), tzinfo=UTC
+            ) + timedelta(minutes=1)
+            database.upsert_heart_rate(
+                "user",
+                HeartRateSample("yesterday", yesterday_sample, 70, "passive", False),
+            )
+            database.upsert_heart_rate(
+                "user",
+                HeartRateSample("today", today_sample, 72, "passive", False),
+            )
+
+            database.prune_user_data("user", 1, UTC)
+
+            rows = database.heart_rates_since(
+                "user", (yesterday_sample - timedelta(minutes=1)).isoformat()
+            )
+            self.assertEqual([row["record_id"] for row in rows], ["today"])
+
+    def test_v8_migration_removes_historical_proactive_message_bodies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "health.sqlite3"
+            database = Database(path)
+            database.initialize()
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute("UPDATE schema_version SET version=7")
+                connection.execute(
+                    """INSERT INTO alerts(
+                           alert_type,created_at,message,event_key,owner_platform_id
+                       ) VALUES(?,?,?,?,?)""",
+                    (
+                        "late_night_activity",
+                        "2026-08-07T01:30:00+00:00",
+                        "所有者在 01:30 仍有私聊活动",
+                        "2026-08-07",
+                        "owner",
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO alerts(
+                           alert_type,created_at,message,event_key,owner_platform_id
+                       ) VALUES(?,?,?,?,?)""",
+                    (
+                        "proactive_message",
+                        "2026-08-07T01:35:00+00:00",
+                        "今晚早点休息吧",
+                        None,
+                        "owner",
+                    ),
+                )
+                connection.commit()
+
+            database.initialize()
+
+            with closing(sqlite3.connect(path)) as connection:
+                version = connection.execute(
+                    "SELECT version FROM schema_version"
+                ).fetchone()[0]
+                rows = connection.execute(
+                    "SELECT alert_type,message FROM alerts ORDER BY id"
+                ).fetchall()
+            self.assertEqual(version, 8)
+            self.assertEqual(
+                rows,
+                [
+                    ("late_night_activity", "已发送深夜活跃关心"),
+                    ("proactive_message", "已发送主动关心"),
+                ],
+            )

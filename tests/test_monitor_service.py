@@ -7,9 +7,13 @@ import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import Mock
 
 import astrbot_test_stub  # noqa: F401
-from astrbot_plugin_mi_fitness_health.services import HealthMonitorService
+from astrbot_plugin_mi_fitness_health.services import (
+    HealthMonitorService,
+    MonitorFinding,
+)
 from astrbot_plugin_mi_fitness_health.storage import Database
 
 
@@ -68,3 +72,24 @@ class MonitorServiceTest(unittest.TestCase):
             )
 
             self.assertIsNone(asyncio.run(service.evaluate_late_activity(now)))
+
+    def test_delivery_audit_does_not_store_candidate_or_generated_text(self) -> None:
+        database = Mock()
+        service = HealthMonitorService(
+            database, "owner", UTC, True, "00:30", "06:00", 45, 120
+        )
+        finding = MonitorFinding(
+            "late_night_activity",
+            "2026-08-07",
+            "所有者在 01:30 仍有私聊活动",
+        )
+        sent_at = datetime(2026, 8, 7, 1, 35, tzinfo=UTC)
+
+        asyncio.run(service.mark_sent(finding, sent_at))
+        asyncio.run(service.mark_proactive_sent("今晚早点休息吧", sent_at))
+
+        calls = database.add_alert.call_args_list
+        self.assertEqual(calls[0].args[2], "已发送深夜活跃关心")
+        self.assertEqual(calls[1].args[2], "已发送主动关心")
+        self.assertNotIn("01:30", str(calls))
+        self.assertNotIn("早点休息", str(calls))
