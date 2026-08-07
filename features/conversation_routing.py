@@ -14,7 +14,7 @@ from ..adapters import MiFitnessAuthenticationError
 from ..utils.async_tools import await_with_hard_timeout
 from ..utils.privacy import redact_error
 
-CONTEXT_DECISION_TIMEOUT_SECONDS = 3.0
+DEFAULT_CONTEXT_DECISION_TIMEOUT_SECONDS = 8.0
 
 DEFAULT_CONTEXT_DECISION_PROMPT = (
     "结合最近对话与当前消息，判断小米运动健康生活数据是否可能让 Bot 的本轮回复"
@@ -395,7 +395,13 @@ class ConversationRoutingMixin:
                         "你只能按指定结构输出一个 JSON 对象。"
                     ),
                 ),
-                CONTEXT_DECISION_TIMEOUT_SECONDS,
+                float(
+                    getattr(
+                        self,
+                        "context_decision_timeout_seconds",
+                        DEFAULT_CONTEXT_DECISION_TIMEOUT_SECONDS,
+                    )
+                ),
                 registry=getattr(self, "_detached_tasks", None),
             )
             decision = self._parse_context_decision(

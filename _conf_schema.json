@@ -68,6 +68,17 @@
     "_special": "select_provider",
     "default": ""
   },
+  "context_decision_timeout_seconds": {
+    "type": "int",
+    "description": "判断模型等待时间（秒）",
+    "hint": "等待生活数据调用判断模型返回的最长时间。默认 8 秒，可在 3～30 秒之间调整；模型较慢时可适当增加。超时会静默跳过本轮生活数据，普通聊天仍继续回复。",
+    "default": 8,
+    "slider": {
+      "min": 3,
+      "max": 30,
+      "step": 1
+    }
+  },
   "context_decision_message_count": {
     "type": "int",
     "description": "调用判断读取的最近消息条数",
@@ -110,6 +121,17 @@
     "description": "对话触发的数据刷新间隔（分钟）",
     "hint": "日常聊天需要相关数据且缓存较旧时，插件会在后台刷新。默认 15 分钟；设置太短会增加小米云请求次数。",
     "default": 15
+  },
+  "natural_query_cloud_wait_seconds": {
+    "type": "int",
+    "description": "对话云端刷新等待时间（秒）",
+    "hint": "判断需要生活数据且缓存较旧时，当前回复等待小米云刷新的最长时间。默认 5 秒，可在 1～30 秒之间调整；超时会使用已有缓存或跳过数据，已开始的同步继续在后台完成。设置越长，当前回复可能等待越久。",
+    "default": 5,
+    "slider": {
+      "min": 1,
+      "max": 30,
+      "step": 1
+    }
   },
   "enable_proactive_health_monitor": {
     "type": "bool",

@@ -27,6 +27,8 @@ class MainLifecycleTest(unittest.TestCase):
         plugin.allow_proactive_chat_context = True
         plugin.health_dialogue_provider_id = ""
         plugin.health_dialogue_persona_id = ""
+        plugin.context_decision_timeout_seconds = 8
+        plugin.natural_query_cloud_wait_seconds = 5
         plugin.context_decision_message_count = 8
         plugin.context_decision_include_bot_messages = True
         plugin._last_proactive_delivery_at = None
@@ -375,7 +377,7 @@ class MainLifecycleTest(unittest.TestCase):
             "今天 睡眠",
             wait_for_result=True,
             force_refresh=False,
-            wait_timeout=2.0,
+            wait_timeout=5.0,
         )
         self.assertEqual(len(request.extra_user_content_parts), 1)
         self.assertIn("今日睡眠 430 分钟", request.extra_user_content_parts[0].text)
@@ -484,7 +486,7 @@ class MainLifecycleTest(unittest.TestCase):
             "今天 睡眠",
             wait_for_result=True,
             force_refresh=False,
-            wait_timeout=2.0,
+            wait_timeout=5.0,
         )
         self.assertEqual(len(request.extra_user_content_parts), 1)
         injected = request.extra_user_content_parts[0]
@@ -530,7 +532,7 @@ class MainLifecycleTest(unittest.TestCase):
             "今天 睡眠",
             wait_for_result=True,
             force_refresh=False,
-            wait_timeout=2.0,
+            wait_timeout=5.0,
         )
         self.assertEqual(len(request.extra_user_content_parts), 1)
         injected = request.extra_user_content_parts[0].text
@@ -1024,13 +1026,10 @@ class MainLifecycleTest(unittest.TestCase):
 
             plugin.context.llm_generate = stuck_provider
             started = asyncio.get_running_loop().time()
-            with patch(
-                "astrbot_plugin_mi_fitness_health.features.conversation_routing.CONTEXT_DECISION_TIMEOUT_SECONDS",
-                0.01,
-            ):
-                decision = await plugin._decide_context_focus(
-                    "qq:FriendMessage:123", "今天好累"
-                )
+            plugin.context_decision_timeout_seconds = 0.01
+            decision = await plugin._decide_context_focus(
+                "qq:FriendMessage:123", "今天好累"
+            )
             elapsed = asyncio.get_running_loop().time() - started
             release_cleanup.set()
             await asyncio.sleep(0)
@@ -1277,8 +1276,9 @@ class MainLifecycleTest(unittest.TestCase):
 
         self.assertEqual(request.extra_user_content_parts, [])
 
-    def test_casual_llm_context_waits_up_to_two_seconds_for_cloud_refresh(self) -> None:
+    def test_casual_llm_context_uses_configured_cloud_refresh_wait(self) -> None:
         plugin = self._bare_plugin()
+        plugin.natural_query_cloud_wait_seconds = 11
         plugin.care_dialogue_enabled = True
         plugin.allow_health_data_to_llm = True
         plugin._is_private_owner_event = Mock(return_value=True)
@@ -1307,7 +1307,7 @@ class MainLifecycleTest(unittest.TestCase):
             "今天 睡眠 心率",
             wait_for_result=True,
             force_refresh=False,
-            wait_timeout=2.0,
+            wait_timeout=11.0,
         )
 
     def test_explicit_sleep_question_restricts_broader_model_focus(self) -> None:
@@ -1701,7 +1701,7 @@ class MainLifecycleTest(unittest.TestCase):
             "今天 睡眠",
             wait_for_result=True,
             force_refresh=True,
-            wait_timeout=2.0,
+            wait_timeout=5.0,
         )
 
     def test_optional_health_dialogue_draft_stays_in_temporary_context(self) -> None:
@@ -2351,6 +2351,8 @@ class MainLifecycleTest(unittest.TestCase):
                     "allow_proactive_chat_context": "true",
                     "health_check_interval_minutes": "broken",
                     "natural_query_sync_minutes": None,
+                    "context_decision_timeout_seconds": "broken",
+                    "natural_query_cloud_wait_seconds": 999999,
                     "sync_interval_minutes": 999999,
                     "data_retention_days": "bad",
                 },
@@ -2362,8 +2364,24 @@ class MainLifecycleTest(unittest.TestCase):
         self.assertTrue(plugin.allow_proactive_chat_context)
         self.assertEqual(plugin.monitor_interval, 30)
         self.assertEqual(plugin.natural_query_sync_minutes, 15)
+        self.assertEqual(plugin.context_decision_timeout_seconds, 8)
+        self.assertEqual(plugin.natural_query_cloud_wait_seconds, 30)
         self.assertEqual(plugin.sync_interval, 1440)
         self.assertEqual(plugin.data_retention_days, 90)
+
+    def test_dialogue_wait_times_are_configurable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = MiFitnessHealthPlugin(
+                Mock(),
+                {
+                    "database_path": str(Path(directory) / "timeouts.sqlite3"),
+                    "context_decision_timeout_seconds": 12,
+                    "natural_query_cloud_wait_seconds": 18,
+                },
+            )
+
+        self.assertEqual(plugin.context_decision_timeout_seconds, 12)
+        self.assertEqual(plugin.natural_query_cloud_wait_seconds, 18)
 
     def test_failed_manual_sync_does_not_start_cooldown(self) -> None:
         plugin = self._bare_plugin()

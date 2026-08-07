@@ -189,6 +189,9 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
         self.context_decision_provider_id = str(
             config.get("context_decision_provider_id") or ""
         ).strip()
+        self.context_decision_timeout_seconds = _config_int(
+            config, "context_decision_timeout_seconds", 8, 3, 30
+        )
         self.context_decision_message_count = _config_int(
             config, "context_decision_message_count", 8, 0, 20
         )
@@ -239,6 +242,9 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
         )
         self.natural_query_sync_minutes = _config_int(
             config, "natural_query_sync_minutes", 15, 1, 120
+        )
+        self.natural_query_cloud_wait_seconds = _config_int(
+            config, "natural_query_cloud_wait_seconds", 5, 1, 30
         )
         self.sync_days = _config_int(config, "default_sync_days", 7, 1, 90)
         self.sync_interval = _config_int(config, "sync_interval_minutes", 60, 5, 1440)
@@ -570,7 +576,7 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
             focus,
             wait_for_result=True,
             force_refresh=self._wants_fresh_cloud_data(question),
-            wait_timeout=5.0 if health_question else 2.0,
+            wait_timeout=float(self.natural_query_cloud_wait_seconds),
         )
         snapshot = await self.query_service.llm_care_snapshot(
             focus,
@@ -822,6 +828,8 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
             f"主动私聊目标：{'已记录' if private_state else '待所有者先私聊一次'}\n"
             f"对话触发的数据刷新间隔：{self.natural_query_sync_minutes} 分钟\n"
             f"生活数据调用判断：{'已选模型' if self.context_decision_provider_id else '内置规则'}\n"
+            f"判断模型等待上限：{self.context_decision_timeout_seconds} 秒\n"
+            f"对话云端刷新等待上限：{self.natural_query_cloud_wait_seconds} 秒\n"
             f"对话生活数据授权：{'开启' if self.allow_health_data_to_llm else '关闭'}\n"
             f"主动判断私聊上下文授权：{'开启' if self.allow_proactive_chat_context else '关闭'}\n"
             f"本地数据保留：{str(self.data_retention_days) + ' 天' if self.data_retention_days else '不自动清理'}"
