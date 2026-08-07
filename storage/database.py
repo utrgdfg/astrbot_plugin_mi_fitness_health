@@ -1278,8 +1278,10 @@ class Database:
         """Prune one Xiaomi user's health rows and the selected owner's audit rows."""
         if retention_days <= 0:
             return 0
+        # ``retention_days`` includes today: 1 keeps only the current local
+        # calendar day, 7 keeps today plus the previous six local dates.
         cutoff_date_value = datetime.now(user_timezone).date() - timedelta(
-            days=max(1, retention_days)
+            days=max(0, retention_days - 1)
         )
         cutoff_date = cutoff_date_value.isoformat()
         cutoff_timestamp = (

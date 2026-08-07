@@ -508,3 +508,31 @@ class DatabaseTest(unittest.TestCase):
                 "user", (now - timedelta(days=3)).isoformat()
             )
             self.assertEqual([row["record_id"] for row in rows], ["current"])
+
+    def test_one_day_retention_keeps_only_the_current_local_date(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            today = datetime.now(UTC).date()
+            yesterday = today - timedelta(days=1)
+            yesterday_sample = datetime.combine(
+                yesterday, datetime.min.time(), tzinfo=UTC
+            ) + timedelta(hours=12)
+            today_sample = datetime.combine(
+                today, datetime.min.time(), tzinfo=UTC
+            ) + timedelta(minutes=1)
+            database.upsert_heart_rate(
+                "user",
+                HeartRateSample("yesterday", yesterday_sample, 70, "passive", False),
+            )
+            database.upsert_heart_rate(
+                "user",
+                HeartRateSample("today", today_sample, 72, "passive", False),
+            )
+
+            database.prune_user_data("user", 1, UTC)
+
+            rows = database.heart_rates_since(
+                "user", (yesterday_sample - timedelta(minutes=1)).isoformat()
+            )
+            self.assertEqual([row["record_id"] for row in rows], ["today"])

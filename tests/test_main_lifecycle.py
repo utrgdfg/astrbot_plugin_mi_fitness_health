@@ -1898,7 +1898,7 @@ class MainLifecycleTest(unittest.TestCase):
         self.assertTrue(running)
         self.assertEqual(results, [])
         plugin.database.touch_private_owner_session.assert_called_once_with(
-            "123", "qq:FriendMessage:123"
+            "123", "qq:FriendMessage:123", None, True
         )
 
     def test_health_connection_queues_in_background_behind_busy_cloud_operation(
@@ -1945,7 +1945,7 @@ class MainLifecycleTest(unittest.TestCase):
         self.assertEqual(results, [])
         self.assertTrue(running)
         plugin.database.touch_private_owner_session.assert_called_once_with(
-            "123", "qq:FriendMessage:123"
+            "123", "qq:FriendMessage:123", None, True
         )
 
     def test_repeated_health_connection_is_silent_while_check_is_running(

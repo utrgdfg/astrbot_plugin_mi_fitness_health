@@ -682,6 +682,8 @@ class MiFitnessHealthPlugin(ProactiveCareMixin, ConversationRoutingMixin, Star):
                 self.database.touch_private_owner_session,
                 self.owner_platform_id,
                 session,
+                None,
+                True,
             )
         except Exception as error:
             yield event.plain_result(f"健康连接检查无法启动：{redact_error(error)}")
