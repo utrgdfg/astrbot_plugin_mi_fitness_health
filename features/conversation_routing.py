@@ -216,6 +216,27 @@ class ConversationRoutingMixin:
 
     def _fallback_context_decision(self, message: str) -> tuple[bool, str]:
         """Use deterministic cues when no classifier is selected or usable."""
+        compact = message.lower().replace(" ", "")
+        non_owner_contexts = (
+            "压力测试",
+            "性能测试",
+            "睡眠算法",
+            "睡眠排序",
+            "睡眠代码",
+            "心率算法",
+            "心率代码",
+            "健康接口",
+            "健康数据接口",
+            "熬夜主题的故事",
+            "睡眠主题的故事",
+            "我朋友",
+            "我同事",
+            "我同学",
+            "他昨晚",
+            "她昨晚",
+        )
+        if any(cue in compact for cue in non_owner_contexts):
+            return False, ""
         if self._is_health_question(message):
             return True, message
         if self._is_care_conversation(message):

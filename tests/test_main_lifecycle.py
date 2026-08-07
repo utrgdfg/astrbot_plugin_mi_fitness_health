@@ -970,6 +970,33 @@ class MainLifecycleTest(unittest.TestCase):
 
         self.assertEqual(decision, (True, "睡眠 心率"))
 
+    def test_context_model_failure_does_not_expose_data_for_non_owner_contexts(
+        self,
+    ) -> None:
+        examples = (
+            "这个接口的压力测试结果怎么样？",
+            "帮我看看这段睡眠排序代码",
+            "帮我写一个熬夜主题的故事",
+            "昨天我朋友没睡好",
+        )
+        for message in examples:
+            with self.subTest(message=message):
+                plugin = self._bare_plugin()
+                plugin.context_decision_provider_id = "offline-classifier"
+                plugin.context = Mock()
+                plugin.context.llm_generate = AsyncMock(
+                    side_effect=RuntimeError("offline")
+                )
+
+                decision = asyncio.run(
+                    plugin._decide_context_focus(
+                        "qq:FriendMessage:123",
+                        message,
+                    )
+                )
+
+                self.assertEqual(decision, (False, ""))
+
     def test_context_model_hard_timeout_does_not_wait_for_provider_cleanup(
         self,
     ) -> None:

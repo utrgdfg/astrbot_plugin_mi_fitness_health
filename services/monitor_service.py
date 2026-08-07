@@ -164,12 +164,12 @@ class HealthMonitorService:
     async def mark_sent(
         self, finding: MonitorFinding, sent_at: datetime | None = None
     ) -> None:
-        """Start cooldown only after the proactive message was delivered."""
+        """Start cooldown without persisting the private candidate fact."""
         await asyncio.to_thread(
             self.database.add_alert,
             self.owner_platform_id,
             finding.alert_type,
-            finding.message,
+            "已发送深夜活跃关心",
             finding.event_key,
             sent_at,
         )
@@ -177,12 +177,12 @@ class HealthMonitorService:
     async def mark_proactive_sent(
         self, message: str, sent_at: datetime | None = None
     ) -> None:
-        """Record the global cooldown after one combined message is delivered."""
+        """Record global cooldown without retaining the generated message body."""
         await asyncio.to_thread(
             self.database.add_alert,
             self.owner_platform_id,
             "proactive_message",
-            message,
+            "已发送主动关心",
             None,
             sent_at,
         )
