@@ -419,7 +419,7 @@ class AdapterTest(unittest.TestCase):
             result = asyncio.run(SyncService(adapter, database, "user").sync(1))
             self.assertEqual(result["details"]["sleep"]["fetched"], 1)
             snapshot = asyncio.run(query_service.care_snapshot("我昨天睡得怎么样"))
-            self.assertIn("睡眠 430 分钟", snapshot)
+            self.assertIn("睡眠时长 430 分钟", snapshot)
             self.assertIn("评分 82", snapshot)
             self.assertIn(wake_local.date().isoformat(), snapshot)
             self.assertIn(

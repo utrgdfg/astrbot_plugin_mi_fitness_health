@@ -7,7 +7,6 @@ import tempfile
 import unittest
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock
 
 import astrbot_test_stub  # noqa: F401
 from astrbot_plugin_mi_fitness_health.models import (
@@ -78,44 +77,6 @@ class QueryServiceTest(unittest.TestCase):
                     asyncio.run(service.llm_care_snapshot(focus)),
                     "",
                 )
-
-    def test_main_model_overview_is_bounded_and_uses_no_missing_notices(self) -> None:
-        service = QueryService(_RecordingDatabase(), "user", "Asia/Shanghai")
-        service.care_snapshot = AsyncMock(
-            return_value="；".join(f"第{index}项生活数据" for index in range(100))
-        )
-
-        snapshot = asyncio.run(service.llm_overview_snapshot("综合概况", 200))
-
-        service.care_snapshot.assert_awaited_once_with(
-            "综合概况",
-            include_missing_notice=False,
-        )
-        self.assertLessEqual(len(snapshot), 200)
-        self.assertFalse(snapshot.endswith("；"))
-
-    def test_today_sleep_presence_uses_local_wake_date(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            database = Database(Path(directory) / "health.sqlite3")
-            database.initialize()
-            service = QueryService(database, "user", "Asia/Shanghai")
-            wake = datetime.now(service.timezone).replace(second=0, microsecond=0)
-            database.upsert_sleep(
-                "user",
-                SleepSession(
-                    "today",
-                    (wake - timedelta(hours=7)).astimezone(UTC),
-                    wake.astimezone(UTC),
-                    450,
-                    420,
-                    30,
-                    88,
-                ),
-            )
-
-            available = asyncio.run(service.has_sleep_ending_today())
-
-        self.assertTrue(available)
 
     def test_llm_focus_limits_ordinary_requests_to_first_two_categories(self) -> None:
         service = QueryService(_RecordingDatabase(), "user", "Asia/Shanghai")
@@ -410,6 +371,26 @@ class QueryServiceTest(unittest.TestCase):
         self.assertIsNotNone(formatted)
         self.assertIn("入睡 2026-08-06 23:30", formatted)
         self.assertIn("起床 2026-08-07 07:30", formatted)
+        self.assertIn("跨日 是", formatted)
+        self.assertIn("核心参考", formatted)
+
+    def test_sleep_snapshot_disambiguates_17_to_03_cross_day_clock(self) -> None:
+        service = QueryService(_RecordingDatabase(), "user", "Asia/Shanghai")
+
+        formatted = service._format_sleep_row(
+            {
+                "start_at": "2026-08-07T09:00:00+00:00",
+                "end_at": "2026-08-07T19:00:00+00:00",
+                "asleep_minutes": 600,
+                "score": 90,
+            }
+        )
+
+        self.assertIsNotNone(formatted)
+        self.assertIn("睡眠时长 600 分钟（10 小时，核心参考）", formatted)
+        self.assertIn("入睡 2026-08-07 17:00（下午5点，24小时制）", formatted)
+        self.assertIn("起床 2026-08-08 03:00（凌晨3点，24小时制）", formatted)
+        self.assertNotIn("15:00", formatted)
 
     def test_display_timestamps_use_configured_user_timezone(self) -> None:
         """UTC storage timestamps must display as local time, not raw +00:00 text."""

@@ -269,20 +269,6 @@ class ConversationRoutingMixin:
             return mode
         return "local_rules"
 
-    async def _main_model_refresh_focus(self) -> str:
-        """Prioritize today's missing sleep during the usual wake-up window."""
-        local_now = datetime.now(self.query_service.timezone)
-        if 4 <= local_now.hour < 14:
-            try:
-                if not await self.query_service.has_sleep_ending_today():
-                    return "今天 睡眠"
-            except Exception as error:
-                logger.warning(
-                    "[小米运动健康] 检查今日睡眠缓存失败，改用综合缓存刷新（%s）",
-                    type(error).__name__,
-                )
-        return "综合概况"
-
     def _context_decision_is_backing_off(self) -> bool:
         """Return whether recent classifier failures should bypass the provider."""
         retry_at = getattr(self, "_context_decision_retry_at", None)
