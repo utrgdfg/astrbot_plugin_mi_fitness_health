@@ -14,7 +14,7 @@ class PrivacyTest(unittest.TestCase):
         metadata = (Path(__file__).parents[1] / "metadata.yaml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("version: v0.8.4", metadata)
+        self.assertIn("version: v0.8.5", metadata)
         self.assertIn('astrbot_version: ">=4.24.2,<5"', metadata)
 
     def test_sensitive_llm_authorization_defaults_to_false_in_schema(self) -> None:
@@ -29,6 +29,15 @@ class PrivacyTest(unittest.TestCase):
             schema["context_decision_provider_id"]["_special"], "select_provider"
         )
         self.assertEqual(schema["context_decision_provider_id"]["default"], "")
+        self.assertEqual(schema["conversation_health_mode"]["default"], "auto")
+        self.assertIn(
+            "main_model",
+            schema["conversation_health_mode"]["options"],
+        )
+        self.assertEqual(
+            schema["natural_query_cloud_wait_seconds"]["slider"]["min"],
+            0,
+        )
         self.assertEqual(schema["context_decision_prompt"]["type"], "text")
         self.assertTrue(schema["context_decision_prompt"]["default"])
         self.assertEqual(schema["proactive_decision_prompt"]["type"], "text")

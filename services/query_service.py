@@ -50,7 +50,7 @@ class QueryService:
             "代谢",
             "身体年龄",
         ),
-        "sleep": ("睡", "失眠", "入睡", "醒", "熬夜", "通宵"),
+        "sleep": ("睡", "失眠", "入睡", "醒", "熬夜", "通宵", "补觉", "午觉"),
         "spo2": ("血氧", "spo2"),
         "stress": ("压力", "焦虑", "stress"),
     }
@@ -299,6 +299,40 @@ class QueryService:
         """Format one stored timestamp in the configured user timezone."""
         return local_timestamp(value, self.timezone)
 
+    @staticmethod
+    def _sleep_clock_label(value: datetime) -> str:
+        """Make 24-hour sleep times unambiguous to a conversational model."""
+        hour = value.hour
+        if hour == 0:
+            period = "午夜"
+        elif hour < 6:
+            period = "凌晨"
+        elif hour < 12:
+            period = "早上"
+        elif hour < 14:
+            period = "中午"
+        elif hour < 18:
+            period = "下午"
+        else:
+            period = "晚上"
+        hour_12 = hour % 12 or 12
+        minute_text = f"{value.minute:02d}分" if value.minute else ""
+        return (
+            f"{value.strftime('%Y-%m-%d %H:%M')}"
+            f"（{period}{hour_12}点{minute_text}，24小时制）"
+        )
+
+    @staticmethod
+    def _sleep_duration_label(minutes: int) -> str:
+        """Keep exact minutes while adding an easy-to-read duration."""
+        hours, remainder = divmod(minutes, 60)
+        readable = ""
+        if hours:
+            readable += f"{hours} 小时"
+        if remainder:
+            readable += (" " if readable else "") + f"{remainder} 分钟"
+        return f"{minutes} 分钟（{readable or '0 分钟'}，核心参考）"
+
     def _format_sleep_row(self, sleep: dict) -> str | None:
         """Format explicit local sleep boundaries, skipping malformed history."""
         try:
@@ -311,7 +345,9 @@ class QueryService:
             started = started.astimezone(self.timezone)
             ended = ended.astimezone(self.timezone)
             score = sleep["score"] if sleep["score"] is not None else "未提供"
-            asleep_minutes = sleep["asleep_minutes"]
+            asleep_minutes = int(sleep["asleep_minutes"])
+            if not 0 <= asleep_minutes <= 24 * 60:
+                return None
         except (
             KeyError,
             TypeError,
@@ -320,10 +356,13 @@ class QueryService:
             OSError,
         ):
             return None
+        crosses_date = "是" if started.date() != ended.date() else "否"
         return (
-            f"{ended.date()} 睡眠 {asleep_minutes} 分钟"
-            f"（入睡 {started.strftime('%Y-%m-%d %H:%M')}，"
-            f"起床 {ended.strftime('%Y-%m-%d %H:%M')}，评分 {score}）"
+            f"{ended.date()} 睡眠时长 {self._sleep_duration_label(asleep_minutes)}；"
+            f"入睡 {self._sleep_clock_label(started)}；"
+            f"起床 {self._sleep_clock_label(ended)}；跨日 {crosses_date}；评分 {score}。"
+            "判断睡眠情况时以睡眠时长为主，入睡与起床时刻只作辅助；"
+            "凌晨时刻仍按 24 小时制理解"
         )
 
     async def care_snapshot(

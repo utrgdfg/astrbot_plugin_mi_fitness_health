@@ -371,6 +371,26 @@ class QueryServiceTest(unittest.TestCase):
         self.assertIsNotNone(formatted)
         self.assertIn("入睡 2026-08-06 23:30", formatted)
         self.assertIn("起床 2026-08-07 07:30", formatted)
+        self.assertIn("跨日 是", formatted)
+        self.assertIn("核心参考", formatted)
+
+    def test_sleep_snapshot_disambiguates_17_to_03_cross_day_clock(self) -> None:
+        service = QueryService(_RecordingDatabase(), "user", "Asia/Shanghai")
+
+        formatted = service._format_sleep_row(
+            {
+                "start_at": "2026-08-07T09:00:00+00:00",
+                "end_at": "2026-08-07T19:00:00+00:00",
+                "asleep_minutes": 600,
+                "score": 90,
+            }
+        )
+
+        self.assertIsNotNone(formatted)
+        self.assertIn("睡眠时长 600 分钟（10 小时，核心参考）", formatted)
+        self.assertIn("入睡 2026-08-07 17:00（下午5点，24小时制）", formatted)
+        self.assertIn("起床 2026-08-08 03:00（凌晨3点，24小时制）", formatted)
+        self.assertNotIn("15:00", formatted)
 
     def test_display_timestamps_use_configured_user_timezone(self) -> None:
         """UTC storage timestamps must display as local time, not raw +00:00 text."""

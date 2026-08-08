@@ -14,7 +14,7 @@ from ..adapters import MiFitnessAuthenticationError
 from ..utils.async_tools import await_with_hard_timeout
 from ..utils.privacy import redact_error
 
-CONTEXT_DECISION_TIMEOUT_SECONDS = 3.0
+DEFAULT_CONTEXT_DECISION_TIMEOUT_SECONDS = 8.0
 
 DEFAULT_CONTEXT_DECISION_PROMPT = (
     "结合最近对话与当前消息，判断小米运动健康生活数据是否可能让 Bot 的本轮回复"
@@ -256,6 +256,19 @@ class ConversationRoutingMixin:
             return True, self._care_focus(message)
         return False, ""
 
+    def _effective_conversation_health_mode(self) -> str:
+        """Resolve the selected mode while preserving pre-v0.8.5 behavior in auto."""
+        mode = str(getattr(self, "conversation_health_mode", "auto") or "auto")
+        if mode == "auto":
+            return (
+                "decision_model"
+                if getattr(self, "context_decision_provider_id", "")
+                else "local_rules"
+            )
+        if mode in {"main_model", "decision_model", "local_rules"}:
+            return mode
+        return "local_rules"
+
     def _context_decision_is_backing_off(self) -> bool:
         """Return whether recent classifier failures should bypass the provider."""
         retry_at = getattr(self, "_context_decision_retry_at", None)
@@ -395,7 +408,13 @@ class ConversationRoutingMixin:
                         "你只能按指定结构输出一个 JSON 对象。"
                     ),
                 ),
-                CONTEXT_DECISION_TIMEOUT_SECONDS,
+                float(
+                    getattr(
+                        self,
+                        "context_decision_timeout_seconds",
+                        DEFAULT_CONTEXT_DECISION_TIMEOUT_SECONDS,
+                    )
+                ),
                 registry=getattr(self, "_detached_tasks", None),
             )
             decision = self._parse_context_decision(

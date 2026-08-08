@@ -43,6 +43,7 @@ def install_logger_stub() -> None:
 
         command = _decorator
         llm_tool = _decorator
+        on_agent_done = _decorator
         on_llm_request = _decorator
         event_message_type = _decorator
 
@@ -83,12 +84,16 @@ def install_logger_stub() -> None:
             self.extra_user_content_parts = []
             self.contexts = []
             self.conversation = None
+            self.func_tool = None
 
     provider_module.ProviderRequest = ProviderRequest
 
     core_module = ModuleType("astrbot.core")
     agent_module = ModuleType("astrbot.core.agent")
     message_module = ModuleType("astrbot.core.agent.message")
+    run_context_module = ModuleType("astrbot.core.agent.run_context")
+    tool_module = ModuleType("astrbot.core.agent.tool")
+    astr_agent_context_module = ModuleType("astrbot.core.astr_agent_context")
 
     class TextPart:
         def __init__(self, text):
@@ -99,7 +104,67 @@ def install_logger_stub() -> None:
             self._no_save = True
             return self
 
+    class Message:
+        def __init__(self, role, content=None, tool_calls=None, tool_call_id=None):
+            self.role = role
+            self.content = content
+            self.tool_calls = tool_calls
+            self.tool_call_id = tool_call_id
+            self._no_save = False
+
+    class ContextWrapper:
+        def __init__(self, context=None, messages=None):
+            self.context = context
+            self.messages = list(messages or [])
+
+        @classmethod
+        def __class_getitem__(cls, item):
+            del item
+            return cls
+
+    class FunctionTool:
+        def __init__(
+            self,
+            name,
+            description,
+            parameters,
+            handler=None,
+            active=True,
+            is_background_task=False,
+        ):
+            self.name = name
+            self.description = description
+            self.parameters = parameters
+            self.handler = handler
+            self.active = active
+            self.is_background_task = is_background_task
+
+        @classmethod
+        def __class_getitem__(cls, item):
+            del item
+            return cls
+
+    class ToolSet:
+        def __init__(self, tools=None):
+            self.tools = list(tools or [])
+
+        def add_tool(self, tool):
+            self.tools = [item for item in self.tools if item.name != tool.name]
+            self.tools.append(tool)
+
+        def get_tool(self, name):
+            return next((item for item in self.tools if item.name == name), None)
+
+    class AstrAgentContext:
+        pass
+
+    message_module.Message = Message
     message_module.TextPart = TextPart
+    run_context_module.ContextWrapper = ContextWrapper
+    tool_module.FunctionTool = FunctionTool
+    tool_module.ToolExecResult = str
+    tool_module.ToolSet = ToolSet
+    astr_agent_context_module.AstrAgentContext = AstrAgentContext
 
     astrbot_module.api = api_module
     sys.modules["astrbot"] = astrbot_module
@@ -111,6 +176,9 @@ def install_logger_stub() -> None:
     sys.modules["astrbot.core"] = core_module
     sys.modules["astrbot.core.agent"] = agent_module
     sys.modules["astrbot.core.agent.message"] = message_module
+    sys.modules["astrbot.core.agent.run_context"] = run_context_module
+    sys.modules["astrbot.core.agent.tool"] = tool_module
+    sys.modules["astrbot.core.astr_agent_context"] = astr_agent_context_module
 
 
 install_logger_stub()
