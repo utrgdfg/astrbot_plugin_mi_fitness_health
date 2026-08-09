@@ -85,11 +85,22 @@ class MonitorServiceTest(unittest.TestCase):
         )
         sent_at = datetime(2026, 8, 7, 1, 35, tzinfo=UTC)
 
-        asyncio.run(service.mark_sent(finding, sent_at))
-        asyncio.run(service.mark_proactive_sent("今晚早点休息吧", sent_at))
+        asyncio.run(service.mark_sent(finding, sent_at, delivery_confirmed=False))
+        asyncio.run(
+            service.mark_proactive_sent(
+                "今晚早点休息吧", sent_at, delivery_confirmed=False
+            )
+        )
+        asyncio.run(service.confirm_sent(finding, sent_at))
+        asyncio.run(service.confirm_proactive_sent(sent_at))
 
         calls = database.add_alert.call_args_list
-        self.assertEqual(calls[0].args[2], "已发送深夜活跃关心")
-        self.assertEqual(calls[1].args[2], "已发送主动关心")
+        self.assertEqual(calls[0].args[2], "深夜活跃关心发送结果待确认")
+        self.assertEqual(calls[1].args[2], "主动关心发送结果待确认")
+        confirmations = database.confirm_alert_delivery.call_args_list
+        self.assertEqual(confirmations[0].args[2], "已发送深夜活跃关心")
+        self.assertEqual(confirmations[1].args[2], "已发送主动关心")
         self.assertNotIn("01:30", str(calls))
         self.assertNotIn("早点休息", str(calls))
+        self.assertNotIn("01:30", str(confirmations))
+        self.assertNotIn("早点休息", str(confirmations))

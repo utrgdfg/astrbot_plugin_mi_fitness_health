@@ -1,100 +1,249 @@
-"""Main-model health Tool orchestration and temporary prompt construction."""
+"""Private health prompt construction for the ordinary chat model."""
 
 from __future__ import annotations
 
 import html
+import inspect
+from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.message import TextPart
-from astrbot.core.agent.run_context import ContextWrapper
-from astrbot.core.astr_agent_context import AstrAgentContext
+from astrbot.core.agent.tool import ToolSet
+
+_REQUEST_GUARD_MARKER = "_mi_fitness_reject_unadvertised_tool_calls"
+_RUNNER_GUARD_ORIGINAL = "_mi_fitness_unadvertised_tool_guard_original_v1"
+_RUNNER_GUARD_WRAPPER = "_mi_fitness_unadvertised_tool_guard_wrapper_v1"
+_RUNNER_GUARD_TOKEN = "_mi_fitness_unadvertised_tool_guard_token_v1"
+_RUNNER_TOOL_GUARD_ORIGINAL = "_mi_fitness_provider_tool_guard_original_v1"
+_RUNNER_TOOL_GUARD_WRAPPER = "_mi_fitness_provider_tool_guard_wrapper_v1"
+_RUNNER_TOOL_GUARD_TOKEN = "_mi_fitness_provider_tool_guard_token_v1"
+_RUNNER_FORCE_NONE_MARKER = "_mi_fitness_force_none_tools_for_provider"
+_GUARD_IMPLEMENTATION_TOKEN = object()
+
+
+class _RunnerSafeEmptyToolSet(ToolSet):
+    """Remain truthy only long enough for AstrBot skills-like runner reset."""
+
+    _mi_fitness_reject_unadvertised_tool_calls = True
+
+    def __bool__(self) -> bool:
+        return True
+
+    def get_light_tool_set(self) -> ToolSet:
+        """Keep the request marker while exposing no skills-like schemas."""
+        return type(self)()
+
+    def get_param_only_tool_set(self) -> ToolSet:
+        """Keep parser normalization enabled without advertising parameters."""
+        return type(self)()
+
+
+def _is_private_no_tool_request(runner: object) -> bool:
+    """Recognize only requests isolated by this plugin, including skills-like mode."""
+    request = getattr(runner, "req", None)
+    if bool(getattr(request, _REQUEST_GUARD_MARKER, False)):
+        return True
+    candidates = (
+        getattr(request, "func_tool", None),
+        getattr(runner, "_skill_like_raw_tool_set", None),
+    )
+    return any(
+        bool(getattr(candidate, "_mi_fitness_reject_unadvertised_tool_calls", False))
+        for candidate in candidates
+    )
+
+
+def _strip_unadvertised_tool_call(response: object) -> None:
+    """Turn an impossible no-schema tool call into one safe terminal text response."""
+    if not getattr(response, "tools_call_name", None):
+        return
+    response.tools_call_name = []
+    response.tools_call_args = []
+    response.tools_call_ids = []
+    for attribute in ("tools_call_extra_content", "tool_calls_extra_content"):
+        if hasattr(response, attribute):
+            setattr(response, attribute, {})
+    if hasattr(response, "reasoning_signature"):
+        response.reasoning_signature = None
+    if hasattr(response, "raw_completion"):
+        response.raw_completion = None
+    response.role = "assistant"
+    has_text = bool(str(getattr(response, "completion_text", "") or "").strip())
+    result_chain = getattr(response, "result_chain", None)
+    has_result_chain = bool(getattr(result_chain, "chain", None))
+    if not getattr(response, "is_chunk", False) and not (has_text or has_result_chain):
+        response.completion_text = "这次回复没有正常完成，请再说一次。"
+        if hasattr(response, "reasoning_content"):
+            response.reasoning_content = None
+    logger.warning(
+        "Mi Fitness blocked an unadvertised tool call from a no-tool private-context request"
+    )
+
+
+def _install_unadvertised_tool_call_guard() -> bool:
+    """Install a narrow runner guard or fail closed on incompatible AstrBot builds."""
+    try:
+        from astrbot.core.agent.runners.tool_loop_agent_runner import (
+            ToolLoopAgentRunner,
+        )
+    except (ImportError, AttributeError):
+        return False
+
+    try:
+        runner_source = inspect.getsourcefile(ToolLoopAgentRunner)
+        if not runner_source:
+            return False
+        runner_source_path = Path(runner_source).resolve()
+    except Exception:
+        return False
+
+    def validated_original(
+        method_name: str,
+        original_name: str,
+        wrapper_name: str,
+    ) -> tuple[object | None, bool]:
+        current_method = getattr(ToolLoopAgentRunner, method_name, None)
+        installed_method = getattr(ToolLoopAgentRunner, wrapper_name, None)
+        original_method = getattr(ToolLoopAgentRunner, original_name, None)
+        if not callable(current_method):
+            return None, False
+        if installed_method is None and original_method is None:
+            try:
+                method_source_path = Path(current_method.__code__.co_filename).resolve()
+                is_astrbot_method = (
+                    getattr(current_method, "__module__", None)
+                    == "astrbot.core.agent.runners.tool_loop_agent_runner"
+                    and getattr(current_method, "__name__", None) == method_name
+                    and not hasattr(current_method, "__wrapped__")
+                    and method_source_path == runner_source_path
+                )
+            except Exception:
+                return None, False
+            return (current_method, True) if is_astrbot_method else (None, False)
+        if installed_method is current_method and callable(original_method):
+            return original_method, True
+        if current_method is original_method and callable(original_method):
+            return original_method, True
+        return None, False
+
+    response_original, response_valid = validated_original(
+        "_iter_llm_responses",
+        _RUNNER_GUARD_ORIGINAL,
+        _RUNNER_GUARD_WRAPPER,
+    )
+    tool_original, tool_valid = validated_original(
+        "_func_tool_for_provider",
+        _RUNNER_TOOL_GUARD_ORIGINAL,
+        _RUNNER_TOOL_GUARD_WRAPPER,
+    )
+    response_current = getattr(ToolLoopAgentRunner, "_iter_llm_responses", None)
+    tool_current = getattr(ToolLoopAgentRunner, "_func_tool_for_provider", None)
+    response_installed = getattr(ToolLoopAgentRunner, _RUNNER_GUARD_WRAPPER, None)
+    tool_installed = getattr(ToolLoopAgentRunner, _RUNNER_TOOL_GUARD_WRAPPER, None)
+    response_token = getattr(ToolLoopAgentRunner, _RUNNER_GUARD_TOKEN, None)
+    tool_token = getattr(ToolLoopAgentRunner, _RUNNER_TOOL_GUARD_TOKEN, None)
+    if (
+        response_installed is response_current
+        and tool_installed is tool_current
+        and response_token is _GUARD_IMPLEMENTATION_TOKEN
+        and tool_token is _GUARD_IMPLEMENTATION_TOKEN
+    ):
+        return True
+    if not response_valid or not tool_valid:
+        logger.warning(
+            "Mi Fitness detected another runner patch after its privacy guard; "
+            "skipping private health context for this turn"
+        )
+        return False
+
+    async def guarded_responses(runner, *args, **kwargs):
+        private_no_tool_request = _is_private_no_tool_request(runner)
+        request = getattr(runner, "req", None)
+        provider_config = getattr(
+            getattr(runner, "provider", None), "provider_config", None
+        )
+        hide_tools_from_gemini = (
+            private_no_tool_request
+            and request is not None
+            and isinstance(provider_config, dict)
+            and provider_config.get("type") == "googlegenai_chat_completion"
+        )
+        responses = response_original(runner, *args, **kwargs)
+        while True:
+            if hide_tools_from_gemini:
+                previous_force_none = getattr(runner, _RUNNER_FORCE_NONE_MARKER, None)
+                setattr(runner, _RUNNER_FORCE_NONE_MARKER, True)
+            try:
+                response = await anext(responses)
+            except StopAsyncIteration:
+                return
+            finally:
+                if hide_tools_from_gemini:
+                    if previous_force_none is None:
+                        try:
+                            delattr(runner, _RUNNER_FORCE_NONE_MARKER)
+                        except AttributeError:
+                            pass
+                    else:
+                        setattr(runner, _RUNNER_FORCE_NONE_MARKER, previous_force_none)
+            if private_no_tool_request:
+                _strip_unadvertised_tool_call(response)
+            yield response
+
+    def guarded_provider_tools(runner, *args, **kwargs):
+        if _is_private_no_tool_request(runner):
+            if bool(getattr(runner, _RUNNER_FORCE_NONE_MARKER, False)):
+                return None
+            # Never trust req.func_tool here: a later hook or the runner's
+            # max-step handling may replace it with real tools or None.
+            return _RunnerSafeEmptyToolSet()
+        return tool_original(runner, *args, **kwargs)
+
+    previous_values = {
+        name: getattr(ToolLoopAgentRunner, name, None)
+        for name in (
+            "_iter_llm_responses",
+            "_func_tool_for_provider",
+            _RUNNER_GUARD_ORIGINAL,
+            _RUNNER_GUARD_WRAPPER,
+            _RUNNER_GUARD_TOKEN,
+            _RUNNER_TOOL_GUARD_ORIGINAL,
+            _RUNNER_TOOL_GUARD_WRAPPER,
+            _RUNNER_TOOL_GUARD_TOKEN,
+        )
+    }
+    missing_names = {
+        name for name in previous_values if not hasattr(ToolLoopAgentRunner, name)
+    }
+    try:
+        setattr(ToolLoopAgentRunner, _RUNNER_GUARD_ORIGINAL, response_original)
+        setattr(ToolLoopAgentRunner, _RUNNER_TOOL_GUARD_ORIGINAL, tool_original)
+        setattr(ToolLoopAgentRunner, "_iter_llm_responses", guarded_responses)
+        setattr(ToolLoopAgentRunner, "_func_tool_for_provider", guarded_provider_tools)
+        setattr(ToolLoopAgentRunner, _RUNNER_GUARD_WRAPPER, guarded_responses)
+        setattr(ToolLoopAgentRunner, _RUNNER_TOOL_GUARD_WRAPPER, guarded_provider_tools)
+        setattr(ToolLoopAgentRunner, _RUNNER_GUARD_TOKEN, _GUARD_IMPLEMENTATION_TOKEN)
+        setattr(
+            ToolLoopAgentRunner,
+            _RUNNER_TOOL_GUARD_TOKEN,
+            _GUARD_IMPLEMENTATION_TOKEN,
+        )
+    except Exception:
+        for name, value in previous_values.items():
+            if name in missing_names:
+                try:
+                    delattr(ToolLoopAgentRunner, name)
+                except AttributeError:
+                    pass
+            else:
+                setattr(ToolLoopAgentRunner, name, value)
+        return False
+    return True
 
 
 class MainModelToolingMixin:
-    """Prepare minimal health context only after the current model requests it."""
-
-    @staticmethod
-    def _message_text(message: object) -> str:
-        """Read bounded plain text from one runtime message, excluding media."""
-        content = getattr(message, "content", None)
-        if isinstance(content, str):
-            return " ".join(content.split())[:600]
-        if not isinstance(content, list):
-            return ""
-        parts = [
-            str(getattr(part, "text", "") or "")
-            for part in content
-            if isinstance(getattr(part, "text", None), str)
-        ]
-        return " ".join(" ".join(parts).split())[:600]
-
-    def _main_model_tool_focus(
-        self,
-        context: ContextWrapper[AstrAgentContext],
-        current_message: str,
-    ) -> str | None:
-        """Infer a small data slice after the main model has requested the tool."""
-        candidates = [current_message]
-        for message in reversed(context.messages):
-            if getattr(message, "role", None) not in {"user", "assistant"}:
-                continue
-            text = self._message_text(message)
-            if text and text != current_message:
-                candidates.append(text)
-            if len(candidates) >= 9:
-                break
-
-        focus = ""
-        for text in candidates:
-            focus = self.query_service.normalize_llm_focus(text)
-            if focus:
-                break
-            if self._is_care_conversation(text):
-                focus = self._care_focus(text)
-                break
-        if not focus:
-            return None
-        return self._normalize_context_focus_for_message(current_message, focus)
-
-    async def _load_main_model_private_context(
-        self, context: ContextWrapper[AstrAgentContext]
-    ) -> str | None:
-        """Refresh only after a main-model tool call and prepare temporary context."""
-        event = context.context.event
-        if (
-            not self.care_dialogue_enabled
-            or not self.allow_health_data_to_llm
-            or not self._is_private_owner_event(event)
-        ):
-            return None
-        current_message = self._sanitize_focus(event.get_message_str())
-        focus = self._main_model_tool_focus(context, current_message)
-        if not focus:
-            return None
-        wait_seconds = float(self.natural_query_cloud_wait_seconds)
-        await self._refresh_for_natural_question(
-            focus,
-            wait_for_result=wait_seconds > 0,
-            force_refresh=self._wants_fresh_cloud_data(current_message),
-            wait_timeout=max(wait_seconds, 0.001),
-        )
-        snapshot = await self.query_service.llm_care_snapshot(
-            focus,
-            include_missing_notice=False,
-        )
-        if not snapshot:
-            return None
-        last_sync = await self.query_service.sync_at_for_focus(focus)
-        displayed_last_sync = (
-            self.query_service.display_timestamp(last_sync) if last_sync else None
-        )
-        return self._build_private_life_context(
-            snapshot,
-            displayed_last_sync,
-            None,
-            health_question=self._is_health_question(current_message),
-        )
+    """Build and inject the smallest authorized, non-persistent data slice."""
 
     @staticmethod
     def _build_private_life_context(
@@ -151,13 +300,26 @@ class MainModelToolingMixin:
         )
 
     @staticmethod
-    def _append_temporary_context(req: ProviderRequest, text: str) -> None:
+    def _append_temporary_context(req: ProviderRequest, text: str) -> bool:
         """Append provider-only context or fail closed on unsupported AstrBot builds."""
+        if not _install_unadvertised_tool_call_guard():
+            logger.warning(
+                "[小米运动健康] 当前 AstrBot 不支持私密请求隔离，"
+                "为避免生活数据进入工具日志，本次未注入数据"
+            )
+            return False
         part = TextPart(text=text)
         if not hasattr(part, "mark_as_temp"):
             logger.warning(
                 "[小米运动健康] 当前 AstrBot 不支持临时上下文，"
                 "为避免生活数据进入会话历史，本次未注入数据"
             )
-            return
+            return False
         req.extra_user_content_parts.append(part.mark_as_temp())
+        return True
+
+    @staticmethod
+    def _disable_request_tools(req: ProviderRequest) -> None:
+        """Hide every tool without triggering AstrBot's skills-like early return."""
+        setattr(req, _REQUEST_GUARD_MARKER, True)
+        req.func_tool = _RunnerSafeEmptyToolSet()

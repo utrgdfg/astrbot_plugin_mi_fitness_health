@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+import threading
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime, time, timedelta, tzinfo
 from pathlib import Path
@@ -24,6 +25,7 @@ OWNERSHIP_KEY = "application"
 OWNERSHIP_VALUE = "astrbot_plugin_mi_fitness_health"
 CUSTOM_DATABASE_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
 SQLITE_HEADER = b"SQLite format 3\x00"
+_INITIALIZE_LOCK = threading.Lock()
 
 
 class Database:
@@ -40,6 +42,11 @@ class Database:
         self.custom_path = custom_path
 
     def initialize(self) -> None:
+        """Serialize schema creation across plugin instances in this process."""
+        with _INITIALIZE_LOCK:
+            self._initialize_schema()
+
+    def _initialize_schema(self) -> None:
         """Create the schema and apply forward-only migrations."""
         if self.custom_path:
             self._validate_custom_path()
@@ -719,16 +726,19 @@ class Database:
         if self.custom_path:
             self._assert_no_link_components()
         connection = sqlite3.connect(self.path, timeout=30.0)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=30000")
-        connection.execute("PRAGMA secure_delete=ON")
         try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout=30000")
+            connection.execute("PRAGMA secure_delete=ON")
             if self.custom_path and not allow_unclaimed:
                 self._assert_owned_connection(connection)
             yield connection
             connection.commit()
         except Exception:
-            connection.rollback()
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
             raise
         finally:
             connection.close()
@@ -1307,10 +1317,10 @@ class Database:
         message: str,
         event_key: str | None = None,
         created_at: datetime | None = None,
-    ) -> None:
-        """Persist a non-diagnostic alert audit record."""
+    ) -> bool:
+        """Persist an audit record and report whether this caller inserted it."""
         with self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """INSERT OR IGNORE INTO alerts(
                        alert_type,created_at,message,event_key,owner_platform_id
                    ) VALUES(?,?,?,?,?)""",
@@ -1322,6 +1332,32 @@ class Database:
                     owner_platform_id,
                 ),
             )
+            return cursor.rowcount > 0
+
+    def confirm_alert_delivery(
+        self,
+        owner_platform_id: str,
+        alert_type: str,
+        message: str,
+        created_at: datetime,
+        event_key: str | None = None,
+    ) -> None:
+        """Upgrade one pre-send audit row without creating a second cooldown row."""
+        created_at_text = created_at.astimezone(UTC).isoformat()
+        with self._connect() as connection:
+            if event_key is None:
+                connection.execute(
+                    """UPDATE alerts SET message=?
+                       WHERE owner_platform_id=? AND alert_type=?
+                         AND event_key IS NULL AND created_at=?""",
+                    (message, owner_platform_id, alert_type, created_at_text),
+                )
+            else:
+                connection.execute(
+                    """UPDATE alerts SET message=?
+                       WHERE owner_platform_id=? AND alert_type=? AND event_key=?""",
+                    (message, owner_platform_id, alert_type, event_key),
+                )
 
     def last_alert_at(self, owner_platform_id: str, alert_type: str) -> str | None:
         """Return the latest alert timestamp for cooldown enforcement."""

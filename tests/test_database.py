@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -22,6 +23,26 @@ from astrbot_plugin_mi_fitness_health.storage.database import (
 
 class DatabaseTest(unittest.TestCase):
     """Verify migration and precise insert/update accounting."""
+
+    def test_concurrent_initialization_is_serialized_and_closes_every_handle(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "health.sqlite3"
+
+            def initialize_one(_index: int) -> None:
+                Database(path).initialize()
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                list(executor.map(initialize_one, range(16)))
+
+            with closing(sqlite3.connect(path)) as connection:
+                self.assertEqual(
+                    connection.execute("SELECT version FROM schema_version").fetchone()[
+                        0
+                    ],
+                    9,
+                )
 
     def test_database_records_ownership_and_protects_generic_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -480,6 +501,60 @@ class DatabaseTest(unittest.TestCase):
 
             self.assertIsNone(database.last_alert_at("owner-a", "proactive_message"))
             self.assertIsNotNone(database.last_alert_at("owner-b", "proactive_message"))
+
+    def test_confirm_alert_delivery_updates_reserved_row_without_duplication(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "health.sqlite3"
+            database = Database(path)
+            database.initialize()
+            attempted_at = datetime(2026, 8, 9, 2, 0, tzinfo=UTC)
+            database.add_alert(
+                "owner",
+                "proactive_message",
+                "主动关心发送结果待确认",
+                created_at=attempted_at,
+            )
+
+            database.confirm_alert_delivery(
+                "owner",
+                "proactive_message",
+                "已发送主动关心",
+                attempted_at,
+            )
+
+            with closing(sqlite3.connect(path)) as connection:
+                rows = connection.execute(
+                    """SELECT message FROM alerts
+                       WHERE owner_platform_id=? AND alert_type=?""",
+                    ("owner", "proactive_message"),
+                ).fetchall()
+            self.assertEqual(rows, [("已发送主动关心",)])
+
+    def test_alert_event_reservation_has_one_atomic_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            attempted_at = datetime(2026, 8, 9, 2, 0, tzinfo=UTC)
+
+            first = database.add_alert(
+                "owner",
+                "late_night_activity",
+                "深夜活跃关心发送结果待确认",
+                "2026-08-09",
+                attempted_at,
+            )
+            second = database.add_alert(
+                "owner",
+                "late_night_activity",
+                "深夜活跃关心发送结果待确认",
+                "2026-08-09",
+                attempted_at,
+            )
+
+            self.assertTrue(first)
+            self.assertFalse(second)
 
     def test_retention_honors_values_shorter_than_seven_days(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

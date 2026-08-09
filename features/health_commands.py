@@ -4,21 +4,53 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from functools import wraps
 
 from astrbot.api.event import AstrMessageEvent
 
+from ..services.sync_service import SyncServiceBusyError
 from ..utils import measurement_text, today_text
 from ..utils.privacy import redact_error
+
+
+def _tracked_foreground_operation(method):
+    """Keep mutating command tasks inside the plugin reload barrier."""
+
+    @wraps(method)
+    async def wrapped(self, *args, **kwargs):
+        task = self._begin_foreground_operation()
+        if task is None:
+            event = args[0] if args else kwargs.get("event")
+            if event is not None:
+                event.stop_event()
+                yield event.plain_result("插件正在重载，请稍后再试。")
+            return
+        try:
+            async for result in method(self, *args, **kwargs):
+                yield result
+        finally:
+            self._end_foreground_operation(task)
+
+    return wrapped
 
 
 class HealthCommandsMixin:
     """Provide owner-only commands for health data and maintenance."""
 
     _CONVERSATION_HEALTH_MODE_LABELS = {
-        "main_model": "主模型直接判断",
+        "main_model": "当前主模型预判",
         "decision_model": "独立判断模型",
         "local_rules": "本地轻量规则",
     }
+
+    def _connection_check_active(self) -> bool:
+        """Return whether a background Xiaomi connection still owns cloud work."""
+        connection_task = getattr(self, "_connection_task", None)
+        cloud_task = getattr(self, "_connection_cloud_task", None)
+        return bool(
+            (connection_task is not None and not connection_task.done())
+            or (cloud_task is not None and not cloud_task.done())
+        )
 
     async def health_help(self, event: AstrMessageEvent):
         """Show commands and privacy boundaries."""
@@ -58,7 +90,13 @@ class HealthCommandsMixin:
         if self._local_data_clear_in_progress:
             yield event.plain_result("本地健康数据正在清除，请稍后再检查连接。")
             return
+        if self._terminating or self._terminated:
+            return
         if self._connection_task is not None and not self._connection_task.done():
+            return
+        cloud_task = getattr(self, "_connection_cloud_task", None)
+        if cloud_task is not None and not cloud_task.done():
+            yield event.plain_result("上一次健康连接仍在收尾，请稍后再试。")
             return
         if self._maintenance_lock.locked():
             yield event.plain_result("当前有健康数据操作正在进行，请稍后再检查连接。")
@@ -67,28 +105,27 @@ class HealthCommandsMixin:
         async with self._maintenance_lock:
             if self._local_data_clear_in_progress:
                 error_text = "本地健康数据正在清除，请稍后再检查连接。"
+            elif self._terminating or self._terminated:
+                return
             elif self._connection_task is not None and not self._connection_task.done():
                 return
+            elif (
+                getattr(self, "_connection_cloud_task", None) is not None
+                and not self._connection_cloud_task.done()
+            ):
+                error_text = "上一次健康连接仍在收尾，请稍后再试。"
             else:
                 session = str(event.unified_msg_origin)
-                try:
-                    await asyncio.to_thread(
-                        self.database.touch_private_owner_session,
-                        self.owner_platform_id,
-                        session,
-                        None,
-                        True,
-                    )
-                except Exception as error:
-                    error_text = f"健康连接检查无法启动：{redact_error(error)}"
-                else:
-                    self._connection_task = asyncio.create_task(
-                        self._connection_worker(session),
-                        name=f"{self.name}-connection-check",
-                    )
+                if self._terminating or self._terminated:
+                    return
+                self._connection_task = asyncio.create_task(
+                    self._connection_worker(session),
+                    name=f"{self.name}-connection-check",
+                )
         if error_text:
             yield event.plain_result(error_text)
 
+    @_tracked_foreground_operation
     async def health_sync(self, event: AstrMessageEvent):
         """Manually synchronize a bounded recent cloud-data window."""
         async for result in self._guard(event):
@@ -97,6 +134,9 @@ class HealthCommandsMixin:
         if self._local_data_clear_in_progress:
             yield event.plain_result("本地健康数据正在清除，请稍后再同步。")
             return
+        if self._connection_check_active():
+            yield event.plain_result("健康连接仍在检查或收尾，请稍后再同步。")
+            return
         if self._maintenance_lock.locked():
             yield event.plain_result("当前有健康数据操作正在进行，请稍后再同步。")
             return
@@ -104,6 +144,8 @@ class HealthCommandsMixin:
         async with self._maintenance_lock:
             if self._local_data_clear_in_progress:
                 reply = "本地健康数据正在清除，请稍后再同步。"
+            elif self._connection_check_active():
+                reply = "健康连接仍在检查或收尾，请稍后再同步。"
             else:
                 now = datetime.now(UTC)
                 if self._last_manual_sync_at is not None:
@@ -177,6 +219,7 @@ class HealthCommandsMixin:
             + await self.query_service.care_snapshot("睡眠 血氧 压力")
         )
 
+    @_tracked_foreground_operation
     async def health_diagnose(self, event: AstrMessageEvent):
         """Probe cloud keys safely to diagnose data availability, not the user."""
         async for result in self._guard(event):
@@ -185,12 +228,17 @@ class HealthCommandsMixin:
         if self._local_data_clear_in_progress:
             yield event.plain_result("本地健康数据正在清除，请稍后再诊断。")
             return
+        if self._connection_check_active():
+            yield event.plain_result("健康连接仍在检查或收尾，请稍后再诊断。")
+            return
         if self._maintenance_lock.locked():
             yield event.plain_result("当前有健康数据操作正在进行，请稍后再诊断。")
             return
         async with self._maintenance_lock:
             if self._local_data_clear_in_progress:
                 reply = "本地健康数据正在清除，请稍后再诊断。"
+            elif self._connection_check_active():
+                reply = "健康连接仍在检查或收尾，请稍后再诊断。"
             else:
                 try:
                     data = await self.sync_service.probe_data_keys(
@@ -252,6 +300,7 @@ class HealthCommandsMixin:
             f"本地数据保留：{str(self.data_retention_days) + ' 天' if self.data_retention_days else '不自动清理'}"
         )
 
+    @_tracked_foreground_operation
     async def clear_local_health_data(
         self, event: AstrMessageEvent, confirmation: str = ""
     ):
@@ -275,6 +324,7 @@ class HealthCommandsMixin:
         if self._maintenance_lock.locked():
             yield event.plain_result("当前有健康数据操作正在进行，请稍后再清除。")
             return
+        deleted: int | None = None
         self._local_data_clear_in_progress = True
         try:
             async with self._maintenance_lock:
@@ -289,11 +339,17 @@ class HealthCommandsMixin:
                 self._pending_owner_activity = None
                 self._pending_refresh_types.clear()
                 self._active_refresh_types.clear()
-                deleted = await self.sync_service.purge_local_data(
-                    self.owner_platform_id
-                )
+                try:
+                    deleted = await self.sync_service.purge_local_data(
+                        self.owner_platform_id
+                    )
+                except SyncServiceBusyError:
+                    pass
         finally:
             self._local_data_clear_in_progress = False
+        if deleted is None:
+            yield event.plain_result("小米云连接或同步仍在收尾，请稍后再清除本地数据。")
+            return
         yield event.plain_result(
             f"本地健康缓存已清除，共删除 {deleted} 条本地记录。"
             "小米云端数据和插件配置凭证未被修改。"

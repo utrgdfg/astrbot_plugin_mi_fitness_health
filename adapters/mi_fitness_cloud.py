@@ -756,8 +756,12 @@ class MiFitnessCloudAdapter(DataAdapter):
                 if isinstance(result.get("next_key"), str)
                 else None
             )
-            if not result.get("has_more") or not next_cursor:
+            if not result.get("has_more"):
                 return records
+            if not next_cursor:
+                raise RuntimeError(
+                    f"小米健康云 {key} 数据分页缺少有效游标；已拒绝不完整的同步结果。"
+                )
             if next_cursor in seen_cursors:
                 raise RuntimeError(
                     f"小米健康云 {key} 数据分页游标重复；已拒绝不完整的同步结果。"
@@ -1237,6 +1241,9 @@ class MiFitnessCloudAdapter(DataAdapter):
         self, start: datetime, end: datetime
     ) -> AsyncIterator[SleepSession]:
         """Yield completed sessions even when Xiaomi indexes today's summary later."""
+        requested_start = (
+            start.replace(tzinfo=UTC) if start.tzinfo is None else start.astimezone(UTC)
+        )
         requested_end = (
             end.replace(tzinfo=UTC) if end.tzinfo is None else end.astimezone(UTC)
         )
@@ -1260,7 +1267,7 @@ class MiFitnessCloudAdapter(DataAdapter):
             )
             if begin_time is None or finish_time is None:
                 continue
-            if finish_time > requested_end:
+            if not requested_start <= finish_time <= requested_end:
                 continue
             begin = int(begin_time.timestamp())
             finish = int(finish_time.timestamp())

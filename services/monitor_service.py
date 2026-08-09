@@ -162,27 +162,59 @@ class HealthMonitorService:
         )
 
     async def mark_sent(
-        self, finding: MonitorFinding, sent_at: datetime | None = None
-    ) -> None:
+        self,
+        finding: MonitorFinding,
+        sent_at: datetime | None = None,
+        *,
+        delivery_confirmed: bool = True,
+    ) -> bool:
         """Start cooldown without persisting the private candidate fact."""
-        await asyncio.to_thread(
+        return await asyncio.to_thread(
             self.database.add_alert,
             self.owner_platform_id,
             finding.alert_type,
-            "已发送深夜活跃关心",
+            "已发送深夜活跃关心"
+            if delivery_confirmed
+            else "深夜活跃关心发送结果待确认",
             finding.event_key,
             sent_at,
         )
 
     async def mark_proactive_sent(
-        self, message: str, sent_at: datetime | None = None
-    ) -> None:
+        self,
+        message: str,
+        sent_at: datetime | None = None,
+        *,
+        delivery_confirmed: bool = True,
+    ) -> bool:
         """Record global cooldown without retaining the generated message body."""
-        await asyncio.to_thread(
+        return await asyncio.to_thread(
             self.database.add_alert,
             self.owner_platform_id,
             "proactive_message",
-            "已发送主动关心",
+            "已发送主动关心" if delivery_confirmed else "主动关心发送结果待确认",
             None,
             sent_at,
+        )
+
+    async def confirm_sent(self, finding: MonitorFinding, sent_at: datetime) -> None:
+        """Upgrade a pre-send finding audit after the platform acknowledges it."""
+        await asyncio.to_thread(
+            self.database.confirm_alert_delivery,
+            self.owner_platform_id,
+            finding.alert_type,
+            "已发送深夜活跃关心",
+            sent_at,
+            finding.event_key,
+        )
+
+    async def confirm_proactive_sent(self, sent_at: datetime) -> None:
+        """Upgrade the matching global cooldown audit without adding a row."""
+        await asyncio.to_thread(
+            self.database.confirm_alert_delivery,
+            self.owner_platform_id,
+            "proactive_message",
+            "已发送主动关心",
+            sent_at,
+            None,
         )

@@ -10,7 +10,7 @@
 
 - `main.py` 是唯一 AstrBot 插件入口，只负责配置装配、任务生命周期、事件钩子与命令注册；不要在这里继续堆叠可独立测试的对话策略。
 - `features/conversation_routing.py` 负责普通私聊的语义判断、数据类别选择、缓存新鲜度检查和按需刷新。
-- `features/main_model_tooling.py` 负责主模型调用后的最小数据范围推断、云端等待和临时提示构造；`features/private_health_tool.py` 负责请求级零参数 Tool 与历史清理。
+- `features/main_model_tooling.py` 负责私密摘要的边界转义、临时提示构造和请求级工具隔离。
 - `features/proactive_care.py` 负责受限私聊上下文读取、主动关心发送判断和自然措辞生成。
 - `services/` 负责同步、查询与非诊断状态判断，`adapters/` 负责小米协议，`storage/` 负责 SQLite 持久化，`utils/` 保持无状态公共工具。
 
@@ -34,7 +34,7 @@ AstrBot 的 `filter` 装饰器继续只放在 `main.py` 的插件类上，功能
 
 - 连接、诊断、同步和本地清除共用一个操作锁。
 - 自然对话的并发刷新会合并为单个后台任务。
-- `conversation_health_mode` 提供兼容、主模型、独立判断模型和本地规则四种配置值。主模型模式只为本轮已授权请求挂载零参数 Tool；主模型先基于原会话决定是否调用，调用后插件才从当前消息和最近文字上下文推断最小数据范围、检查缓存并按需刷新，不调用独立判断或草稿模型。独立判断模型默认使用 8 秒硬超时，配置项 `context_decision_timeout_seconds` 可在 3～30 秒之间调整。对话云端刷新默认等待 5 秒，`natural_query_cloud_wait_seconds` 可在 0～30 秒之间调整；0 表示只创建后台任务。可选补充回复草稿模型仍使用 2 秒硬超时。判断、草稿或刷新超时均不会取消底层后台同步或阻断正常回复。
+- `conversation_health_mode` 提供兼容、当前主模型预判、独立判断模型和本地规则四种配置值。当前主模型预判先用本轮实际选择的文字 Provider 对受限文字上下文做一次不含健康数据的 JSON 分类；明显无关的对话由本地候选门控直接跳过，图片回退 Provider 无法从官方 hook 确认时 fail closed。分类命中后插件才检查缓存并按需刷新，不调用草稿模型。独立判断模型与主模型预判共用 8 秒默认硬超时，配置项 `context_decision_timeout_seconds` 可在 3～30 秒之间调整。对话云端刷新默认等待 5 秒，`natural_query_cloud_wait_seconds` 可在 0～30 秒之间调整；0 表示只创建后台任务。可选补充回复草稿模型仍使用 2 秒硬超时。判断、草稿或刷新超时均不会取消底层后台同步或阻断正常回复。
 - 操作锁或后台连接任务繁忙时，自然对话立即使用缓存或跳过数据，不创建排队的云端任务。`/健康连接` 在命令流水线中静默启动后台检查，只发送最终结果，并设有包含锁等待的 120 秒上限。
 - 主动关心检查和普通自动同步是独立任务；前者只评估本地状态，不发起小米云同步，后者仅在用户明确开启时运行。
 - 深夜规则只产生候选 finding；发送前必须再经过上下文模型的严格布尔闸门，模型失败或上下文为空时 fail closed。
@@ -53,7 +53,7 @@ AstrBot 的 `filter` 装饰器继续只放在 `main.py` 的插件类上，功能
 - 所有健康数据入口同时校验使用者 UID、Bot ID 和私聊消息类型。
 - 群聊不会返回健康数据。
 - 向 LLM 提供健康摘要需要用户显式开启授权，默认关闭；主动判断读取最近私聊使用另一项独立且默认关闭的授权。
-- 主模型模式的请求级零参数 Tool 只返回不含健康值的固定安全状态，因此 AstrBot 的 Tool Result 日志不含原始摘要。真实摘要附加到本轮用户消息的 `mark_as_temp()` 内容块中；`on_agent_done` 在历史持久化前移除该临时块、本插件的 Tool 调用规划消息和安全 Tool Result。独立判断与本地规则仍在 `on_llm_request` 中注入临时摘要；不支持临时内容的运行时会安全跳过。
+- 所有模式都只在 `on_llm_request` 阶段通过 `mark_as_temp()` 内容块注入最小摘要；成功注入后使用兼容 AstrBot `skills_like` reset 的空 ToolSet 隔离本轮其他工具。`main_model_tooling` 会以请求标记包装 `ToolLoopAgentRunner._iter_llm_responses`，只在本插件的无工具私密请求中、任何 runner 日志/Trace/上下文追加之前清除 Provider 凭空返回的工具调用；普通请求和其他插件工具不受影响。无法安装该兼容保护、不支持临时内容、使用非 `local` Agent 执行器、配置任何 `fallback_chat_models`，或当前 Provider 启用服务端原生搜索/代码工具时均 fail closed，不注入数据并保留原工具。
 - 用户关注文本会被限长、压缩为单行并作为不可信数据隔离。
 - 获得独立私聊授权后，深夜闸门可通过 AstrBot 官方会话管理器、平台消息历史管理器或混合模式读取当前所有者私聊。平台历史记录必须携带可核验的消息类型或完整 UMO，否则丢弃并安全回退。配置范围为 0～50 条，总量仍限制为 4000 字符；可选择排除 assistant/Bot 文本，图片、工具结果和系统消息始终不会传入。刚收到但尚未落入 AstrBot 历史的所有者文本仅在插件内存中短暂补充，不写入插件 SQLite。
 - 配置补充回复草稿模型或人格后，相关最小化健康摘要会额外发送给该草稿使用的 Provider；配置页与 README 会明确披露第三方模型可能处理或保存这些内容。
@@ -66,11 +66,11 @@ AstrBot 的 `filter` 装饰器继续只放在 `main.py` 的插件类上，功能
 
 配置文件仍使用稳定的内部键名，以兼容已有安装；README 和配置页说明使用面向用户的中文名称。模型与人格字段使用 AstrBot 官方的 `select_provider` 和 `select_persona` 选择器。
 
-`conversation_health_mode=auto` 用于兼容升级：已有 `context_decision_provider_id` 时解析为独立判断模型，否则解析为本地规则。显式 `main_model` 只在每次已授权的所有者私聊中挂载请求级 Tool；未被主模型调用时不检查缓存、不访问小米云、不发送摘要。Tool 被调用后只向当前主模型临时提供相关摘要；没有摘要时返回不含技术细节的安全空状态。显式 `decision_model` 缺少 Provider 时 fail closed，不暗中退回本地规则。
+`conversation_health_mode=auto` 用于兼容升级：已有 `context_decision_provider_id` 时解析为独立判断模型，否则解析为本地规则。显式 `main_model` 对候选生活话题调用本轮文字 Provider 做分类，分类命中后才检查缓存、访问小米云并向正式回复临时提供相关摘要；图片回退 Provider 身份无法确认、Provider 为空或分类失败时均 fail closed。显式 `decision_model` 缺少 Provider 时同样 fail closed，不暗中退回本地规则。
 
 `context_decision_provider_id` 仅用于独立判断模型。它接收当前所有者私聊中经过长度限制和边界转义的最近 `user`/可选 `assistant` 纯文本，以及当前消息，并返回严格 JSON；不接收 system、tool、多媒体内容或本轮刚读取的小米生活数据。历史条数由 `context_decision_message_count` 控制（0～20，总量最多 4000 字符），是否包含 Bot 回复由 `context_decision_include_bot_messages` 控制。有效结果最多选择两个数据类别，随后仍由插件根据每类缓存的新鲜度决定是否联网刷新。模型失败、超时、输出无效或处于 1、5、15 分钟退避期间均静默跳过本轮健康上下文，不由本地规则接管；有效结果立即清零退避。原始消息的强制刷新意图单独保留，不依赖模型生成的焦点文本。
 
-`context_decision_prompt` 和 `proactive_decision_prompt` 使用官方 `text` 配置类型。前者定义生活数据调用任务：主模型模式将它作为零参数 Tool 固定安全说明后的补充文字，独立判断模式则继续固定追加允许类别、JSON 输出协议、提示注入隔离和 fail-closed 规则。后者定义深夜候选时机的发送取舍；配置提示词不能移除代码层的权限与隐私边界。
+`context_decision_prompt` 和 `proactive_decision_prompt` 使用官方 `text` 配置类型。前者定义生活数据语义分类任务；当前主模型预判和独立判断模式都会固定追加允许类别、JSON 输出协议、提示注入隔离和 fail-closed 规则。后者定义深夜候选时机的发送取舍；配置提示词不能移除代码层的权限与隐私边界。
 
 `proactive_context_source` 支持 `conversation_history`、`platform_message_history` 与 `hybrid`。平台流水通过 AstrBot 官方 `message_history_manager.get()` 读取；记录必须包含精确匹配的完整 UMO 或 `FriendMessage` 类型，不能证明私聊来源的记录不会进入模型。读取失败或为空时回退到当前对话历史。`proactive_context_prompt` 支持 `{{context_lines}}` 占位符，缺少占位符时插件会自动在末尾追加序列化上下文。
 

@@ -20,6 +20,11 @@ DIAGNOSTIC_TIMEOUT_SECONDS = 100
 INCREMENTAL_OVERLAP_DAYS = 2
 MAX_RECORDS_PER_DATASET = 100_000
 KNOWN_REGIONS = frozenset({"cn", "ru", "de", "i2", "sg", "us"})
+PURGE_LOCK_TIMEOUT_SECONDS = 1.0
+
+
+class SyncServiceBusyError(RuntimeError):
+    """A destructive local purge could not safely acquire the service lock."""
 
 
 class SyncService:
@@ -115,13 +120,28 @@ class SyncService:
                 await self._await_completion(self.adapter.close())
                 raise
 
-    async def purge_local_data(self, owner_platform_id: str) -> int:
-        """Serialize an explicit owner purge with cloud/database operations."""
-        async with self.lock:
+    async def purge_local_data(
+        self,
+        owner_platform_id: str,
+        *,
+        lock_timeout: float = PURGE_LOCK_TIMEOUT_SECONDS,
+    ) -> int:
+        """Atomically acquire the service lock or fail fast before a local purge."""
+        try:
+            await asyncio.wait_for(
+                self.lock.acquire(), timeout=max(0.001, float(lock_timeout))
+            )
+        except TimeoutError as error:
+            raise SyncServiceBusyError(
+                "小米云连接或同步仍在收尾；请稍后再清除本地数据。"
+            ) from error
+        try:
             self._ensure_open()
             return await self._await_database(
                 self.database.purge_user_data, self.user_id, owner_platform_id
             )
+        finally:
+            self.lock.release()
 
     async def close(self) -> None:
         """Wait for active operations, then close the shared cloud client exactly once."""
@@ -346,10 +366,13 @@ class SyncService:
                 await asyncio.shield(task)
             except asyncio.CancelledError:
                 cancelled = True
-        result = task.result()
         if cancelled:
+            try:
+                task.exception()
+            except asyncio.CancelledError:
+                pass
             raise asyncio.CancelledError
-        return result
+        return task.result()
 
     async def _await_database(self, operation, *args):
         """Never abandon a running SQLite thread or release the operation lock early."""

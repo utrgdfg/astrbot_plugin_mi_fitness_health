@@ -19,6 +19,7 @@ from ..utils.privacy import redact_error
 HEALTH_DIALOGUE_TIMEOUT_SECONDS = 2.0
 PROACTIVE_DECISION_TIMEOUT_SECONDS = 10.0
 PROACTIVE_REPLY_TIMEOUT_SECONDS = 25.0
+PROACTIVE_SEND_TIMEOUT_SECONDS = 20.0
 
 DEFAULT_PROACTIVE_DECISION_PROMPT = (
     "判断此刻是否值得主动给用户发送一条深夜关心。这是发送前的最后一道闸门，"
@@ -45,8 +46,10 @@ SAFE_CROSS_PROVIDER_STYLE_PROMPT = (
 class ProactiveCareMixin:
     """Provide private-context collection and proactive-reply decisions."""
 
-    async def _send_private_message(self, text: str) -> bool:
+    async def _send_private_message(self, text: str) -> bool | None:
         """Send a proactive result only to the last observed owner private chat."""
+        if getattr(self, "_terminating", False) or getattr(self, "_terminated", False):
+            return False
         state = await asyncio.to_thread(
             self.database.private_owner_session, self.owner_platform_id
         )
@@ -59,9 +62,14 @@ class ProactiveCareMixin:
             )
             return False
         try:
-            return await self.context.send_message(
-                session, MessageChain().message(text)
+            return await await_with_hard_timeout(
+                self.context.send_message(session, MessageChain().message(text)),
+                PROACTIVE_SEND_TIMEOUT_SECONDS,
+                registry=getattr(self, "_detached_tasks", None),
             )
+        except TimeoutError:
+            logger.warning("Mi Fitness proactive message delivery timed out")
+            return None
         except Exception as error:
             logger.warning(
                 "Mi Fitness proactive message was not delivered: %s",
@@ -544,6 +552,8 @@ class ProactiveCareMixin:
             provider_id = await self._health_provider_id(
                 session, self.proactive_reminder_provider_id
             )
+            if self._provider_native_tools_are_unsafe(provider_id):
+                return False
             response = await await_with_hard_timeout(
                 self.context.llm_generate(
                     chat_provider_id=provider_id,
@@ -609,6 +619,8 @@ class ProactiveCareMixin:
             provider_id = await self._health_provider_id(
                 session, self.proactive_reminder_provider_id
             )
+            if self._provider_native_tools_are_unsafe(provider_id):
+                return None
             response = await await_with_hard_timeout(
                 self.context.llm_generate(
                     chat_provider_id=provider_id,
@@ -673,6 +685,8 @@ class ProactiveCareMixin:
             provider_id = await self._health_provider_id(
                 session, self.health_dialogue_provider_id
             )
+            if self._provider_native_tools_are_unsafe(provider_id):
+                return None
             response = await await_with_hard_timeout(
                 self.context.llm_generate(
                     chat_provider_id=provider_id,

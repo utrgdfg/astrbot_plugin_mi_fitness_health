@@ -128,7 +128,9 @@ class AdapterTest(unittest.TestCase):
         async def collect():
             adapter = FixtureAdapter("user", "token", "cn")
             now = datetime.now(UTC)
-            return [row async for row in adapter.iter_sleep(now, now)]
+            return [
+                row async for row in adapter.iter_sleep(now - timedelta(days=1), now)
+            ]
 
         records = asyncio.run(collect())
         self.assertEqual(len(records), 1)
@@ -572,6 +574,43 @@ class AdapterTest(unittest.TestCase):
             )
         self.assertEqual(adapter.calls, 100)
 
+    def test_has_more_without_valid_cursor_rejects_partial_records(self) -> None:
+        """A declared next page must never be silently treated as complete."""
+
+        for key in ("steps", "sleep"):
+            for next_key in (None, "", 123):
+                with self.subTest(key=key, next_key=next_key):
+
+                    class FixtureAdapter(MiFitnessCloudAdapter):
+                        async def _fetch_page(
+                            self,
+                            data_key,
+                            start,
+                            end,
+                            region,
+                            cursor=None,
+                            *,
+                            budget=None,
+                        ):
+                            return {
+                                "data_list": [
+                                    {"time": 1784692800, "value": {"steps": 12}}
+                                ],
+                                "has_more": True,
+                                "next_key": next_key,
+                            }
+
+                    adapter = FixtureAdapter("user", "token", "cn")
+                    with self.assertRaisesRegex(RuntimeError, "缺少有效游标"):
+                        asyncio.run(
+                            adapter._fetch_key(
+                                key,
+                                datetime.now(UTC),
+                                datetime.now(UTC),
+                                "cn",
+                            )
+                        )
+
     def test_zero_sleep_and_stress_scores_are_preserved(self) -> None:
         """Valid zero scores must not be treated as missing by truthiness fallbacks."""
 
@@ -671,8 +710,10 @@ class AdapterTest(unittest.TestCase):
     def test_sleep_fetches_later_daily_index_but_rejects_future_session(self) -> None:
         """Today's completed sleep may be indexed later without admitting future data."""
         requested_end = datetime(2026, 8, 1, 7, 0, tzinfo=UTC)
+        requested_start = requested_end - timedelta(days=3)
         completed_wake = requested_end - timedelta(minutes=15)
         future_wake = requested_end + timedelta(hours=2)
+        stale_wake = requested_start - timedelta(minutes=1)
         observed_end: list[datetime] = []
 
         class FixtureAdapter(MiFitnessCloudAdapter):
@@ -697,15 +738,22 @@ class AdapterTest(unittest.TestCase):
                             "wake_up_time": int(future_wake.timestamp()),
                         },
                     },
+                    {
+                        "time": int(stale_wake.timestamp()),
+                        "value": {
+                            "bedtime": int(
+                                (stale_wake - timedelta(hours=7)).timestamp()
+                            ),
+                            "wake_up_time": int(stale_wake.timestamp()),
+                        },
+                    },
                 ]
 
         async def collect():
             adapter = FixtureAdapter("user", "token", "cn")
             return [
                 record
-                async for record in adapter.iter_sleep(
-                    requested_end - timedelta(days=3), requested_end
-                )
+                async for record in adapter.iter_sleep(requested_start, requested_end)
             ]
 
         records = asyncio.run(collect())
