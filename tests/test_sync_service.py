@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import astrbot_test_stub  # noqa: F401
 from astrbot_plugin_mi_fitness_health.adapters import MiFitnessRateLimitError
-from astrbot_plugin_mi_fitness_health.models import SleepSession
+from astrbot_plugin_mi_fitness_health.models import DailyActivity, SleepSession
 from astrbot_plugin_mi_fitness_health.services import SyncService
 from astrbot_plugin_mi_fitness_health.storage import Database
 
@@ -187,6 +187,7 @@ class SyncServiceTest(unittest.TestCase):
 
             asyncio.run(service.initialize())
             self.assertEqual(adapter.region, "cn")
+            self.assertFalse(service.activity_timezone_reset)
 
             database.set_metadata(service._region_metadata_key(), "CN")
             invalid_adapter = _RecordingAdapter()
@@ -203,6 +204,25 @@ class SyncServiceTest(unittest.TestCase):
             self.assertEqual(
                 database.get_metadata(explicit_service._region_metadata_key()), "us"
             )
+
+    def test_initialize_reports_activity_reset_after_timezone_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            now = datetime.now(UTC)
+            database.ensure_activity_timezone("user", "Asia/Shanghai")
+            database.upsert_activity(
+                "user", DailyActivity(now.date().isoformat(), 100, 80, 10, now)
+            )
+            database.update_sync_state("user", "daily_activity", now)
+            adapter = _RecordingAdapter()
+            service = SyncService(adapter, database, "user")
+
+            asyncio.run(service.initialize())
+
+            self.assertTrue(service.activity_timezone_reset)
+            self.assertIsNone(database.today_activity("user", now.date().isoformat()))
+            self.assertIsNone(database.latest_sync_at("user", ("daily_activity",)))
 
     def test_every_connection_path_persists_a_discovered_region(self) -> None:
         class DiscoveringAdapter(_RecordingAdapter):

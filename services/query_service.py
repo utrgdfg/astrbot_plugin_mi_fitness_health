@@ -92,13 +92,20 @@ class QueryService:
         """
         self.database = database
         self.user_id = user_id
+        requested_timezone = str(timezone_name or "Asia/Shanghai").strip()
+        requested_timezone = requested_timezone or "Asia/Shanghai"
+        self.invalid_timezone_name: str | None = None
+        self.timezone_fallback_used = False
         try:
-            self.timezone = ZoneInfo(timezone_name or "Asia/Shanghai")
+            self.timezone = ZoneInfo(requested_timezone)
         except Exception:
             # Windows/Python builds may not bundle the IANA tz database.  A
             # fixed +08:00 fallback keeps the documented default usable; DST
             # aware zones remain available whenever ZoneInfo can load them.
             self.timezone = timezone(timedelta(hours=8), name="Asia/Shanghai")
+            self.timezone_fallback_used = True
+            if requested_timezone != "Asia/Shanghai":
+                self.invalid_timezone_name = " ".join(requested_timezone.split())[:128]
 
     def today(self) -> str:
         """Return user's local date."""
@@ -511,9 +518,12 @@ class QueryService:
                     f"{activity['date']} 活动：{activity['steps']} 步，{activity['distance_m']:.0f} m，活动消耗 {activity['active_kcal']:.0f} kcal"
                 )
         if requested["heart"] and rates:
-            values = [row["bpm"] for row in rates]
+            ordinary_rates = [row for row in rates if not bool(row["is_workout"])]
+            summarized_rates = ordinary_rates or rates
+            values = [row["bpm"] for row in summarized_rates]
+            label = heart_label if ordinary_rates else f"{heart_label}运动期间"
             parts.append(
-                f"{heart_label}心率：最新 {rates[0]['bpm']} bpm（数据采集时间 {self.display_timestamp(rates[0]['timestamp'])}），平均 {sum(values) / len(values):.0f}，最高 {max(values)}，最低 {min(values)}"
+                f"{label}心率：最新 {summarized_rates[0]['bpm']} bpm（数据采集时间 {self.display_timestamp(summarized_rates[0]['timestamp'])}），平均 {sum(values) / len(values):.0f}，最高 {max(values)}，最低 {min(values)}"
             )
         if requested["body"] and measurement:
             parts.append(

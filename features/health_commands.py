@@ -236,9 +236,15 @@ class HealthCommandsMixin:
         mode_label = self._CONVERSATION_HEALTH_MODE_LABELS[
             self._effective_conversation_health_mode()
         ]
+        timezone_status = str(self.query_service.timezone)
+        if getattr(self.query_service, "invalid_timezone_name", None):
+            timezone_status += "（配置无效，已回退）"
+        elif getattr(self.query_service, "timezone_fallback_used", False):
+            timezone_status += "（固定偏移回退）"
         yield event.plain_result(
             f"健康状态\n连接：{'已连接' if self.adapter.is_connected() else '未连接/待验证'}\n"
-            f"区域：{self.adapter.region or '自动探测'}\n最近同步完成时间：{self.query_service.display_timestamp(last_sync) if last_sync else '暂无'}\n"
+            f"区域：{self.adapter.region or '自动探测'}\n用户时区：{timezone_status}\n"
+            f"最近同步完成时间：{self.query_service.display_timestamp(last_sync) if last_sync else '暂无'}\n"
             f"平台实例校验：{'已启用' if self.owner_platform_instance_id else '未配置（健康功能禁用）'}\n"
             f"后台同步：{background_status}\n"
             f"主动关心检查：{'运行中' if monitor_running else '未运行'}"

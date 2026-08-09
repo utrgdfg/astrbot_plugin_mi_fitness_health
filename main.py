@@ -167,6 +167,16 @@ class MiFitnessHealthPlugin(
             self.user_id,
             str(config.get("user_timezone") or "Asia/Shanghai"),
         )
+        if self.query_service.invalid_timezone_name:
+            logger.warning(
+                "[小米运动健康] 配置项 user_timezone 不是有效的 IANA 时区，"
+                "已安全回退为 Asia/Shanghai"
+            )
+        elif self.query_service.timezone_fallback_used:
+            logger.warning(
+                "[小米运动健康] 当前 Python 环境无法加载 IANA 时区数据，"
+                "已使用 Asia/Shanghai 固定偏移回退"
+            )
         self.adapter = MiFitnessCloudAdapter(
             self.user_id,
             self.pass_token,
@@ -308,6 +318,11 @@ class MiFitnessHealthPlugin(
     async def initialize(self) -> None:
         """Migrate the database and schedule the configured background loops."""
         await self.sync_service.initialize()
+        if self.sync_service.activity_timezone_reset:
+            logger.warning(
+                "[小米运动健康] 用户时区已变化，旧活动日汇总及其同步状态已清除；"
+                "下次同步会按新时区重建近期活动数据"
+            )
         self._ensure_background_task()
 
     def _ensure_background_task(self) -> None:

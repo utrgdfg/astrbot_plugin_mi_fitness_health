@@ -7,6 +7,7 @@ import base64
 import binascii
 import hashlib
 import json
+import math
 import os
 import struct
 from collections import defaultdict
@@ -58,6 +59,9 @@ API_RESPONSE_MAX_BYTES = 8 * 1024 * 1024
 MAX_DATASET_BYTES = 64 * 1024 * 1024
 MAX_LOGIN_FIELD_LENGTH = 8192
 MAX_SESSION_COOKIE_BYTES = 32 * 1024
+SESSION_COOKIE_NAMES = frozenset(
+    {"serviceToken", "yetAnotherServiceToken", "cUserId", "userId"}
+)
 MAX_RATE_LIMIT_DELAY_SECONDS = 15 * 60
 DEFAULT_RATE_LIMIT_DELAY_SECONDS = 60
 DIAGNOSTIC_TIMEOUT_SECONDS = 120
@@ -439,9 +443,15 @@ class MiFitnessCloudAdapter(DataAdapter):
                 "小米健康云会话授权失败；请重新获取 Cookie。"
             )
         redirected.raise_for_status()
+        session_cookies: dict[str, str] = {}
+        for header in redirected.headers.get_list("set-cookie"):
+            pair = header.split(";", 1)[0]
+            name, separator, cookie_value = pair.partition("=")
+            name = name.strip()
+            if separator and name in SESSION_COOKIE_NAMES and cookie_value:
+                session_cookies[name] = cookie_value
         candidate_cookies = "; ".join(
-            value.split(";", 1)[0]
-            for value in redirected.headers.get_list("set-cookie")
+            f"{name}={value}" for name, value in session_cookies.items()
         )
         if not candidate_cookies:
             raise MiFitnessAuthenticationError(
@@ -749,28 +759,14 @@ class MiFitnessCloudAdapter(DataAdapter):
             if not result.get("has_more") or not next_cursor:
                 return records
             if next_cursor in seen_cursors:
-                if key in {"steps", "calories"}:
-                    raise RuntimeError(
-                        f"小米健康云 {key} 数据分页游标重复；已拒绝不完整的每日汇总。"
-                    )
-                logger.warning(
-                    "Mi Fitness pagination stopped at a repeated cursor for key %s; keeping %d unique records",
-                    key,
-                    len(records),
+                raise RuntimeError(
+                    f"小米健康云 {key} 数据分页游标重复；已拒绝不完整的同步结果。"
                 )
-                return records
             seen_cursors.add(next_cursor)
             cursor = next_cursor
-        if key in {"steps", "calories"}:
-            raise RuntimeError(
-                f"小米健康云 {key} 数据分页超过安全上限；已拒绝不完整的每日汇总。"
-            )
-        logger.warning(
-            "Mi Fitness pagination reached the safety limit for key %s; keeping %d unique records",
-            key,
-            len(records),
+        raise RuntimeError(
+            f"小米健康云 {key} 数据分页超过安全上限；已拒绝不完整的同步结果。"
         )
-        return records
 
     async def _discover_region(self, budget: _OperationBudget | None = None) -> str:
         """Probe only first pages and stop at the first region with usable data."""
@@ -933,6 +929,30 @@ class MiFitnessCloudAdapter(DataAdapter):
         return number if minimum <= number <= maximum else None
 
     @staticmethod
+    def _boolish(value: object) -> bool | None:
+        """Parse only explicit boolean-like cloud values."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            try:
+                number = float(value)
+            except (OverflowError, ValueError):
+                return None
+            return number != 0 if math.isfinite(number) else None
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "yes", "on"}:
+                return True
+            if normalized in {"false", "no", "off", ""}:
+                return False
+            try:
+                number = float(normalized)
+                return number != 0 if math.isfinite(number) else None
+            except (OverflowError, ValueError):
+                return None
+        return None
+
+    @staticmethod
     def _timestamp_datetime(value: object) -> datetime | None:
         """Convert a cloud timestamp only when it falls in a reasonable range."""
         try:
@@ -951,16 +971,37 @@ class MiFitnessCloudAdapter(DataAdapter):
             return None
 
     @staticmethod
-    def _record_time(item: dict) -> tuple[datetime, str] | None:
+    def _record_time(
+        item: dict, preferred_time: object | None = None
+    ) -> tuple[datetime, str] | None:
         """Return UTC collection time and cloud-zone local calendar date."""
         try:
             offset = int(item.get("zone_offset", 0))
         except (TypeError, ValueError, OverflowError):
             return None
-        utc_time = MiFitnessCloudAdapter._timestamp_datetime(item.get("time"))
+        utc_time = MiFitnessCloudAdapter._timestamp_datetime(preferred_time)
+        if utc_time is None:
+            utc_time = MiFitnessCloudAdapter._timestamp_datetime(item.get("time"))
         if utc_time is None or abs(offset) > 15 * 3600:
             return None
         return utc_time, (utc_time + timedelta(seconds=offset)).date().isoformat()
+
+    @staticmethod
+    def _in_requested_range(
+        timestamp: datetime, start: datetime, end: datetime
+    ) -> bool:
+        """Return whether a non-sleep sample lies in the inclusive UTC request range."""
+
+        def as_utc(value: datetime) -> datetime:
+            return (
+                value.replace(tzinfo=UTC)
+                if value.tzinfo is None
+                else value.astimezone(UTC)
+            )
+
+        return as_utc(start) <= timestamp <= as_utc(end) and timestamp <= datetime.now(
+            UTC
+        )
 
     async def iter_daily_activity(
         self, start: datetime, end: datetime
@@ -978,6 +1019,8 @@ class MiFitnessCloudAdapter(DataAdapter):
                 if not record_time:
                     continue
                 timestamp, _ = record_time
+                if not self._in_requested_range(timestamp, start, end):
+                    continue
                 date = timestamp.astimezone(self.user_timezone).date().isoformat()
                 bucket_key = (date, int(timestamp.timestamp()) // 60)
                 value = self._value(item)
@@ -1057,8 +1100,9 @@ class MiFitnessCloudAdapter(DataAdapter):
         """
         operation_budget = _OperationBudget()
         errors: list[RuntimeError] = []
-        seen: set[tuple[int, int]] = set()
-        found = False
+        response_errors: list[MiFitnessResponseError] = []
+        successful_keys = 0
+        seen: set[tuple[str, int]] = set()
         for key in PRIMARY_HEART_RATE_KEYS + RESTING_HEART_RATE_KEYS:
             try:
                 samples = self._parse_heart_rate_records(
@@ -1070,6 +1114,8 @@ class MiFitnessCloudAdapter(DataAdapter):
                         budget=operation_budget,
                     ),
                     is_resting=key in RESTING_HEART_RATE_KEYS,
+                    start=start,
+                    end=end,
                 )
             except MiFitnessAuthenticationError:
                 raise
@@ -1077,30 +1123,48 @@ class MiFitnessCloudAdapter(DataAdapter):
                 raise
             except MiFitnessBudgetError:
                 raise
+            except MiFitnessResponseError as error:
+                response_errors.append(error)
+                continue
             except RuntimeError as error:
                 errors.append(error)
                 continue
+            successful_keys += 1
             for sample in samples:
-                identity = (int(sample.timestamp.timestamp()), sample.bpm)
+                source = "resting_hr" if key in RESTING_HEART_RATE_KEYS else "hr"
+                identity = (source, int(sample.timestamp.timestamp()))
                 if identity in seen:
                     continue
                 seen.add(identity)
-                found = True
                 yield sample
-        if not found and errors:
+        if errors:
             raise errors[-1]
+        if successful_keys == 0 and response_errors:
+            raise response_errors[-1]
 
     def _parse_heart_rate_records(
-        self, records: list[dict], *, is_resting: bool
+        self,
+        records: list[dict],
+        *,
+        is_resting: bool,
+        start: datetime | None = None,
+        end: datetime | None = None,
     ) -> list[HeartRateSample]:
         """Validate one candidate key before it can suppress another alias."""
-        samples: list[HeartRateSample] = []
+        samples: dict[int, HeartRateSample] = {}
         for item in records:
-            record_time = self._record_time(item)
+            value = self._value(item)
+            preferred_time = value.get("date_time") if is_resting else None
+            record_time = self._record_time(item, preferred_time)
             if not record_time:
                 continue
             timestamp, _ = record_time
-            value = self._value(item)
+            if (
+                start is not None
+                and end is not None
+                and not self._in_requested_range(timestamp, start, end)
+            ):
+                continue
             bpm = self._number(
                 value.get("bpm")
                 or value.get("heart_rate")
@@ -1114,22 +1178,28 @@ class MiFitnessCloudAdapter(DataAdapter):
             if bpm is None:
                 continue
             kind = (
-                "passive"
-                if is_resting or str(value.get("type", "0")) == "0"
-                else "active"
+                "active"
+                if not is_resting and self._boolish(value.get("type")) is True
+                else "passive"
             )
-            is_workout = bool(value.get("workout_id") or value.get("is_workout"))
+            workout_id = value.get("workout_id")
+            workout_id_flag = self._boolish(workout_id)
+            if workout_id_flag is None and isinstance(workout_id, str):
+                workout_id_flag = bool(workout_id.strip())
+            is_workout = (
+                workout_id_flag is True
+                or self._boolish(value.get("is_workout")) is True
+            )
             source = "resting_hr" if is_resting else "hr"
-            samples.append(
-                HeartRateSample(
-                    f"mi_fitness_{source}_{int(timestamp.timestamp())}_{int(bpm)}",
-                    timestamp,
-                    int(bpm),
-                    kind,
-                    is_workout,
-                )
+            timestamp_seconds = int(timestamp.timestamp())
+            samples[timestamp_seconds] = HeartRateSample(
+                f"mi_fitness_{source}_{timestamp_seconds}",
+                timestamp,
+                int(bpm),
+                kind,
+                is_workout,
             )
-        return samples
+        return list(samples.values())
 
     async def iter_body_measurements(
         self, start: datetime, end: datetime
@@ -1140,6 +1210,8 @@ class MiFitnessCloudAdapter(DataAdapter):
             if not record_time:
                 continue
             timestamp, _ = record_time
+            if not self._in_requested_range(timestamp, start, end):
+                continue
             value = self._value(item)
             weight = self._number(value.get("weight"), 10, 400)
             if weight is None:
@@ -1220,8 +1292,9 @@ class MiFitnessCloudAdapter(DataAdapter):
         """Yield validated blood-oxygen records; unsupported keys simply return no rows."""
         operation_budget = _OperationBudget()
         errors: list[RuntimeError] = []
+        response_errors: list[MiFitnessResponseError] = []
+        successful_keys = 0
         seen_timestamps: set[int] = set()
-        found = False
         for key in SPO2_KEYS:
             try:
                 samples = self._parse_spo2_records(
@@ -1231,7 +1304,9 @@ class MiFitnessCloudAdapter(DataAdapter):
                         end,
                         self.region,
                         budget=operation_budget,
-                    )
+                    ),
+                    start=start,
+                    end=end,
                 )
             except MiFitnessAuthenticationError:
                 raise
@@ -1239,25 +1314,36 @@ class MiFitnessCloudAdapter(DataAdapter):
                 raise
             except MiFitnessBudgetError:
                 raise
+            except MiFitnessResponseError as error:
+                response_errors.append(error)
+                continue
             except RuntimeError as error:
                 errors.append(error)
                 continue
+            successful_keys += 1
             for sample in samples:
                 timestamp = int(sample.timestamp.timestamp())
                 if timestamp in seen_timestamps:
                     continue
                 seen_timestamps.add(timestamp)
-                found = True
                 yield sample
-        if not found and errors:
+        if errors:
             raise errors[-1]
+        if successful_keys == 0 and response_errors:
+            raise response_errors[-1]
 
-    def _parse_spo2_records(self, records: list[dict]) -> list[SpO2Sample]:
+    def _parse_spo2_records(
+        self,
+        records: list[dict],
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> list[SpO2Sample]:
         """Return only validated samples from one SpO2 candidate key."""
         samples: list[SpO2Sample] = []
         for item in records:
-            record_time = self._record_time(item)
             value = self._value(item)
+            record_time = self._record_time(item, value.get("time"))
             raw_percent = value.get("spo2")
             if raw_percent is None:
                 raw_percent = value.get("blood_oxygen")
@@ -1268,6 +1354,12 @@ class MiFitnessCloudAdapter(DataAdapter):
             percent = self._number(raw_percent, 70, 100)
             if record_time and percent is not None:
                 timestamp, _ = record_time
+                if (
+                    start is not None
+                    and end is not None
+                    and not self._in_requested_range(timestamp, start, end)
+                ):
+                    continue
                 samples.append(
                     SpO2Sample(
                         f"mi_fitness_spo2_{int(timestamp.timestamp())}",
@@ -1282,8 +1374,8 @@ class MiFitnessCloudAdapter(DataAdapter):
     ) -> AsyncIterator[StressSample]:
         """Yield validated stress scores; no medical inference is made here."""
         for item in await self._fetch_key("stress", start, end, self.region):
-            time = self._record_time(item)
             value = self._value(item)
+            time = self._record_time(item, value.get("time"))
             stress_value = value.get("stress")
             if stress_value is None:
                 stress_value = value.get("score")
@@ -1292,6 +1384,8 @@ class MiFitnessCloudAdapter(DataAdapter):
             score = self._number(stress_value, 0, 100)
             if time and score is not None:
                 timestamp, _ = time
+                if not self._in_requested_range(timestamp, start, end):
+                    continue
                 yield StressSample(
                     f"mi_fitness_stress_{int(timestamp.timestamp())}",
                     timestamp,

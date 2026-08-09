@@ -58,12 +58,18 @@ class SyncService:
         self.owner_platform_id = owner_platform_id
         self.lock = asyncio.Lock()
         self._closed = False
+        self.activity_timezone_reset = False
         self._region_was_configured = bool(str(getattr(adapter, "region", "")).strip())
 
     async def initialize(self) -> None:
         """Initialize schema outside AstrBot's event loop."""
         self._ensure_open()
         await self._await_database(self.database.initialize)
+        self.activity_timezone_reset = await self._await_database(
+            self.database.ensure_activity_timezone,
+            self.user_id,
+            str(getattr(self.adapter, "user_timezone", UTC)),
+        )
         await self._await_database(
             self.database.prune_user_data,
             self.user_id,

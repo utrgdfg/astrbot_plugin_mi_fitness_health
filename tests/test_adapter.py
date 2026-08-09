@@ -43,6 +43,11 @@ def _http_response(
     )
 
 
+def _range_around(timestamp: int, seconds: int = 120) -> tuple[datetime, datetime]:
+    center = datetime.fromtimestamp(timestamp, UTC)
+    return center - timedelta(seconds=seconds), center + timedelta(seconds=seconds)
+
+
 class _StreamContext:
     """Minimal async context manager returned by AsyncClient.stream."""
 
@@ -146,12 +151,8 @@ class AdapterTest(unittest.TestCase):
 
         async def collect():
             adapter = FixtureAdapter("user", "token", "cn")
-            return [
-                record
-                async for record in adapter.iter_heart_rate(
-                    datetime.now(UTC), datetime.now(UTC)
-                )
-            ]
+            start, end = _range_around(1784692800)
+            return [record async for record in adapter.iter_heart_rate(start, end)]
 
         records = asyncio.run(collect())
         self.assertEqual(len(records), 1)
@@ -164,27 +165,249 @@ class AdapterTest(unittest.TestCase):
         class FixtureAdapter(MiFitnessCloudAdapter):
             async def _fetch_key(self, key, start, end, region, *, budget=None):
                 if key == "heart_rate":
-                    raise RuntimeError("unsupported key")
-                return [
-                    {
-                        "time": 1784692800000,
-                        "zone_offset": 28800,
-                        "value": '{"heart_rate":68}',
-                    }
-                ]
+                    raise MiFitnessResponseError("unsupported key")
+                if key == "resting_heart_rate":
+                    return [
+                        {
+                            "time": 1784692800000,
+                            "zone_offset": 28800,
+                            "value": '{"heart_rate":68}',
+                        }
+                    ]
+                return []
 
         async def collect():
             adapter = FixtureAdapter("user", "token", "cn")
-            return [
-                record
-                async for record in adapter.iter_heart_rate(
-                    datetime.now(UTC), datetime.now(UTC)
-                )
-            ]
+            start, end = _range_around(1784692800)
+            return [record async for record in adapter.iter_heart_rate(start, end)]
 
         records = asyncio.run(collect())
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0].bpm, 68)
+
+    def test_heart_rate_identity_uses_source_and_timestamp_not_bpm(self) -> None:
+        timestamp = 1784692800
+
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
+                if key == "heart_rate":
+                    return [
+                        {"time": timestamp, "value": {"bpm": 70}},
+                        {"time": timestamp, "value": {"bpm": 72}},
+                    ]
+                if key == "resting_heart_rate":
+                    return [{"time": timestamp, "value": {"bpm": 60}}]
+                return []
+
+        async def collect():
+            start, end = _range_around(timestamp)
+            return [
+                row
+                async for row in FixtureAdapter("user", "token", "cn").iter_heart_rate(
+                    start, end
+                )
+            ]
+
+        records = asyncio.run(collect())
+        self.assertEqual([record.bpm for record in records], [72, 60])
+        self.assertEqual(
+            [record.record_id for record in records],
+            [
+                f"mi_fitness_hr_{timestamp}",
+                f"mi_fitness_resting_hr_{timestamp}",
+            ],
+        )
+
+    def test_all_heart_rate_alias_response_errors_fail_the_dataset(self) -> None:
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
+                raise MiFitnessResponseError(f"unsupported {key}")
+
+        async def collect():
+            now = datetime.now(UTC)
+            return [
+                row
+                async for row in FixtureAdapter("user", "token", "cn").iter_heart_rate(
+                    now - timedelta(minutes=1), now
+                )
+            ]
+
+        with self.assertRaises(MiFitnessResponseError):
+            asyncio.run(collect())
+
+    def test_heart_rate_boolish_fields_do_not_use_python_truthiness(self) -> None:
+        adapter = MiFitnessCloudAdapter("user", "token", "cn")
+        samples = adapter._parse_heart_rate_records(
+            [
+                {
+                    "time": 1784692800,
+                    "value": {
+                        "bpm": 70,
+                        "type": False,
+                        "workout_id": "0",
+                        "is_workout": "false",
+                    },
+                },
+                {
+                    "time": 1784692860,
+                    "value": {
+                        "bpm": 71,
+                        "type": "false",
+                        "workout_id": 0,
+                        "is_workout": False,
+                    },
+                },
+                {
+                    "time": 1784692920,
+                    "value": {
+                        "bpm": 72,
+                        "type": "1",
+                        "workout_id": "0",
+                        "is_workout": "true",
+                    },
+                },
+                {
+                    "time": 1784692980,
+                    "value": {
+                        "bpm": 73,
+                        "type": "0",
+                        "workout_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "is_workout": "false",
+                    },
+                },
+                {
+                    "time": 1784693040,
+                    "value": {
+                        "bpm": 74,
+                        "type": "0",
+                        "is_workout": "opaque-but-not-boolish",
+                    },
+                },
+            ],
+            is_resting=False,
+        )
+
+        self.assertEqual(
+            [(row.sample_type, row.is_workout) for row in samples],
+            [
+                ("passive", False),
+                ("passive", False),
+                ("active", True),
+                ("passive", True),
+                ("passive", False),
+            ],
+        )
+
+    def test_nested_measurement_times_take_priority_and_invalid_values_fallback(
+        self,
+    ) -> None:
+        timestamp = 1784692800
+        outside = timestamp + 3600
+
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
+                if key == "resting_heart_rate":
+                    return [
+                        {
+                            "time": outside,
+                            "value": {"bpm": 60, "date_time": timestamp},
+                        },
+                        {
+                            "time": timestamp + 10,
+                            "value": {"bpm": 61, "date_time": "invalid"},
+                        },
+                    ]
+                if key == "spo2":
+                    return [
+                        {"time": outside, "value": {"spo2": 97, "time": timestamp}},
+                        {
+                            "time": timestamp + 10,
+                            "value": {"spo2": 98, "time": "invalid"},
+                        },
+                    ]
+                if key == "stress":
+                    return [
+                        {"time": outside, "value": {"stress": 20, "time": timestamp}},
+                        {
+                            "time": timestamp + 10,
+                            "value": {"stress": 21, "time": "invalid"},
+                        },
+                    ]
+                return []
+
+        async def collect():
+            adapter = FixtureAdapter("user", "token", "cn")
+            start, end = _range_around(timestamp, 30)
+            heart = [row async for row in adapter.iter_heart_rate(start, end)]
+            spo2 = [row async for row in adapter.iter_spo2(start, end)]
+            stress = [row async for row in adapter.iter_stress(start, end)]
+            return heart, spo2, stress
+
+        groups = asyncio.run(collect())
+        for rows in groups:
+            self.assertEqual(
+                [int(row.timestamp.timestamp()) for row in rows],
+                [timestamp, timestamp + 10],
+            )
+
+    def test_non_sleep_iterators_reject_records_outside_requested_range(self) -> None:
+        timestamp = 1784692800
+        record_times = (timestamp - 60, timestamp, timestamp + 60)
+
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
+                values = {
+                    "steps": lambda: {"steps": 10},
+                    "heart_rate": lambda: {"bpm": 70},
+                    "weight": lambda: {"weight": 65},
+                    "spo2": lambda: {"spo2": 97},
+                    "stress": lambda: {"stress": 20},
+                }
+                if key not in values:
+                    return []
+                return [
+                    {"time": record_time, "value": values[key]()}
+                    for record_time in record_times
+                ]
+
+        async def collect():
+            adapter = FixtureAdapter("user", "token", "cn")
+            start, end = _range_around(timestamp, 10)
+            return (
+                [row async for row in adapter.iter_daily_activity(start, end)],
+                [row async for row in adapter.iter_heart_rate(start, end)],
+                [row async for row in adapter.iter_body_measurements(start, end)],
+                [row async for row in adapter.iter_spo2(start, end)],
+                [row async for row in adapter.iter_stress(start, end)],
+            )
+
+        groups = asyncio.run(collect())
+        self.assertTrue(all(len(rows) == 1 for rows in groups))
+        for rows in groups[1:]:
+            self.assertEqual(int(rows[0].timestamp.timestamp()), timestamp)
+
+    def test_non_sleep_future_record_is_rejected_even_inside_requested_range(
+        self,
+    ) -> None:
+        future = datetime.now(UTC).replace(microsecond=0) + timedelta(days=1)
+        future_timestamp = int(future.timestamp())
+
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
+                if key == "heart_rate":
+                    return [{"time": future_timestamp, "value": {"bpm": 70}}]
+                return []
+
+        async def collect():
+            start, end = _range_around(future_timestamp, 10)
+            return [
+                row
+                async for row in FixtureAdapter("user", "token", "cn").iter_heart_rate(
+                    start, end
+                )
+            ]
+
+        self.assertEqual(asyncio.run(collect()), [])
 
     def test_daily_activity_uses_dedicated_calorie_total(self) -> None:
         """Dedicated calorie records replace, rather than duplicate, step calories."""
@@ -211,12 +434,8 @@ class AdapterTest(unittest.TestCase):
 
         async def collect():
             adapter = FixtureAdapter("user", "token", "cn")
-            return [
-                record
-                async for record in adapter.iter_daily_activity(
-                    datetime.now(UTC), datetime.now(UTC)
-                )
-            ]
+            start, end = _range_around(1743467400)
+            return [record async for record in adapter.iter_daily_activity(start, end)]
 
         records = asyncio.run(collect())
         self.assertEqual(len(records), 1)
@@ -241,12 +460,8 @@ class AdapterTest(unittest.TestCase):
 
         async def collect():
             adapter = FixtureAdapter("user", "token", "cn")
-            return [
-                record
-                async for record in adapter.iter_daily_activity(
-                    datetime.now(UTC), datetime.now(UTC)
-                )
-            ]
+            start, end = _range_around(1743467400)
+            return [record async for record in adapter.iter_daily_activity(start, end)]
 
         records = asyncio.run(collect())
         self.assertEqual(len(records), 1)
@@ -299,8 +514,8 @@ class AdapterTest(unittest.TestCase):
 
         self.assertEqual(asyncio.run(collect()), [])
 
-    def test_repeated_pagination_cursor_keeps_unique_records(self) -> None:
-        """A malformed cloud cursor cannot discard an otherwise usable first page."""
+    def test_repeated_pagination_cursor_rejects_partial_sleep_records(self) -> None:
+        """A malformed cloud cursor cannot return a partial non-activity dataset."""
 
         class FixtureAdapter(MiFitnessCloudAdapter):
             calls = 0
@@ -327,10 +542,35 @@ class AdapterTest(unittest.TestCase):
                 }
 
         adapter = FixtureAdapter("user", "token", "cn")
-        records = asyncio.run(
-            adapter._fetch_key("sleep", datetime.now(UTC), datetime.now(UTC), "cn")
-        )
-        self.assertEqual(len(records), 1)
+        with self.assertRaisesRegex(RuntimeError, "分页游标重复"):
+            asyncio.run(
+                adapter._fetch_key("sleep", datetime.now(UTC), datetime.now(UTC), "cn")
+            )
+
+    def test_non_activity_pagination_page_limit_rejects_partial_records(self) -> None:
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            calls = 0
+
+            async def _fetch_page(
+                self, key, start, end, region, cursor=None, *, budget=None
+            ):
+                self.calls += 1
+                return {
+                    "data_list": [
+                        {"time": 1784692800 + self.calls, "value": {"bpm": 70}}
+                    ],
+                    "has_more": True,
+                    "next_key": f"cursor-{self.calls}",
+                }
+
+        adapter = FixtureAdapter("user", "token", "cn")
+        with self.assertRaisesRegex(RuntimeError, "分页超过安全上限"):
+            asyncio.run(
+                adapter._fetch_key(
+                    "heart_rate", datetime.now(UTC), datetime.now(UTC), "cn"
+                )
+            )
+        self.assertEqual(adapter.calls, 100)
 
     def test_zero_sleep_and_stress_scores_are_preserved(self) -> None:
         """Valid zero scores must not be treated as missing by truthiness fallbacks."""
@@ -355,7 +595,7 @@ class AdapterTest(unittest.TestCase):
 
         async def collect():
             adapter = FixtureAdapter("user", "token", "cn")
-            now = datetime.now(UTC)
+            now = datetime.now(UTC).replace(microsecond=0)
             sleeps = [row async for row in adapter.iter_sleep(now, now)]
             stress = [row async for row in adapter.iter_stress(now, now)]
             return sleeps, stress
@@ -376,7 +616,7 @@ class AdapterTest(unittest.TestCase):
                 }
 
         adapter = FixtureAdapter("user", "token", "cn")
-        with self.assertRaisesRegex(RuntimeError, "不完整的每日汇总"):
+        with self.assertRaisesRegex(RuntimeError, "不完整的同步结果"):
             asyncio.run(
                 adapter._fetch_key("steps", datetime.now(UTC), datetime.now(UTC), "cn")
             )
@@ -615,6 +855,57 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(adapter.pass_token, "original-token")
         self.assertEqual(adapter._client.calls, 2)
 
+    def test_login_forwards_only_whitelisted_session_cookies(self) -> None:
+        payload = {
+            "ssecurity": base64.b64encode(b"s" * 16).decode(),
+            "location": "https://api.io.mi.com/session",
+            "userId": "user",
+        }
+        session_headers = httpx.Headers(
+            [
+                ("Set-Cookie", "unknownCookie=ignored; Secure"),
+                ("Set-Cookie", "serviceToken=service; Secure; HttpOnly"),
+                ("Set-Cookie", "cUserId=cloud-user; Secure"),
+                ("Set-Cookie", "userId=user; Secure"),
+                ("Set-Cookie", "yetAnotherServiceToken=alternate; Secure"),
+            ]
+        )
+        adapter = MiFitnessCloudAdapter("user", "token", "cn")
+        adapter._client = _StreamingClient(
+            _http_response(
+                200,
+                content=LOGIN_PREFIX + json.dumps(payload).encode(),
+            ),
+            _http_response(200, headers=session_headers),
+        )
+
+        asyncio.run(adapter._login_with_token())
+
+        self.assertEqual(
+            adapter._cookies,
+            "serviceToken=service; cUserId=cloud-user; userId=user; "
+            "yetAnotherServiceToken=alternate",
+        )
+        self.assertNotIn("unknownCookie", adapter._cookies)
+
+    def test_login_rejects_session_with_only_unknown_cookies(self) -> None:
+        payload = {
+            "ssecurity": base64.b64encode(b"s" * 16).decode(),
+            "location": "https://api.io.mi.com/session",
+        }
+        adapter = MiFitnessCloudAdapter("user", "token", "cn")
+        adapter._client = _StreamingClient(
+            _http_response(
+                200,
+                content=LOGIN_PREFIX + json.dumps(payload).encode(),
+            ),
+            _http_response(200, headers={"Set-Cookie": "unknownCookie=ignored"}),
+        )
+
+        with self.assertRaises(MiFitnessAuthenticationError):
+            asyncio.run(adapter._login_with_token())
+        self.assertEqual(adapter._cookies, "")
+
     def test_connect_commits_login_credentials_only_after_health_api_probe(
         self,
     ) -> None:
@@ -703,7 +994,8 @@ class AdapterTest(unittest.TestCase):
 
         async def collect():
             adapter = FixtureAdapter()
-            iterator = adapter.iter_heart_rate(datetime.now(UTC), datetime.now(UTC))
+            start, end = _range_around(1784692800)
+            iterator = adapter.iter_heart_rate(start, end)
             first = await anext(iterator)
             calls_after_first = list(adapter.calls)
             remaining = [record async for record in iterator]
@@ -800,12 +1092,8 @@ class AdapterTest(unittest.TestCase):
 
         async def collect():
             adapter = FixtureAdapter("user", "token", "cn")
-            return [
-                row
-                async for row in adapter.iter_heart_rate(
-                    datetime.now(UTC), datetime.now(UTC)
-                )
-            ]
+            start, end = _range_around(1784692800)
+            return [row async for row in adapter.iter_heart_rate(start, end)]
 
         records = asyncio.run(collect())
         self.assertEqual([record.bpm for record in records], [71])
@@ -821,12 +1109,8 @@ class AdapterTest(unittest.TestCase):
 
         async def collect():
             adapter = FixtureAdapter("user", "token", "cn")
-            return [
-                row
-                async for row in adapter.iter_heart_rate(
-                    datetime.now(UTC), datetime.now(UTC)
-                )
-            ]
+            start, end = _range_around(1784692800)
+            return [row async for row in adapter.iter_heart_rate(start, end)]
 
         records = asyncio.run(collect())
         self.assertEqual([record.bpm for record in records], [73])
@@ -865,21 +1149,65 @@ class AdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "spo2 endpoint failure"):
             asyncio.run(collect_spo2())
 
+    def test_heart_network_error_is_raised_even_when_resting_fallback_has_data(
+        self,
+    ) -> None:
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
+                if key == "heart_rate":
+                    raise RuntimeError("synthetic heart network failure")
+                if key == "resting_heart_rate":
+                    return [{"time": 1784692800, "value": {"bpm": 60}}]
+                return []
+
+        async def collect():
+            start, end = _range_around(1784692800)
+            return [
+                row
+                async for row in FixtureAdapter("user", "token", "cn").iter_heart_rate(
+                    start, end
+                )
+            ]
+
+        with self.assertRaisesRegex(RuntimeError, "heart network failure"):
+            asyncio.run(collect())
+
+    def test_spo2_network_error_is_raised_even_when_alias_fallback_has_data(
+        self,
+    ) -> None:
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            async def _fetch_key(self, key, start, end, region, *, budget=None):
+                if key == "spo2":
+                    raise RuntimeError("synthetic spo2 network failure")
+                if key == "blood_oxygen":
+                    return [{"time": 1784692800, "value": {"blood_oxygen": 97}}]
+                return []
+
+        async def collect():
+            start, end = _range_around(1784692800)
+            return [
+                row
+                async for row in FixtureAdapter("user", "token", "cn").iter_spo2(
+                    start, end
+                )
+            ]
+
+        with self.assertRaisesRegex(RuntimeError, "spo2 network failure"):
+            asyncio.run(collect())
+
     def test_blood_oxygen_alias_is_used_by_normal_sync(self) -> None:
         class FixtureAdapter(MiFitnessCloudAdapter):
             async def _fetch_key(self, key, start, end, region, *, budget=None):
                 if key == "spo2":
-                    raise RuntimeError("unsupported key")
+                    raise MiFitnessResponseError("unsupported key")
                 if key == "blood_oxygen":
                     return [{"time": 1784692800, "value": {"blood_oxygen": 97}}]
                 return []
 
         async def collect():
             adapter = FixtureAdapter("user", "token", "cn")
-            return [
-                row
-                async for row in adapter.iter_spo2(datetime.now(UTC), datetime.now(UTC))
-            ]
+            start, end = _range_around(1784692800)
+            return [row async for row in adapter.iter_spo2(start, end)]
 
         records = asyncio.run(collect())
         self.assertEqual([record.percent for record in records], [97])
@@ -959,12 +1287,8 @@ class AdapterTest(unittest.TestCase):
             adapter = FixtureAdapter(
                 "user", "token", "cn", timezone(timedelta(hours=8))
             )
-            return [
-                row
-                async for row in adapter.iter_daily_activity(
-                    datetime.now(UTC), datetime.now(UTC)
-                )
-            ]
+            start, end = _range_around(base)
+            return [row async for row in adapter.iter_daily_activity(start, end)]
 
         records = asyncio.run(collect())
         self.assertEqual(records[0].date, "2026-01-02")

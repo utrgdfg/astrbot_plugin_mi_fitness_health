@@ -579,7 +579,7 @@ class DatabaseTest(unittest.TestCase):
                 rows = connection.execute(
                     "SELECT alert_type,message FROM alerts ORDER BY id"
                 ).fetchall()
-            self.assertEqual(version, 8)
+            self.assertEqual(version, 9)
             self.assertEqual(
                 rows,
                 [
@@ -587,3 +587,167 @@ class DatabaseTest(unittest.TestCase):
                     ("proactive_message", "已发送主动关心"),
                 ],
             )
+
+    def test_v9_migration_canonicalizes_and_deduplicates_legacy_heart_ids(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "health.sqlite3"
+            database = Database(path)
+            database.initialize()
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute("UPDATE schema_version SET version=8")
+                connection.executemany(
+                    """INSERT INTO heart_rate_samples(
+                           user_id,record_id,timestamp,bpm,sample_type,is_workout,updated_at
+                       ) VALUES(?,?,?,?,?,?,?)""",
+                    (
+                        (
+                            "user-a",
+                            "mi_fitness_hr_1784692800",
+                            "2026-07-22T04:00:00+00:00",
+                            69,
+                            "passive",
+                            0,
+                            "2026-08-01T00:00:00+00:00",
+                        ),
+                        (
+                            "user-a",
+                            "mi_fitness_hr_1784692800_70",
+                            "2026-07-22T04:00:00+00:00",
+                            70,
+                            "passive",
+                            0,
+                            "2026-08-02T00:00:00+00:00",
+                        ),
+                        (
+                            "user-a",
+                            "mi_fitness_hr_1784692800_72",
+                            "2026-07-22T04:00:00+00:00",
+                            72,
+                            "passive",
+                            0,
+                            "2026-08-02T00:00:00+00:00",
+                        ),
+                        (
+                            "user-a",
+                            "mi_fitness_resting_hr_1784696400_60",
+                            "2026-07-22T05:00:00+00:00",
+                            60,
+                            "passive",
+                            0,
+                            "2026-08-01T00:00:00+00:00",
+                        ),
+                        (
+                            "user-a",
+                            "mi_fitness_resting_hr_1784696400",
+                            "2026-07-22T05:00:00+00:00",
+                            61,
+                            "passive",
+                            0,
+                            "2026-08-03T00:00:00+00:00",
+                        ),
+                        (
+                            "user-a",
+                            "mi_fitness_hr_1784692800_not-a-bpm",
+                            "2026-07-22T04:00:00+00:00",
+                            73,
+                            "passive",
+                            0,
+                            "2026-08-04T00:00:00+00:00",
+                        ),
+                        (
+                            "user-b",
+                            "mi_fitness_hr_1784692800_75",
+                            "2026-07-22T04:00:00+00:00",
+                            75,
+                            "passive",
+                            0,
+                            "2026-08-02T00:00:00+00:00",
+                        ),
+                    ),
+                )
+                connection.commit()
+
+            database.initialize()
+
+            with closing(sqlite3.connect(path)) as connection:
+                version = connection.execute(
+                    "SELECT version FROM schema_version"
+                ).fetchone()[0]
+                rows = connection.execute(
+                    """SELECT user_id,record_id,bpm,updated_at
+                       FROM heart_rate_samples ORDER BY user_id,record_id"""
+                ).fetchall()
+            self.assertEqual(version, 9)
+            self.assertEqual(
+                rows,
+                [
+                    (
+                        "user-a",
+                        "mi_fitness_hr_1784692800",
+                        72,
+                        "2026-08-02T00:00:00+00:00",
+                    ),
+                    (
+                        "user-a",
+                        "mi_fitness_hr_1784692800_not-a-bpm",
+                        73,
+                        "2026-08-04T00:00:00+00:00",
+                    ),
+                    (
+                        "user-a",
+                        "mi_fitness_resting_hr_1784696400",
+                        61,
+                        "2026-08-03T00:00:00+00:00",
+                    ),
+                    (
+                        "user-b",
+                        "mi_fitness_hr_1784692800",
+                        75,
+                        "2026-08-02T00:00:00+00:00",
+                    ),
+                ],
+            )
+
+    def test_activity_timezone_change_atomically_resets_only_activity_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            now = datetime.now(UTC)
+            database.upsert_activity(
+                "xiaomi-user",
+                DailyActivity(now.date().isoformat(), 100, 80, 10, now),
+            )
+            database.update_sync_state("xiaomi-user", "daily_activity", now)
+            database.update_sync_failure("xiaomi-user", "daily_activity", "temporary")
+            database.update_sync_state("xiaomi-user", "sleep", now)
+
+            self.assertFalse(
+                database.ensure_activity_timezone("xiaomi-user", "Asia/Shanghai")
+            )
+            key = database._activity_timezone_metadata_key("xiaomi-user")
+            self.assertNotIn("xiaomi-user", key)
+            self.assertEqual(database.get_metadata(key), "Asia/Shanghai")
+            self.assertIsNotNone(
+                database.today_activity("xiaomi-user", now.date().isoformat())
+            )
+            self.assertFalse(
+                database.ensure_activity_timezone("xiaomi-user", "Asia/Shanghai")
+            )
+
+            self.assertTrue(database.ensure_activity_timezone("xiaomi-user", "UTC"))
+
+            self.assertEqual(database.get_metadata(key), "UTC")
+            self.assertIsNone(
+                database.today_activity("xiaomi-user", now.date().isoformat())
+            )
+            self.assertIsNone(
+                database.latest_sync_at("xiaomi-user", ("daily_activity",))
+            )
+            self.assertIsNone(
+                database.latest_sync_failure_at("xiaomi-user", ("daily_activity",))
+            )
+            self.assertIsNotNone(database.latest_sync_at("xiaomi-user", ("sleep",)))

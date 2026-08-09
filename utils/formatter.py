@@ -63,9 +63,14 @@ def today_text(
     else:
         lines.append("步数/距离/活动消耗：暂无今日数据")
     if heart_rates:
-        values = [item["bpm"] for item in heart_rates]
+        ordinary_rates = [
+            item for item in heart_rates if not bool(item.get("is_workout"))
+        ]
+        summarized_rates = ordinary_rates or heart_rates
+        values = [item["bpm"] for item in summarized_rates]
+        label = "今日心率（本地自然日）" if ordinary_rates else "今日运动期间心率"
         lines.append(
-            f"今日心率（本地自然日）：最新 {heart_rates[0]['bpm']} bpm（数据采集时间：{local_timestamp(heart_rates[0]['timestamp'], user_timezone)}），平均 {sum(values) / len(values):.0f}，最高 {max(values)}，最低 {min(values)}"
+            f"{label}：最新 {summarized_rates[0]['bpm']} bpm（数据采集时间：{local_timestamp(summarized_rates[0]['timestamp'], user_timezone)}），平均 {sum(values) / len(values):.0f}，最高 {max(values)}，最低 {min(values)}"
         )
     else:
         lines.append("今日心率（本地自然日）：暂无数据")
