@@ -19,6 +19,24 @@ def _consume_task_result(task: asyncio.Task) -> None:
         pass
 
 
+async def await_cancellation_safe(awaitable: Awaitable[T]) -> T:
+    """Finish non-cancellable owned work before propagating task cancellation."""
+    task = asyncio.ensure_future(awaitable)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+        raise asyncio.CancelledError
+    return task.result()
+
+
 async def await_with_hard_timeout(
     awaitable: Awaitable[T],
     timeout: float,

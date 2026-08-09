@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import astrbot_test_stub  # noqa: F401
 from astrbot_plugin_mi_fitness_health.models import (
@@ -30,6 +31,27 @@ class _RecordingDatabase:
 
 
 class QueryServiceTest(unittest.TestCase):
+    def test_timezone_fallback_exposes_bounded_invalid_name(self) -> None:
+        service = QueryService(_RecordingDatabase(), "user", "Not/AZone")
+        self.assertTrue(service.timezone_fallback_used)
+        self.assertEqual(service.invalid_timezone_name, "Not/AZone")
+        self.assertEqual(str(service.timezone), "Asia/Shanghai")
+
+        long_name = "x" * 500
+        bounded = QueryService(_RecordingDatabase(), "user", long_name)
+        self.assertTrue(bounded.timezone_fallback_used)
+        self.assertEqual(len(bounded.invalid_timezone_name), 128)
+
+    def test_missing_default_tzdata_is_not_reported_as_user_typo(self) -> None:
+        with patch(
+            "astrbot_plugin_mi_fitness_health.services.query_service.ZoneInfo",
+            side_effect=RuntimeError("tzdata unavailable"),
+        ):
+            service = QueryService(_RecordingDatabase(), "user", "Asia/Shanghai")
+        self.assertTrue(service.timezone_fallback_used)
+        self.assertIsNone(service.invalid_timezone_name)
+        self.assertEqual(str(service.timezone), "Asia/Shanghai")
+
     def test_heart_rate_cutoff_is_utc(self) -> None:
         """UTC storage must not be lexically compared against +08:00 text."""
         database = _RecordingDatabase()
@@ -299,6 +321,58 @@ class QueryServiceTest(unittest.TestCase):
             self.assertIn("72 bpm", snapshot)
             self.assertNotIn("睡眠", snapshot)
             self.assertNotIn("历史参考", snapshot)
+
+    def test_care_snapshot_excludes_workout_samples_from_ordinary_summary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            service = QueryService(database, "user", "Asia/Shanghai")
+            now = datetime.now(UTC)
+            database.upsert_heart_rate(
+                "user", HeartRateSample("passive", now, 70, "passive", False)
+            )
+            database.upsert_heart_rate(
+                "user",
+                HeartRateSample(
+                    "workout", now - timedelta(minutes=1), 180, "active", True
+                ),
+            )
+
+            snapshot = asyncio.run(service.care_snapshot("今天 心率"))
+
+            self.assertIn("今日心率", snapshot)
+            self.assertIn("平均 70", snapshot)
+            self.assertNotIn("180", snapshot)
+            self.assertNotIn("运动期间心率", snapshot)
+
+    def test_only_workout_samples_are_explicitly_labeled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            service = QueryService(database, "user", "Asia/Shanghai")
+            now = datetime.now(UTC)
+            database.upsert_heart_rate(
+                "user", HeartRateSample("workout", now, 180, "active", True)
+            )
+
+            snapshot = asyncio.run(service.care_snapshot("今天 心率"))
+            formatted = today_text(
+                None,
+                [
+                    {
+                        "bpm": 180,
+                        "timestamp": now.isoformat(),
+                        "is_workout": 1,
+                    }
+                ],
+                None,
+                service.timezone,
+            )
+
+            self.assertIn("今日运动期间心率", snapshot)
+            self.assertIn("今日运动期间心率", formatted)
 
     def test_today_sleep_uses_record_ending_today_when_available(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

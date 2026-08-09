@@ -2,11 +2,12 @@
 
 from .monitor_service import HealthMonitorService, MonitorFinding
 from .query_service import QueryService
-from .sync_service import SyncService
+from .sync_service import SyncService, SyncServiceBusyError
 
 __all__ = [
     "HealthMonitorService",
     "MonitorFinding",
     "QueryService",
     "SyncService",
+    "SyncServiceBusyError",
 ]

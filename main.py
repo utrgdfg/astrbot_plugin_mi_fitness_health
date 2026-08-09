@@ -12,8 +12,6 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.platform import MessageType
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools
-from astrbot.core.agent.run_context import ContextWrapper
-from astrbot.core.astr_agent_context import AstrAgentContext
 
 from .adapters import MiFitnessAuthenticationError, MiFitnessCloudAdapter
 from .features import (
@@ -21,22 +19,27 @@ from .features import (
     DEFAULT_PROACTIVE_CONTEXT_PROMPT,
     DEFAULT_PROACTIVE_DECISION_PROMPT,
     ConversationRoutingMixin,
+    HealthCommandsMixin,
     MainModelToolingMixin,
     ProactiveCareMixin,
-    add_private_health_tool,
-    scrub_private_health_tool_messages,
 )
-from .services import HealthMonitorService, QueryService, SyncService
+from .services import (
+    HealthMonitorService,
+    QueryService,
+    SyncService,
+)
 from .storage import Database
-from .utils import measurement_text, today_text
 from .utils.access import (
     normalize_identifier,
     owner_access_denial_reason,
 )
-from .utils.async_tools import await_with_hard_timeout
+from .utils.async_tools import await_cancellation_safe, await_with_hard_timeout
 from .utils.privacy import redact_error
 
 CONNECTION_COMMAND_TIMEOUT_SECONDS = 120.0
+DETACHED_TASK_DRAIN_SECONDS = 1.0
+SHUTDOWN_CLOUD_CLOSE_TIMEOUT_SECONDS = 5.0
+BACKGROUND_SEND_TIMEOUT_SECONDS = 20.0
 
 
 def _config_bool(
@@ -84,11 +87,23 @@ def _config_int(
             key,
         )
         parsed = default
-    return max(minimum, min(parsed, maximum))
+    bounded = max(minimum, min(parsed, maximum))
+    if bounded != parsed:
+        logger.warning(
+            "[小米运动健康] 配置项 %s 超出允许范围，已限制在 %d～%d",
+            key,
+            minimum,
+            maximum,
+        )
+    return bounded
 
 
 class MiFitnessHealthPlugin(
-    ProactiveCareMixin, MainModelToolingMixin, ConversationRoutingMixin, Star
+    HealthCommandsMixin,
+    ProactiveCareMixin,
+    MainModelToolingMixin,
+    ConversationRoutingMixin,
+    Star,
 ):
     """Own cloud lifecycle, local storage, and owner-only health commands."""
 
@@ -124,11 +139,6 @@ class MiFitnessHealthPlugin(
         "醒了",
         "睡醒",
     )
-    _CONVERSATION_HEALTH_MODE_LABELS = {
-        "main_model": "主模型直接判断",
-        "decision_model": "独立判断模型",
-        "local_rules": "本地轻量规则",
-    }
 
     def __init__(self, context: Context, config: AstrBotConfig):
         """Configure one Xiaomi account and one AstrBot data owner.
@@ -166,6 +176,16 @@ class MiFitnessHealthPlugin(
             self.user_id,
             str(config.get("user_timezone") or "Asia/Shanghai"),
         )
+        if self.query_service.invalid_timezone_name:
+            logger.warning(
+                "[小米运动健康] 配置项 user_timezone 不是有效的 IANA 时区，"
+                "已安全回退为 Asia/Shanghai"
+            )
+        elif self.query_service.timezone_fallback_used:
+            logger.warning(
+                "[小米运动健康] 当前 Python 环境无法加载 IANA 时区数据，"
+                "已使用 Asia/Shanghai 固定偏移回退"
+            )
         self.adapter = MiFitnessCloudAdapter(
             self.user_id,
             self.pass_token,
@@ -287,7 +307,12 @@ class MiFitnessHealthPlugin(
         self._monitor_task: asyncio.Task[None] | None = None
         self._natural_refresh_task: asyncio.Task[bool] | None = None
         self._connection_task: asyncio.Task[None] | None = None
+        self._connection_cloud_task: asyncio.Task[bool] | None = None
+        self._owner_activity_task: asyncio.Task[None] | None = None
         self._detached_tasks: set[asyncio.Task] = set()
+        self._foreground_tasks: set[asyncio.Task] = set()
+        self._pending_owner_activity: tuple[str, datetime] | None = None
+        self._maintenance_lock = asyncio.Lock()
         self._pending_refresh_types: set[str] = set()
         self._active_refresh_types: set[str] = set()
         self._auto_sync_paused = False
@@ -300,14 +325,23 @@ class MiFitnessHealthPlugin(
         self._last_natural_cloud_request_at: dict[str, datetime] = {}
         self._natural_hard_cooldown_seconds = 60
         self._local_data_clear_in_progress = False
+        self._terminating = False
+        self._terminated = False
 
     async def initialize(self) -> None:
         """Migrate the database and schedule the configured background loops."""
         await self.sync_service.initialize()
+        if self.sync_service.activity_timezone_reset:
+            logger.warning(
+                "[小米运动健康] 用户时区已变化，旧活动日汇总及其同步状态已清除；"
+                "下次同步会按新时区重建近期活动数据"
+            )
         self._ensure_background_task()
 
     def _ensure_background_task(self) -> None:
         """Start each eligible background loop without creating duplicates."""
+        if self._terminating or self._terminated:
+            return
         monitor_ready = (
             self.proactive_monitor_enabled
             and self.allow_health_data_to_llm
@@ -332,22 +366,80 @@ class MiFitnessHealthPlugin(
 
     async def terminate(self) -> None:
         """Cancel the periodic task and close plugin-owned HTTP resources."""
+        self._terminating = True
+        await self._cancel_foreground_operations()
         for attribute in (
             "_auto_task",
             "_monitor_task",
             "_natural_refresh_task",
             "_connection_task",
+            "_owner_activity_task",
         ):
             await self._cancel_owned_task(attribute)
-        for task in tuple(self._detached_tasks):
-            task.cancel()
-        self._detached_tasks.clear()
+        await self._drain_detached_tasks()
         try:
-            await self.sync_service.close()
+            await await_with_hard_timeout(
+                self.sync_service.close(),
+                SHUTDOWN_CLOUD_CLOSE_TIMEOUT_SECONDS,
+                registry=self._detached_tasks,
+            )
+        except TimeoutError:
+            logger.warning(
+                "Mi Fitness cloud cleanup exceeded the shutdown time limit; "
+                "remaining cleanup will finish in the background"
+            )
         except Exception as error:
             logger.warning(
                 "Mi Fitness cloud cleanup failed during plugin shutdown: %s",
                 redact_error(error),
+            )
+        finally:
+            self._terminated = True
+
+    def _begin_foreground_operation(self) -> asyncio.Task | None:
+        """Register a command task so reload cannot leave an old writer alive."""
+        if self._terminating or self._terminated:
+            return None
+        task = asyncio.current_task()
+        if task is None:
+            return None
+        self._foreground_tasks.add(task)
+        return task
+
+    def _end_foreground_operation(self, task: asyncio.Task) -> None:
+        """Release one command task from the reload barrier."""
+        self._foreground_tasks.discard(task)
+
+    async def _cancel_foreground_operations(self) -> None:
+        """Cancel and fully drain plugin command writers before unloading."""
+        current = asyncio.current_task()
+        tasks = tuple(
+            task
+            for task in self._foreground_tasks
+            if task is not current and not task.done()
+        )
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._foreground_tasks.difference_update(tasks)
+
+    async def _drain_detached_tasks(self) -> None:
+        """Cancel detached work and wait briefly without making reload unbounded."""
+        tasks = tuple(task for task in self._detached_tasks if not task.done())
+        for task in tasks:
+            task.cancel()
+        if not tasks:
+            return
+        _done, pending = await asyncio.wait(
+            tasks,
+            timeout=DETACHED_TASK_DRAIN_SECONDS,
+        )
+        if pending:
+            logger.warning(
+                "Mi Fitness shutdown left %d cancellation-resistant background task(s); "
+                "their results remain isolated and will be discarded",
+                len(pending),
             )
 
     async def _cancel_owned_task(self, attribute: str) -> None:
@@ -404,13 +496,21 @@ class MiFitnessHealthPlugin(
 
     async def _send_connection_result(self, session: str, text: str) -> None:
         """Send one background connection result only to the verified owner chat."""
+        if self._terminating or self._terminated:
+            return
         if not await self._is_configured_owner_private_session(session):
             logger.warning(
                 "Mi Fitness connection result target failed the owner private-session check"
             )
             return
         try:
-            await self.context.send_message(session, MessageChain().message(text))
+            await await_with_hard_timeout(
+                self.context.send_message(session, MessageChain().message(text)),
+                BACKGROUND_SEND_TIMEOUT_SECONDS,
+                registry=self._detached_tasks,
+            )
+        except TimeoutError:
+            logger.warning("Mi Fitness background connection result delivery timed out")
         except Exception as error:
             logger.warning(
                 "Mi Fitness background connection result could not be delivered (%s)",
@@ -421,8 +521,34 @@ class MiFitnessHealthPlugin(
         """Check Xiaomi connectivity without occupying the command pipeline."""
         current_task = asyncio.current_task()
         try:
+            if self._terminating or self._terminated:
+                return
+            await await_cancellation_safe(
+                asyncio.to_thread(
+                    self.database.touch_private_owner_session,
+                    self.owner_platform_id,
+                    session,
+                    None,
+                    True,
+                )
+            )
+            if self._terminating or self._terminated:
+                return
+            cloud_task = self._connection_cloud_task
+            if cloud_task is None or cloud_task.done():
+                cloud_task = asyncio.create_task(
+                    self.sync_service.connect(force=True),
+                    name=f"{self.name}-connection-cloud",
+                )
+                self._connection_cloud_task = cloud_task
+
+                def clear_cloud_slot(done: asyncio.Task[bool]) -> None:
+                    if self._connection_cloud_task is done:
+                        self._connection_cloud_task = None
+
+                cloud_task.add_done_callback(clear_cloud_slot)
             connected = await await_with_hard_timeout(
-                self.sync_service.connect(force=True),
+                cloud_task,
                 CONNECTION_COMMAND_TIMEOUT_SECONDS,
                 registry=self._detached_tasks,
             )
@@ -495,12 +621,34 @@ class MiFitnessHealthPlugin(
                     body = await self._compose_proactive_reply(
                         state["session"], messages
                     )
-                    sent = bool(body) and await self._send_private_message(body)
-                    if sent:
-                        self._last_proactive_delivery_at = datetime.now(UTC)
+                    if body:
+                        attempted_at = datetime.now(UTC)
+                        # Reserve both in-memory and durable cooldowns before the
+                        # platform send. A reload or lost acknowledgement may
+                        # suppress one message, but can never produce duplicates.
+                        self._last_proactive_delivery_at = attempted_at
+                        reservation_acquired = True
                         if late_finding:
-                            await self.monitor_service.mark_sent(late_finding)
-                        await self.monitor_service.mark_proactive_sent(body)
+                            reservation_acquired = await self.monitor_service.mark_sent(
+                                late_finding,
+                                attempted_at,
+                                delivery_confirmed=False,
+                            )
+                        if reservation_acquired:
+                            await self.monitor_service.mark_proactive_sent(
+                                body,
+                                attempted_at,
+                                delivery_confirmed=False,
+                            )
+                            delivery = await self._send_private_message(body)
+                            if delivery is True:
+                                if late_finding:
+                                    await self.monitor_service.confirm_sent(
+                                        late_finding, attempted_at
+                                    )
+                                await self.monitor_service.confirm_proactive_sent(
+                                    attempted_at
+                                )
                 failures = 0
             except asyncio.CancelledError:
                 raise
@@ -544,26 +692,67 @@ class MiFitnessHealthPlugin(
         """Conversational health data is available only in the owner's private chat."""
         return self._access_denial_reason(event) is None
 
+    def _schedule_owner_activity_touch(self, session: str, seen_at: datetime) -> None:
+        """Coalesce non-critical owner-session writes outside the chat pipeline."""
+        if self._local_data_clear_in_progress or self._terminating or self._terminated:
+            return
+        self._pending_owner_activity = (session, seen_at)
+        task = getattr(self, "_owner_activity_task", None)
+        if task is None or task.done():
+            self._owner_activity_task = asyncio.create_task(
+                self._owner_activity_worker(),
+                name=f"{self.name}-owner-activity",
+            )
+
+    async def _owner_activity_worker(self) -> None:
+        """Persist the newest owner activity without delaying or aborting normal chat."""
+        current_task = asyncio.current_task()
+        try:
+            while pending := self._pending_owner_activity:
+                self._pending_owner_activity = None
+                session, seen_at = pending
+                try:
+                    await await_cancellation_safe(
+                        asyncio.to_thread(
+                            self.database.touch_private_owner_session,
+                            self.owner_platform_id,
+                            session,
+                            seen_at,
+                            bool(self.owner_platform_instance_id),
+                        )
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    logger.warning(
+                        "Mi Fitness could not persist owner private activity (%s); "
+                        "normal conversation will continue",
+                        type(error).__name__,
+                    )
+        finally:
+            if self._owner_activity_task is current_task:
+                self._owner_activity_task = None
+
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     async def remember_owner_private_activity(self, event: AstrMessageEvent):
         """Remember private owner activity as the only evidence for being awake."""
+        if self._local_data_clear_in_progress or self._terminating or self._terminated:
+            return
         if self._is_private_owner_event(event):
+            seen_at = datetime.now(UTC)
             if self.allow_proactive_chat_context:
                 message = " ".join(str(event.get_message_str() or "").split())[:600]
                 if message:
                     self._latest_owner_message = (
                         event.unified_msg_origin,
                         message,
-                        datetime.now(UTC),
+                        seen_at,
                     )
             else:
                 self._latest_owner_message = None
-            await asyncio.to_thread(
-                self.database.touch_private_owner_session,
-                self.owner_platform_id,
+            self._schedule_owner_activity_touch(
                 event.unified_msg_origin,
-                None,
-                bool(self.owner_platform_instance_id),
+                seen_at,
             )
 
     @filter.on_llm_request()
@@ -583,19 +772,72 @@ class MiFitnessHealthPlugin(
         question = self._sanitize_focus(raw_question) if raw_question else ""
         if not question:
             return
-        mode = self._effective_conversation_health_mode()
-        if mode == "main_model":
-            add_private_health_tool(
-                req,
-                self._load_main_model_private_context,
-                self.context_decision_prompt,
-            )
+        # AstrBot can switch image turns to another image-capable Provider only
+        # after this hook has completed. The final data recipient is therefore
+        # not knowable here, regardless of which routing mode selected the data.
+        if getattr(req, "image_urls", None):
             return
-
-        wait_seconds = float(self.natural_query_cloud_wait_seconds)
-        force_refresh = self._wants_fresh_cloud_data(question)
-        if mode == "decision_model":
+        if self._private_context_runtime_is_unsafe(event.unified_msg_origin):
+            # AstrBot retries the same request context with globally configured
+            # fallback providers. Keep private health data bound to one provider.
+            return
+        mode = self._effective_conversation_health_mode()
+        provider_id = None
+        response_provider_checked = False
+        if mode == "main_model":
+            decision_history = self._decision_history_from_request(req, question)
+            if not self._may_need_semantic_health_decision(question, decision_history):
+                return
+            selected_provider = event.get_extra("selected_provider")
+            if selected_provider is not None:
+                if not isinstance(selected_provider, str):
+                    logger.warning(
+                        "Mi Fitness could not verify the selected chat provider; "
+                        "skipping health context for this turn"
+                    )
+                    return
+                provider_id = selected_provider.strip() or None
+            if provider_id is None:
+                try:
+                    provider_id = await self.context.get_current_chat_provider_id(
+                        event.unified_msg_origin
+                    )
+                except Exception as error:
+                    logger.warning(
+                        "Mi Fitness could not resolve the current chat provider; "
+                        "skipping health context for this turn (%s)",
+                        type(error).__name__,
+                    )
+                    return
+            if not isinstance(provider_id, str) or not provider_id.strip():
+                logger.warning(
+                    "Mi Fitness could not verify the current chat provider; "
+                    "skipping health context for this turn"
+                )
+                return
+            provider_id = provider_id.strip()
+            if await self._private_context_provider_is_unsafe(
+                event,
+                event.unified_msg_origin,
+                provider_id,
+            ):
+                return
+            response_provider_checked = True
+            use_data, focus = await self._decide_context_focus(
+                event.unified_msg_origin,
+                question,
+                decision_history,
+                provider_id=provider_id,
+                model=getattr(req, "model", None),
+            )
+        elif mode == "decision_model":
             if not self.context_decision_provider_id:
+                return
+            if await self._private_context_provider_is_unsafe(
+                event,
+                event.unified_msg_origin,
+                self.context_decision_provider_id,
+            ):
                 return
             use_data, focus = await self._decide_context_focus(
                 event.unified_msg_origin,
@@ -606,6 +848,15 @@ class MiFitnessHealthPlugin(
             use_data, focus = self._fallback_context_decision(question)
         if not use_data:
             return
+        if (
+            not response_provider_checked
+            and await self._private_context_provider_is_unsafe(
+                event, event.unified_msg_origin, provider_id
+            )
+        ):
+            return
+        wait_seconds = float(self.natural_query_cloud_wait_seconds)
+        force_refresh = self._wants_fresh_cloud_data(question)
         message_focus = self.query_service.normalize_llm_focus(question)
         focus = message_focus or self.query_service.normalize_llm_focus(focus)
         if not focus:
@@ -628,30 +879,24 @@ class MiFitnessHealthPlugin(
         displayed_last_sync = (
             self.query_service.display_timestamp(last_sync) if last_sync else None
         )
-        dialogue = await self._compose_health_dialogue(
-            event.unified_msg_origin,
-            focus,
-            snapshot,
-            displayed_last_sync,
-        )
+        dialogue = None
+        if mode != "main_model":
+            dialogue = await self._compose_health_dialogue(
+                event.unified_msg_origin,
+                focus,
+                snapshot,
+                displayed_last_sync,
+            )
         text = self._build_private_life_context(
             snapshot,
             displayed_last_sync,
             dialogue,
             health_question=health_question,
         )
-        self._append_temporary_context(req, text)
-
-    @filter.on_agent_done()
-    async def scrub_owner_health_tool_history(
-        self,
-        event: AstrMessageEvent,
-        run_context: ContextWrapper[AstrAgentContext],
-        response: object,
-    ) -> None:
-        """Remove temporary health-tool messages before AstrBot saves the turn."""
-        del event, response
-        scrub_private_health_tool_messages(run_context.messages)
+        if self._append_temporary_context(req, text):
+            # The private snapshot is only for the conversational model. Remove
+            # every side-effecting tool before AstrBot constructs the agent run.
+            self._disable_request_tools(req)
 
     async def _guard(self, event: AstrMessageEvent):
         """Require the configured owner and a private chat for all health commands."""
@@ -660,289 +905,64 @@ class MiFitnessHealthPlugin(
             return
         yield event.plain_result(denial_reason)
 
+    # AstrBot binds decorated handlers by their exact entrypoint module. Keep
+    # these wrappers in ``main.py`` while the implementations remain in the
+    # smaller, independently testable feature mixin.
     @filter.command("健康帮助")
     async def health_help(self, event: AstrMessageEvent):
-        """Show commands and privacy boundaries."""
-        async for result in self._guard(event):
+        async for result in HealthCommandsMixin.health_help(self, event):
             yield result
-            return
-        mode_label = self._CONVERSATION_HEALTH_MODE_LABELS[
-            self._effective_conversation_health_mode()
-        ]
-        yield event.plain_result(
-            "小米运动健康（仅所有者可用）\n"
-            "健康连接｜健康同步｜健康状态｜今日健康｜心率记录 [小时]｜身体数据｜健康趋势 [天]\n"
-            "平时只需正常聊天；出现作息、疲劳、运动或早晚问候等线索时，插件会在后台准备相关生活数据，让机器人按当前人格自然回应。\n"
-            f"日常对话数据方式：{mode_label}。\n"
-            "直接查询和以上命令主要用于核对数据或排查连接问题。\n"
-            f"主动关心检查：{'每 ' + str(self.monitor_interval) + ' 分钟检查本地状态' if self.proactive_monitor_enabled else '关闭'}；只在自然时机且冷却结束时私聊一次。\n"
-            f"主动判断读取最近私聊：{'已授权' if self.allow_proactive_chat_context else '未授权（主动关心保持静默）'}。\n"
-            f"普通自动同步：{'每 ' + str(self.sync_interval) + ' 分钟读取小米云' if self.auto_sync_enabled else '关闭（使用对话按需同步）'}。\n"
-            f"对话生活数据授权：{'已开启' if self.allow_health_data_to_llm else '未开启（仅命令查询）'}。\n"
-            "数据用于让日常对话更贴近你；它不是实时监护，也不用于医疗诊断。"
-        )
 
     @filter.command("健康连接")
     async def health_connection(self, event: AstrMessageEvent):
-        """Start a bounded background connection check and release the pipeline."""
-        async for result in self._guard(event):
+        async for result in HealthCommandsMixin.health_connection(self, event):
             yield result
-            return
-        if not self.user_id or not self.pass_token:
-            yield event.plain_result(
-                "未配置 user_id 或 pass_token。请在插件配置页填写后重新加载插件。"
-            )
-            return
-        if self._connection_task is not None and not self._connection_task.done():
-            return
-        session = str(event.unified_msg_origin)
-        try:
-            await asyncio.to_thread(
-                self.database.touch_private_owner_session,
-                self.owner_platform_id,
-                session,
-                None,
-                True,
-            )
-        except Exception as error:
-            yield event.plain_result(f"健康连接检查无法启动：{redact_error(error)}")
-            return
-        self._connection_task = asyncio.create_task(
-            self._connection_worker(session),
-            name=f"{self.name}-connection-check",
-        )
 
     @filter.command("健康同步")
     async def health_sync(self, event: AstrMessageEvent):
-        """Manually synchronize a bounded recent cloud-data window."""
-        async for result in self._guard(event):
+        async for result in HealthCommandsMixin.health_sync(self, event):
             yield result
-            return
-        now = datetime.now(UTC)
-        if self._last_manual_sync_at is not None:
-            elapsed = (now - self._last_manual_sync_at).total_seconds()
-            if elapsed < self._manual_sync_min_interval:
-                remaining = max(
-                    1,
-                    min(
-                        self._manual_sync_min_interval,
-                        int(self._manual_sync_min_interval - elapsed + 0.999),
-                    ),
-                )
-                yield event.plain_result(
-                    f"刚执行过同步，请约 {remaining} 秒后再试；"
-                    "云端数据上传本身有延迟，频繁同步不会让数据更新更快。"
-                )
-                return
-        previous_sync_at = self._last_manual_sync_at
-        self._last_manual_sync_at = now
-        try:
-            result = await self._sync()
-            self._auto_sync_paused = False
-            self._ensure_background_task()
-            details = result.get("details", {})
-            labels = {
-                "daily_activity": "活动",
-                "heart_rate": "心率",
-                "body_measurements": "身体数据",
-                "sleep": "睡眠",
-                "spo2": "血氧",
-                "stress": "压力",
-            }
-            lines = [
-                f"健康同步完成：{result['days']} 天范围，新增 {result['added']}，更新 {result['updated']}。"
-            ]
-            for key, label in labels.items():
-                item = details.get(key, {})
-                if "error" in item:
-                    lines.append(
-                        f"{label}：本次未同步（{redact_error(item['error'])}；已保留其他数据）"
-                    )
-                else:
-                    lines.append(
-                        f"{label}：读取 {item.get('fetched', 0)}，新增 {item.get('added', 0)}，更新 {item.get('updated', 0)}"
-                    )
-            yield event.plain_result("\n".join(lines))
-        except Exception as error:
-            self._last_manual_sync_at = previous_sync_at
-            yield event.plain_result(f"健康同步失败：{redact_error(error)}")
 
     @filter.command("今日健康")
     async def health_today(self, event: AstrMessageEvent):
-        """Show cached user-local daily summary."""
-        async for result in self._guard(event):
+        async for result in HealthCommandsMixin.health_today(self, event):
             yield result
-            return
-        activity, rates, measurement = await self.query_service.today_summary()
-        yield event.plain_result(
-            today_text(activity, rates, measurement, self.query_service.timezone)
-            + "\n"
-            + await self.query_service.care_snapshot("今天 睡眠 血氧 压力")
-        )
 
     @filter.command("健康详情")
     async def health_details(self, event: AstrMessageEvent):
-        """Show latest supported sleep, blood-oxygen, and stress cloud records."""
-        async for result in self._guard(event):
+        async for result in HealthCommandsMixin.health_details(self, event):
             yield result
-            return
-        yield event.plain_result(
-            "健康详情（云端已同步数据，非实时）\n"
-            + await self.query_service.care_snapshot("睡眠 血氧 压力")
-        )
 
     @filter.command("健康诊断")
     async def health_diagnose(self, event: AstrMessageEvent):
-        """Probe cloud keys safely to diagnose data availability, not the user."""
-        async for result in self._guard(event):
+        async for result in HealthCommandsMixin.health_diagnose(self, event):
             yield result
-            return
-        try:
-            data = await self.sync_service.probe_data_keys(
-                datetime.now(UTC) - timedelta(days=30), datetime.now(UTC)
-            )
-        except Exception as error:
-            yield event.plain_result(f"数据诊断无法连接：{redact_error(error)}")
-            return
-        yield event.plain_result(
-            "健康云数据诊断（仅记录数/脱敏错误，不含健康明细或凭证）\n"
-            + "\n".join(f"{key}：{value}" for key, value in data.items())
-        )
 
     @filter.command("健康状态")
     async def health_status(self, event: AstrMessageEvent):
-        """Show cache and synchronization status without exposing credentials."""
-        async for result in self._guard(event):
+        async for result in HealthCommandsMixin.health_status(self, event):
             yield result
-            return
-        last_sync = await self.query_service.latest_sync_at()
-        private_state = await asyncio.to_thread(
-            self.database.private_owner_session, self.owner_platform_id
-        )
-        monitor_running = bool(self._monitor_task and not self._monitor_task.done())
-        auto_running = bool(self._auto_task and not self._auto_task.done())
-        if auto_running:
-            background_status = f"自动同步（每 {self.sync_interval} 分钟）"
-        elif self._auto_sync_paused:
-            background_status = "已暂停（请检查授权）"
-        elif not self.user_id or not self.pass_token:
-            background_status = "未运行（缺少小米凭证）"
-        elif not self.auto_sync_enabled:
-            background_status = "未开启（按需同步）"
-        else:
-            background_status = "未运行"
-        mode_label = self._CONVERSATION_HEALTH_MODE_LABELS[
-            self._effective_conversation_health_mode()
-        ]
-        yield event.plain_result(
-            f"健康状态\n连接：{'已连接' if self.adapter.is_connected() else '未连接/待验证'}\n"
-            f"区域：{self.adapter.region or '自动探测'}\n最近同步完成时间：{self.query_service.display_timestamp(last_sync) if last_sync else '暂无'}\n"
-            f"平台实例校验：{'已启用' if self.owner_platform_instance_id else '未配置（健康功能禁用）'}\n"
-            f"后台同步：{background_status}\n"
-            f"主动关心检查：{'运行中' if monitor_running else '未运行'}"
-            f"（每 {self.monitor_interval} 分钟，仅检查本地数据）\n"
-            f"主动私聊目标：{'已记录' if private_state else '待所有者先私聊一次'}\n"
-            f"对话触发的数据刷新间隔：{self.natural_query_sync_minutes} 分钟\n"
-            f"日常对话数据方式：{mode_label}\n"
-            f"判断模型等待上限：{self.context_decision_timeout_seconds} 秒\n"
-            f"对话云端刷新等待上限：{self.natural_query_cloud_wait_seconds} 秒\n"
-            f"对话生活数据授权：{'开启' if self.allow_health_data_to_llm else '关闭'}\n"
-            f"主动判断私聊上下文授权：{'开启' if self.allow_proactive_chat_context else '关闭'}\n"
-            f"本地数据保留：{str(self.data_retention_days) + ' 天' if self.data_retention_days else '不自动清理'}"
-        )
 
     @filter.command("健康清除本地数据")
     async def clear_local_health_data(
         self, event: AstrMessageEvent, confirmation: str = ""
     ):
-        """Delete local cache only after an exact owner confirmation."""
-        async for result in self._guard(event):
+        async for result in HealthCommandsMixin.clear_local_health_data(
+            self, event, confirmation
+        ):
             yield result
-            return
-        if confirmation.strip() != "确认清除":
-            yield event.plain_result(
-                "此操作会清除插件本地缓存、同步状态和主动关心记录，"
-                "但不会删除小米云数据或配置凭证。"
-                "如确定，请发送：健康清除本地数据 确认清除"
-            )
-            return
-        if self.auto_sync_enabled or self.proactive_monitor_enabled:
-            yield event.plain_result(
-                "为避免清除后立即重新产生本地记录，请先在插件配置中关闭"
-                "“普通自动同步”和“主动关心检查”，重载插件后再执行清除。"
-            )
-            return
-        self._local_data_clear_in_progress = True
-        try:
-            for attribute in (
-                "_auto_task",
-                "_monitor_task",
-                "_natural_refresh_task",
-                "_connection_task",
-            ):
-                await self._cancel_owned_task(attribute)
-            self._pending_refresh_types.clear()
-            self._active_refresh_types.clear()
-            deleted = await self.sync_service.purge_local_data(self.owner_platform_id)
-        finally:
-            self._local_data_clear_in_progress = False
-        yield event.plain_result(
-            f"本地健康缓存已清除，共删除 {deleted} 条本地记录。"
-            "小米云端数据和插件配置凭证未被修改。"
-        )
 
     @filter.command("心率记录")
     async def heart_rate_records(self, event: AstrMessageEvent, hours: int = 24):
-        """Show recent cloud heart-rate records, capped to one week."""
-        async for result in self._guard(event):
+        async for result in HealthCommandsMixin.heart_rate_records(self, event, hours):
             yield result
-            return
-        rows = await self.query_service.heart_rates(hours)
-        if not rows:
-            yield event.plain_result("最近范围内没有缓存心率记录。请先执行 健康同步。")
-            return
-        lines = [f"最近 {max(1, min(hours, 168))} 小时心率记录（云端采集，非实时）"]
-        for row in rows[:20]:
-            kind = (
-                "运动"
-                if row["is_workout"]
-                else ("主动" if row["sample_type"] == "active" else "被动")
-            )
-            lines.append(
-                f"{self.query_service.display_timestamp(row['timestamp'])}｜{row['bpm']} bpm｜{kind}"
-            )
-        yield event.plain_result("\n".join(lines))
 
     @filter.command("身体数据")
     async def body_data(self, event: AstrMessageEvent):
-        """Show the latest cached smart-scale measurement."""
-        async for result in self._guard(event):
+        async for result in HealthCommandsMixin.body_data(self, event):
             yield result
-            return
-        yield event.plain_result(
-            measurement_text(
-                await self.query_service.body(), self.query_service.timezone
-            )
-        )
 
     @filter.command("健康趋势")
     async def health_trend(self, event: AstrMessageEvent, days: int = 7):
-        """Show a concise text trend of cached daily cloud records."""
-        async for result in self._guard(event):
+        async for result in HealthCommandsMixin.health_trend(self, event, days):
             yield result
-            return
-        rows = await self.query_service.trend(days)
-        if not rows:
-            yield event.plain_result("暂无趋势数据。请先执行 健康同步。")
-            return
-        lines = [f"最近 {max(1, min(days, 90))} 天趋势（云端已同步数据）"]
-        for row in rows:
-            heart = (
-                f"{row['avg_heart_rate']:.0f}"
-                if row["avg_heart_rate"] is not None
-                else "—"
-            )
-            lines.append(
-                f"{row['date']}｜步数 {row['steps']}｜活动 {row['active_kcal']:.0f} kcal｜平均心率 {heart}"
-            )
-        yield event.plain_result("\n".join(lines))

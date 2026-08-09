@@ -92,6 +92,10 @@ def install_logger_stub() -> None:
     agent_module = ModuleType("astrbot.core.agent")
     message_module = ModuleType("astrbot.core.agent.message")
     run_context_module = ModuleType("astrbot.core.agent.run_context")
+    runners_module = ModuleType("astrbot.core.agent.runners")
+    tool_loop_runner_module = ModuleType(
+        "astrbot.core.agent.runners.tool_loop_agent_runner"
+    )
     tool_module = ModuleType("astrbot.core.agent.tool")
     astr_agent_context_module = ModuleType("astrbot.core.astr_agent_context")
 
@@ -148,6 +152,9 @@ def install_logger_stub() -> None:
         def __init__(self, tools=None):
             self.tools = list(tools or [])
 
+        def empty(self):
+            return not self.tools
+
         def add_tool(self, tool):
             self.tools = [item for item in self.tools if item.name != tool.name]
             self.tools.append(tool)
@@ -155,8 +162,41 @@ def install_logger_stub() -> None:
         def get_tool(self, name):
             return next((item for item in self.tools if item.name == name), None)
 
+        def get_light_tool_set(self):
+            return ToolSet(self.tools)
+
+        def get_param_only_tool_set(self):
+            return ToolSet(self.tools)
+
+        def __bool__(self):
+            return bool(self.tools)
+
     class AstrAgentContext:
         pass
+
+    class ToolLoopAgentRunner:
+        def _func_tool_for_provider(self):
+            if not self.req.func_tool:
+                return None
+            modalities = self.provider.provider_config.get("modalities", None)
+            if isinstance(modalities, list) and "tool_use" not in modalities:
+                return None
+            return self.req.func_tool
+
+        async def _iter_llm_responses(self, *args, **kwargs):
+            del args, kwargs
+            for response in getattr(self, "_test_responses", []):
+                observed = getattr(self, "_test_seen_func_tools", None)
+                if observed is not None:
+                    observed.append(self._func_tool_for_provider())
+                yield response
+
+    ToolLoopAgentRunner._iter_llm_responses.__module__ = (
+        "astrbot.core.agent.runners.tool_loop_agent_runner"
+    )
+    ToolLoopAgentRunner._func_tool_for_provider.__module__ = (
+        "astrbot.core.agent.runners.tool_loop_agent_runner"
+    )
 
     message_module.Message = Message
     message_module.TextPart = TextPart
@@ -164,6 +204,7 @@ def install_logger_stub() -> None:
     tool_module.FunctionTool = FunctionTool
     tool_module.ToolExecResult = str
     tool_module.ToolSet = ToolSet
+    tool_loop_runner_module.ToolLoopAgentRunner = ToolLoopAgentRunner
     astr_agent_context_module.AstrAgentContext = AstrAgentContext
 
     astrbot_module.api = api_module
@@ -177,6 +218,10 @@ def install_logger_stub() -> None:
     sys.modules["astrbot.core.agent"] = agent_module
     sys.modules["astrbot.core.agent.message"] = message_module
     sys.modules["astrbot.core.agent.run_context"] = run_context_module
+    sys.modules["astrbot.core.agent.runners"] = runners_module
+    sys.modules["astrbot.core.agent.runners.tool_loop_agent_runner"] = (
+        tool_loop_runner_module
+    )
     sys.modules["astrbot.core.agent.tool"] = tool_module
     sys.modules["astrbot.core.astr_agent_context"] = astr_agent_context_module
 

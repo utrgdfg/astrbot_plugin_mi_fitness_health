@@ -13,8 +13,8 @@ from unittest.mock import patch
 
 import astrbot_test_stub  # noqa: F401
 from astrbot_plugin_mi_fitness_health.adapters import MiFitnessRateLimitError
-from astrbot_plugin_mi_fitness_health.models import SleepSession
-from astrbot_plugin_mi_fitness_health.services import SyncService
+from astrbot_plugin_mi_fitness_health.models import DailyActivity, SleepSession
+from astrbot_plugin_mi_fitness_health.services import SyncService, SyncServiceBusyError
 from astrbot_plugin_mi_fitness_health.storage import Database
 
 
@@ -59,6 +59,23 @@ class _RecordingAdapter:
 
 
 class SyncServiceTest(unittest.TestCase):
+    def test_purge_fails_fast_when_service_lock_is_still_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            service = SyncService(_RecordingAdapter(), database, "user")
+
+            async def run():
+                await service.lock.acquire()
+                try:
+                    with self.assertRaises(SyncServiceBusyError):
+                        await service.purge_local_data("owner", lock_timeout=0.01)
+                finally:
+                    service.lock.release()
+                return await service.purge_local_data("owner", lock_timeout=0.1)
+
+            self.assertEqual(asyncio.run(run()), 0)
+
     def test_empty_or_unknown_selection_is_rejected_before_network_access(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Database(Path(directory) / "health.sqlite3")
@@ -187,6 +204,7 @@ class SyncServiceTest(unittest.TestCase):
 
             asyncio.run(service.initialize())
             self.assertEqual(adapter.region, "cn")
+            self.assertFalse(service.activity_timezone_reset)
 
             database.set_metadata(service._region_metadata_key(), "CN")
             invalid_adapter = _RecordingAdapter()
@@ -203,6 +221,25 @@ class SyncServiceTest(unittest.TestCase):
             self.assertEqual(
                 database.get_metadata(explicit_service._region_metadata_key()), "us"
             )
+
+    def test_initialize_reports_activity_reset_after_timezone_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "health.sqlite3")
+            database.initialize()
+            now = datetime.now(UTC)
+            database.ensure_activity_timezone("user", "Asia/Shanghai")
+            database.upsert_activity(
+                "user", DailyActivity(now.date().isoformat(), 100, 80, 10, now)
+            )
+            database.update_sync_state("user", "daily_activity", now)
+            adapter = _RecordingAdapter()
+            service = SyncService(adapter, database, "user")
+
+            asyncio.run(service.initialize())
+
+            self.assertTrue(service.activity_timezone_reset)
+            self.assertIsNone(database.today_activity("user", now.date().isoformat()))
+            self.assertIsNone(database.latest_sync_at("user", ("daily_activity",)))
 
     def test_every_connection_path_persists_a_discovered_region(self) -> None:
         class DiscoveringAdapter(_RecordingAdapter):

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
+import threading
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime, time, timedelta, tzinfo
 from pathlib import Path
@@ -16,13 +18,14 @@ from ..models import (
     SleepSession,
 )
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 APPLICATION_ID = 0x4D464854  # "MFHT"
 OWNERSHIP_TABLE = "mi_fitness_plugin_metadata"
 OWNERSHIP_KEY = "application"
 OWNERSHIP_VALUE = "astrbot_plugin_mi_fitness_health"
 CUSTOM_DATABASE_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
 SQLITE_HEADER = b"SQLite format 3\x00"
+_INITIALIZE_LOCK = threading.Lock()
 
 
 class Database:
@@ -39,6 +42,11 @@ class Database:
         self.custom_path = custom_path
 
     def initialize(self) -> None:
+        """Serialize schema creation across plugin instances in this process."""
+        with _INITIALIZE_LOCK:
+            self._initialize_schema()
+
+    def _initialize_schema(self) -> None:
         """Create the schema and apply forward-only migrations."""
         if self.custom_path:
             self._validate_custom_path()
@@ -255,6 +263,10 @@ class Database:
                        ELSE message END
                        WHERE alert_type IN ('late_night_activity','proactive_message')"""
                 )
+                connection.execute("UPDATE schema_version SET version = 8")
+                current = 8
+            if current < 9:
+                self._migrate_heart_rate_record_ids_v9(connection)
                 connection.execute(
                     "UPDATE schema_version SET version = ?", (SCHEMA_VERSION,)
                 )
@@ -270,6 +282,73 @@ class Database:
                     ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
                 (OWNERSHIP_KEY, OWNERSHIP_VALUE),
             )
+
+    @staticmethod
+    def _canonical_heart_rate_record_id(record_id: object) -> str | None:
+        """Normalize only the two historical IDs whose suffix encoded the BPM."""
+        value = str(record_id)
+        for prefix in ("mi_fitness_resting_hr_", "mi_fitness_hr_"):
+            if not value.startswith(prefix):
+                continue
+            parts = value[len(prefix) :].split("_")
+            if len(parts) != 2 or not all(part.isdigit() for part in parts):
+                return None
+            timestamp, _bpm = parts
+            return f"{prefix}{timestamp}"
+        return None
+
+    @classmethod
+    def _migrate_heart_rate_record_ids_v9(cls, connection: sqlite3.Connection) -> None:
+        """Collapse BPM-suffixed legacy IDs, keeping the newest corrected sample."""
+        table_exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='heart_rate_samples'"
+        ).fetchone()
+        if not table_exists:
+            return
+        rows = connection.execute(
+            """SELECT rowid,* FROM heart_rate_samples
+               WHERE record_id LIKE 'mi_fitness_hr_%'
+                  OR record_id LIKE 'mi_fitness_resting_hr_%'"""
+        ).fetchall()
+        rows_by_id = {(str(row["user_id"]), str(row["record_id"])): row for row in rows}
+        groups: dict[tuple[str, str], list[sqlite3.Row]] = {}
+        for row in rows:
+            canonical = cls._canonical_heart_rate_record_id(row["record_id"])
+            if canonical is None:
+                continue
+            groups.setdefault((str(row["user_id"]), canonical), []).append(row)
+
+        delete_rowids: set[int] = set()
+        winners: list[tuple[object, ...]] = []
+        for (user_id, canonical), legacy_rows in groups.items():
+            canonical_row = rows_by_id.get((user_id, canonical))
+            candidates = [*legacy_rows, *([canonical_row] if canonical_row else [])]
+            winner = max(
+                candidates,
+                key=lambda row: (str(row["updated_at"]), int(row["rowid"])),
+            )
+            delete_rowids.update(int(row["rowid"]) for row in candidates)
+            winners.append(
+                (
+                    user_id,
+                    canonical,
+                    winner["timestamp"],
+                    winner["bpm"],
+                    winner["sample_type"],
+                    winner["is_workout"],
+                    winner["updated_at"],
+                )
+            )
+        connection.executemany(
+            "DELETE FROM heart_rate_samples WHERE rowid=?",
+            ((rowid,) for rowid in delete_rowids),
+        )
+        connection.executemany(
+            """INSERT INTO heart_rate_samples(
+                   user_id,record_id,timestamp,bpm,sample_type,is_workout,updated_at
+               ) VALUES(?,?,?,?,?,?,?)""",
+            winners,
+        )
 
     def _validate_custom_path(self) -> None:
         """Reject ambiguous or foreign files before opening a user-selected path."""
@@ -601,22 +680,65 @@ class Database:
                 (normalized, text),
             )
 
+    @staticmethod
+    def _activity_timezone_metadata_key(user_id: str) -> str:
+        """Namespace an activity timezone without storing the Xiaomi userId."""
+        digest = hashlib.sha256(str(user_id).encode("utf-8")).hexdigest()[:24]
+        return f"activity_timezone:{digest}"
+
+    def ensure_activity_timezone(self, user_id: str, timezone_name: str) -> bool:
+        """Record the aggregation zone and atomically reset stale daily buckets."""
+        normalized_timezone = str(timezone_name).strip()
+        if not normalized_timezone or len(normalized_timezone) > 128:
+            raise ValueError("活动聚合时区必须为 1 到 128 个字符")
+        key = self._activity_timezone_metadata_key(user_id)
+        with self._connect() as connection:
+            self._assert_owned_connection(connection)
+            row = connection.execute(
+                f"SELECT value FROM {OWNERSHIP_TABLE} WHERE key=?", (key,)
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    f"INSERT INTO {OWNERSHIP_TABLE}(key,value) VALUES(?,?)",
+                    (key, normalized_timezone),
+                )
+                return False
+            if str(row["value"]) == normalized_timezone:
+                return False
+            connection.execute("DELETE FROM daily_activity WHERE user_id=?", (user_id,))
+            connection.execute(
+                "DELETE FROM sync_state WHERE user_id=? AND data_type='daily_activity'",
+                (user_id,),
+            )
+            connection.execute(
+                "DELETE FROM sync_failures WHERE user_id=? AND data_type='daily_activity'",
+                (user_id,),
+            )
+            connection.execute(
+                f"UPDATE {OWNERSHIP_TABLE} SET value=? WHERE key=?",
+                (normalized_timezone, key),
+            )
+        return True
+
     @contextmanager
     def _connect(self, *, allow_unclaimed: bool = False):
         """Yield a transaction connection and always close its Windows file handle."""
         if self.custom_path:
             self._assert_no_link_components()
         connection = sqlite3.connect(self.path, timeout=30.0)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=30000")
-        connection.execute("PRAGMA secure_delete=ON")
         try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout=30000")
+            connection.execute("PRAGMA secure_delete=ON")
             if self.custom_path and not allow_unclaimed:
                 self._assert_owned_connection(connection)
             yield connection
             connection.commit()
         except Exception:
-            connection.rollback()
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
             raise
         finally:
             connection.close()
@@ -1195,10 +1317,10 @@ class Database:
         message: str,
         event_key: str | None = None,
         created_at: datetime | None = None,
-    ) -> None:
-        """Persist a non-diagnostic alert audit record."""
+    ) -> bool:
+        """Persist an audit record and report whether this caller inserted it."""
         with self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """INSERT OR IGNORE INTO alerts(
                        alert_type,created_at,message,event_key,owner_platform_id
                    ) VALUES(?,?,?,?,?)""",
@@ -1210,6 +1332,32 @@ class Database:
                     owner_platform_id,
                 ),
             )
+            return cursor.rowcount > 0
+
+    def confirm_alert_delivery(
+        self,
+        owner_platform_id: str,
+        alert_type: str,
+        message: str,
+        created_at: datetime,
+        event_key: str | None = None,
+    ) -> None:
+        """Upgrade one pre-send audit row without creating a second cooldown row."""
+        created_at_text = created_at.astimezone(UTC).isoformat()
+        with self._connect() as connection:
+            if event_key is None:
+                connection.execute(
+                    """UPDATE alerts SET message=?
+                       WHERE owner_platform_id=? AND alert_type=?
+                         AND event_key IS NULL AND created_at=?""",
+                    (message, owner_platform_id, alert_type, created_at_text),
+                )
+            else:
+                connection.execute(
+                    """UPDATE alerts SET message=?
+                       WHERE owner_platform_id=? AND alert_type=? AND event_key=?""",
+                    (message, owner_platform_id, alert_type, event_key),
+                )
 
     def last_alert_at(self, owner_platform_id: str, alert_type: str) -> str | None:
         """Return the latest alert timestamp for cooldown enforcement."""
