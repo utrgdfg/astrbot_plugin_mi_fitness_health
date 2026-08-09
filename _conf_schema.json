@@ -138,7 +138,12 @@
     "type": "int",
     "description": "对话触发的数据刷新间隔（分钟）",
     "hint": "日常聊天需要相关数据且缓存较旧时，插件会在后台刷新。默认 15 分钟；设置太短会增加小米云请求次数。",
-    "default": 15
+    "default": 15,
+    "slider": {
+      "min": 1,
+      "max": 120,
+      "step": 1
+    }
   },
   "natural_query_cloud_wait_seconds": {
     "type": "int",
@@ -220,7 +225,12 @@
     "type": "int",
     "description": "主动关心检查间隔（分钟）",
     "hint": "默认每 30 分钟检查一次本地数据与近期私聊活动，不会因此读取小米云。",
-    "default": 30
+    "default": 30,
+    "slider": {
+      "min": 5,
+      "max": 1440,
+      "step": 1
+    }
   },
   "enable_late_night_activity_check": {
     "type": "bool",
@@ -244,19 +254,34 @@
     "type": "int",
     "description": "多久内发过消息算仍在活跃（分钟）",
     "hint": "默认 45 分钟。超过这段时间没有私聊活动就不会触发。",
-    "default": 45
+    "default": 45,
+    "slider": {
+      "min": 5,
+      "max": 180,
+      "step": 1
+    }
   },
   "care_cooldown_minutes": {
     "type": "int",
     "description": "两次主动关心至少间隔多久（分钟）",
     "hint": "默认 120 分钟，避免频繁打扰。",
-    "default": 120
+    "default": 120,
+    "slider": {
+      "min": 30,
+      "max": 10080,
+      "step": 1
+    }
   },
   "proactive_daily_limit": {
     "type": "int",
     "description": "每天最多主动关心几次",
     "hint": "达到次数后当天不再主动发消息，默认 3 次。",
-    "default": 3
+    "default": 3,
+    "slider": {
+      "min": 1,
+      "max": 24,
+      "step": 1
+    }
   },
   "enable_auto_sync": {
     "type": "bool",
@@ -268,19 +293,34 @@
     "type": "int",
     "description": "普通自动同步间隔（分钟）",
     "hint": "只开启普通自动同步时使用，默认每 60 分钟读取一次小米云。",
-    "default": 60
+    "default": 60,
+    "slider": {
+      "min": 5,
+      "max": 1440,
+      "step": 1
+    }
   },
   "default_sync_days": {
     "type": "int",
     "description": "每次同步最近几天",
     "hint": "通常保持 7 天即可，插件会额外处理延迟上传的数据。",
-    "default": 7
+    "default": 7,
+    "slider": {
+      "min": 1,
+      "max": 90,
+      "step": 1
+    }
   },
   "data_retention_days": {
     "type": "int",
     "description": "本地数据保留天数",
     "hint": "默认 90 天；设为 0 可关闭自动清理。",
-    "default": 90
+    "default": 90,
+    "slider": {
+      "min": 0,
+      "max": 3650,
+      "step": 1
+    }
   },
   "database_path": {
     "type": "string",

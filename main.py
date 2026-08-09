@@ -86,7 +86,15 @@ def _config_int(
             key,
         )
         parsed = default
-    return max(minimum, min(parsed, maximum))
+    bounded = max(minimum, min(parsed, maximum))
+    if bounded != parsed:
+        logger.warning(
+            "[小米运动健康] 配置项 %s 超出允许范围，已限制在 %d～%d",
+            key,
+            minimum,
+            maximum,
+        )
+    return bounded
 
 
 class MiFitnessHealthPlugin(

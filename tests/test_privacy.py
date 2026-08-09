@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -14,7 +15,12 @@ class PrivacyTest(unittest.TestCase):
         metadata = (Path(__file__).parents[1] / "metadata.yaml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("version: v0.8.5", metadata)
+        version_match = re.search(r"^version:\s*(v\d+\.\d+\.\d+)\s*$", metadata, re.M)
+        self.assertIsNotNone(version_match)
+        changelog = (Path(__file__).parents[1] / "CHANGELOG.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(f"## [{version_match.group(1)}]", changelog)
         self.assertIn('astrbot_version: ">=4.24.2,<5"', metadata)
 
     def test_sensitive_llm_authorization_defaults_to_false_in_schema(self) -> None:

@@ -31,4 +31,13 @@ jobs:
           ruff check .
           ruff format --check .
       - name: Compile sources
-        run: python -m compileall -q adapters models services storage utils main.py
+        run: python -m compileall -q adapters features models services storage utils main.py
+      - name: Build installable archive
+        run: python scripts/build_release.py --output-dir dist
+      - name: Keep the Python 3.12 release candidate
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: astrbot-plugin-installation-zip
+          path: dist/*.zip
+          if-no-files-found: error

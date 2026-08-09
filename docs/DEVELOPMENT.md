@@ -102,3 +102,11 @@ python -m ruff format --check .
 3. 完整单元测试、Ruff、格式和真实 AstrBot 导入检查通过。
 4. 仓库中不存在 Cookie、`passToken`、用户 UID、Bot ID、个人截图或本地数据库。
 5. 安装说明仍与 AstrBot 当前 WebUI 的“从链接安装”和“从文件安装”入口一致。
+
+正式安装包统一由仓库脚本生成：
+
+```bash
+python scripts/build_release.py --output-dir dist
+```
+
+生成的 `astrbot_plugin_mi_fitness_health-vX.Y.Z.zip` 以 `main.py` 为压缩包根层入口，排除测试、缓存和数据库文件。将该文件作为同版本 GitHub Release 的资产上传；不要把 GitHub 自动生成的源码 ZIP 当作正式安装包。
