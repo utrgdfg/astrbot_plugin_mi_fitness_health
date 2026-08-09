@@ -747,3 +747,65 @@ class MiFitnessHealthPlugin(
         if denial_reason is None:
             return
         yield event.plain_result(denial_reason)
+
+    # AstrBot binds decorated handlers by their exact entrypoint module. Keep
+    # these wrappers in ``main.py`` while the implementations remain in the
+    # smaller, independently testable feature mixin.
+    @filter.command("健康帮助")
+    async def health_help(self, event: AstrMessageEvent):
+        async for result in HealthCommandsMixin.health_help(self, event):
+            yield result
+
+    @filter.command("健康连接")
+    async def health_connection(self, event: AstrMessageEvent):
+        async for result in HealthCommandsMixin.health_connection(self, event):
+            yield result
+
+    @filter.command("健康同步")
+    async def health_sync(self, event: AstrMessageEvent):
+        async for result in HealthCommandsMixin.health_sync(self, event):
+            yield result
+
+    @filter.command("今日健康")
+    async def health_today(self, event: AstrMessageEvent):
+        async for result in HealthCommandsMixin.health_today(self, event):
+            yield result
+
+    @filter.command("健康详情")
+    async def health_details(self, event: AstrMessageEvent):
+        async for result in HealthCommandsMixin.health_details(self, event):
+            yield result
+
+    @filter.command("健康诊断")
+    async def health_diagnose(self, event: AstrMessageEvent):
+        async for result in HealthCommandsMixin.health_diagnose(self, event):
+            yield result
+
+    @filter.command("健康状态")
+    async def health_status(self, event: AstrMessageEvent):
+        async for result in HealthCommandsMixin.health_status(self, event):
+            yield result
+
+    @filter.command("健康清除本地数据")
+    async def clear_local_health_data(
+        self, event: AstrMessageEvent, confirmation: str = ""
+    ):
+        async for result in HealthCommandsMixin.clear_local_health_data(
+            self, event, confirmation
+        ):
+            yield result
+
+    @filter.command("心率记录")
+    async def heart_rate_records(self, event: AstrMessageEvent, hours: int = 24):
+        async for result in HealthCommandsMixin.heart_rate_records(self, event, hours):
+            yield result
+
+    @filter.command("身体数据")
+    async def body_data(self, event: AstrMessageEvent):
+        async for result in HealthCommandsMixin.body_data(self, event):
+            yield result
+
+    @filter.command("健康趋势")
+    async def health_trend(self, event: AstrMessageEvent, days: int = 7):
+        async for result in HealthCommandsMixin.health_trend(self, event, days):
+            yield result

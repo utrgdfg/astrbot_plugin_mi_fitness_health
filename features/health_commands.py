@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent
 
 from ..utils import measurement_text, today_text
 from ..utils.privacy import redact_error
@@ -20,7 +20,6 @@ class HealthCommandsMixin:
         "local_rules": "本地轻量规则",
     }
 
-    @filter.command("健康帮助")
     async def health_help(self, event: AstrMessageEvent):
         """Show commands and privacy boundaries."""
         async for result in self._guard(event):
@@ -42,7 +41,6 @@ class HealthCommandsMixin:
             "数据用于让日常对话更贴近你；它不是实时监护，也不用于医疗诊断。"
         )
 
-    @filter.command("健康连接")
     async def health_connection(self, event: AstrMessageEvent):
         """Start a bounded background connection check and release the pipeline."""
         async for result in self._guard(event):
@@ -91,7 +89,6 @@ class HealthCommandsMixin:
         if error_text:
             yield event.plain_result(error_text)
 
-    @filter.command("健康同步")
     async def health_sync(self, event: AstrMessageEvent):
         """Manually synchronize a bounded recent cloud-data window."""
         async for result in self._guard(event):
@@ -158,7 +155,6 @@ class HealthCommandsMixin:
                         reply = f"健康同步失败：{redact_error(error)}"
         yield event.plain_result(reply)
 
-    @filter.command("今日健康")
     async def health_today(self, event: AstrMessageEvent):
         """Show cached user-local daily summary."""
         async for result in self._guard(event):
@@ -171,7 +167,6 @@ class HealthCommandsMixin:
             + await self.query_service.care_snapshot("今天 睡眠 血氧 压力")
         )
 
-    @filter.command("健康详情")
     async def health_details(self, event: AstrMessageEvent):
         """Show latest supported sleep, blood-oxygen, and stress cloud records."""
         async for result in self._guard(event):
@@ -182,7 +177,6 @@ class HealthCommandsMixin:
             + await self.query_service.care_snapshot("睡眠 血氧 压力")
         )
 
-    @filter.command("健康诊断")
     async def health_diagnose(self, event: AstrMessageEvent):
         """Probe cloud keys safely to diagnose data availability, not the user."""
         async for result in self._guard(event):
@@ -211,7 +205,6 @@ class HealthCommandsMixin:
                     )
         yield event.plain_result(reply)
 
-    @filter.command("健康状态")
     async def health_status(self, event: AstrMessageEvent):
         """Show cache and synchronization status without exposing credentials."""
         async for result in self._guard(event):
@@ -259,7 +252,6 @@ class HealthCommandsMixin:
             f"本地数据保留：{str(self.data_retention_days) + ' 天' if self.data_retention_days else '不自动清理'}"
         )
 
-    @filter.command("健康清除本地数据")
     async def clear_local_health_data(
         self, event: AstrMessageEvent, confirmation: str = ""
     ):
@@ -307,7 +299,6 @@ class HealthCommandsMixin:
             "小米云端数据和插件配置凭证未被修改。"
         )
 
-    @filter.command("心率记录")
     async def heart_rate_records(self, event: AstrMessageEvent, hours: int = 24):
         """Show recent cloud heart-rate records, capped to one week."""
         async for result in self._guard(event):
@@ -329,7 +320,6 @@ class HealthCommandsMixin:
             )
         yield event.plain_result("\n".join(lines))
 
-    @filter.command("身体数据")
     async def body_data(self, event: AstrMessageEvent):
         """Show the latest cached smart-scale measurement."""
         async for result in self._guard(event):
@@ -341,7 +331,6 @@ class HealthCommandsMixin:
             )
         )
 
-    @filter.command("健康趋势")
     async def health_trend(self, event: AstrMessageEvent, days: int = 7):
         """Show a concise text trend of cached daily cloud records."""
         async for result in self._guard(event):
