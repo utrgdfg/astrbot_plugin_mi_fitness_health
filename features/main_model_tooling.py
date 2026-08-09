@@ -33,7 +33,7 @@ class MainModelToolingMixin:
         self,
         context: ContextWrapper[AstrAgentContext],
         current_message: str,
-    ) -> str:
+    ) -> str | None:
         """Infer a small data slice after the main model has requested the tool."""
         candidates = [current_message]
         for message in reversed(context.messages):
@@ -54,7 +54,7 @@ class MainModelToolingMixin:
                 focus = self._care_focus(text)
                 break
         if not focus:
-            focus = "综合概况"
+            return None
         return self._normalize_context_focus_for_message(current_message, focus)
 
     async def _load_main_model_private_context(
@@ -70,6 +70,8 @@ class MainModelToolingMixin:
             return None
         current_message = self._sanitize_focus(event.get_message_str())
         focus = self._main_model_tool_focus(context, current_message)
+        if not focus:
+            return None
         wait_seconds = float(self.natural_query_cloud_wait_seconds)
         await self._refresh_for_natural_question(
             focus,

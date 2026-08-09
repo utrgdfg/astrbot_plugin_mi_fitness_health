@@ -16,8 +16,12 @@ import astrbot_test_stub  # noqa: F401
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.message import Message, TextPart
 from astrbot.core.agent.run_context import ContextWrapper
+from astrbot.core.agent.tool import FunctionTool, ToolSet
 from astrbot_plugin_mi_fitness_health.adapters import MiFitnessAuthenticationError
-from astrbot_plugin_mi_fitness_health.features import PRIVATE_HEALTH_TOOL_NAME
+from astrbot_plugin_mi_fitness_health.features import (
+    PRIVATE_HEALTH_TOOL_NAME,
+    add_private_health_tool,
+)
 from astrbot_plugin_mi_fitness_health.features.private_health_tool import (
     PrivateHealthContextTool,
 )
@@ -42,7 +46,13 @@ class MainLifecycleTest(unittest.TestCase):
         plugin.context_decision_include_bot_messages = True
         plugin._last_proactive_delivery_at = None
         plugin._connection_task = None
+        plugin._owner_activity_task = None
+        plugin._pending_owner_activity = None
         plugin._detached_tasks = set()
+        plugin._maintenance_lock = asyncio.Lock()
+        plugin._local_data_clear_in_progress = False
+        plugin._pending_refresh_types = set()
+        plugin._active_refresh_types = set()
         plugin.sync_service = Mock()
         plugin.sync_service.lock = asyncio.Lock()
         return plugin
@@ -534,6 +544,7 @@ class MainLifecycleTest(unittest.TestCase):
         self.assertEqual(private_message.content[0].text, "今天补了")
         self.assertTrue(private_message.content[-1]._no_save)
         self.assertIn("420 分钟", private_message.content[-1].text)
+        self.assertEqual(request.func_tool.tools, [])
 
     def test_main_model_tool_zero_wait_starts_background_refresh_without_waiting(
         self,
@@ -589,6 +600,60 @@ class MainLifecycleTest(unittest.TestCase):
 
         focus = plugin._main_model_tool_focus(context, "补了")
         self.assertEqual(focus, "今天 睡眠")
+
+    def test_main_model_tool_without_a_health_topic_fails_closed(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.conversation_health_mode = "main_model"
+        plugin.context_decision_prompt = "按上下文判断。"
+        plugin.natural_query_cloud_wait_seconds = 5
+        plugin.care_dialogue_enabled = True
+        plugin.allow_health_data_to_llm = True
+        plugin._is_private_owner_event = Mock(return_value=True)
+        plugin._refresh_for_natural_question = AsyncMock()
+        plugin.query_service = Mock()
+        plugin.query_service.normalize_llm_focus.side_effect = (
+            QueryService.normalize_llm_focus
+        )
+        plugin.query_service.llm_care_snapshot = AsyncMock()
+        event = Mock()
+        event.get_message_str.return_value = "帮我换个话题"
+        request = ProviderRequest()
+
+        asyncio.run(plugin.add_owner_health_context(event, request))
+        tool = request.func_tool.get_tool(PRIVATE_HEALTH_TOOL_NAME)
+        context = ContextWrapper(
+            context=SimpleNamespace(event=event),
+            messages=[Message(role="user", content=[TextPart("帮我换个话题")])],
+        )
+
+        result = asyncio.run(tool.call(context))
+
+        self.assertIn("No verified", result)
+        plugin._refresh_for_natural_question.assert_not_awaited()
+        plugin.query_service.llm_care_snapshot.assert_not_awaited()
+
+    def test_loading_private_context_revokes_every_other_request_tool(self) -> None:
+        loader = AsyncMock(return_value="已核实睡眠摘要")
+        request = ProviderRequest()
+        request.func_tool = ToolSet()
+        request.func_tool.add_tool(
+            FunctionTool(
+                name="side_effecting_tool",
+                description="send data elsewhere",
+                parameters={"type": "object", "properties": {}},
+            )
+        )
+        add_private_health_tool(request, loader, "按需判断")
+        private_tool = request.func_tool.get_tool(PRIVATE_HEALTH_TOOL_NAME)
+        context = ContextWrapper(
+            context=None,
+            messages=[Message(role="user", content=[TextPart("昨晚睡得怎么样")])],
+        )
+
+        result = asyncio.run(private_tool.call(context))
+
+        self.assertIn("loaded temporarily", result)
+        self.assertEqual(request.func_tool.tools, [])
 
     def test_main_model_tool_redacts_loader_failures_from_tool_result(self) -> None:
         loader = AsyncMock(side_effect=RuntimeError("PRIVATE_ERROR_DETAIL"))
@@ -952,15 +1017,20 @@ class MainLifecycleTest(unittest.TestCase):
         event.unified_msg_origin = "napcat:FriendMessage:owner"
         event.get_message_str.return_value = "这是一条不应保留的私聊原文"
 
-        asyncio.run(plugin.remember_owner_private_activity(event))
+        async def run():
+            await plugin.remember_owner_private_activity(event)
+            await plugin._owner_activity_task
+
+        asyncio.run(run())
 
         self.assertIsNone(plugin._latest_owner_message)
-        plugin.database.touch_private_owner_session.assert_called_once_with(
-            "owner",
-            event.unified_msg_origin,
-            None,
-            True,
-        )
+        plugin.database.touch_private_owner_session.assert_called_once()
+        call = plugin.database.touch_private_owner_session.call_args.args
+        self.assertEqual(call[0], "owner")
+        self.assertEqual(call[1], event.unified_msg_origin)
+        self.assertIsInstance(call[2], datetime)
+        self.assertEqual(call[2].tzinfo, UTC)
+        self.assertTrue(call[3])
 
     def test_private_message_text_is_retained_only_with_context_consent(self) -> None:
         plugin = self._bare_plugin()
@@ -974,13 +1044,41 @@ class MainLifecycleTest(unittest.TestCase):
         event.unified_msg_origin = "napcat:FriendMessage:owner"
         event.get_message_str.return_value = "我准备休息了"
 
-        asyncio.run(plugin.remember_owner_private_activity(event))
+        async def run():
+            await plugin.remember_owner_private_activity(event)
+            await plugin._owner_activity_task
+
+        asyncio.run(run())
 
         self.assertIsNotNone(plugin._latest_owner_message)
         self.assertEqual(
             plugin._latest_owner_message[:2],
             (event.unified_msg_origin, "我准备休息了"),
         )
+
+    def test_owner_activity_persistence_failure_does_not_abort_private_chat(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        plugin.allow_proactive_chat_context = False
+        plugin._is_private_owner_event = Mock(return_value=True)
+        plugin.owner_platform_id = "owner"
+        plugin.owner_platform_instance_id = "napcat"
+        plugin.database = Mock()
+        plugin.database.touch_private_owner_session.side_effect = RuntimeError(
+            "database busy"
+        )
+        event = Mock()
+        event.unified_msg_origin = "napcat:FriendMessage:owner"
+
+        async def run():
+            await plugin.remember_owner_private_activity(event)
+            await plugin._owner_activity_task
+
+        asyncio.run(run())
+
+        plugin.database.touch_private_owner_session.assert_called_once()
+        self.assertIsNone(plugin._owner_activity_task)
 
     def test_platform_history_without_private_proof_is_ignored(self) -> None:
         plugin = self._bare_plugin()
@@ -1338,6 +1436,93 @@ class MainLifecycleTest(unittest.TestCase):
                     "今天 睡眠",
                     "今日睡眠 420 分钟",
                     None,
+                )
+            elapsed = asyncio.get_running_loop().time() - started
+            detached_during_cleanup = len(plugin._detached_tasks)
+            release_cleanup.set()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return reply, elapsed, detached_during_cleanup
+
+        reply, elapsed, detached_during_cleanup = asyncio.run(run())
+
+        self.assertIsNone(reply)
+        self.assertLess(elapsed, 0.1)
+        self.assertEqual(detached_during_cleanup, 1)
+
+    def test_proactive_decision_hard_timeout_does_not_stall_monitor(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.allow_health_data_to_llm = True
+        plugin.allow_proactive_chat_context = True
+        plugin.proactive_reminder_provider_id = "stuck-provider"
+        plugin.proactive_decision_prompt = "谨慎判断。"
+        plugin._recent_private_context = AsyncMock(return_value=["用户: 还醒着"])
+        plugin._health_provider_id = AsyncMock(return_value="stuck-provider")
+        plugin.context = Mock()
+
+        async def run():
+            release_cleanup = asyncio.Event()
+
+            async def stuck_provider(**kwargs):
+                del kwargs
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await release_cleanup.wait()
+                    raise
+
+            plugin.context.llm_generate = stuck_provider
+            started = asyncio.get_running_loop().time()
+            with patch(
+                "astrbot_plugin_mi_fitness_health.features.proactive_care.PROACTIVE_DECISION_TIMEOUT_SECONDS",
+                0.01,
+            ):
+                decision = await plugin._should_send_proactive_care(
+                    "qq:FriendMessage:123",
+                    ["当前为深夜且所有者刚刚有私聊活动"],
+                )
+            elapsed = asyncio.get_running_loop().time() - started
+            detached_during_cleanup = len(plugin._detached_tasks)
+            release_cleanup.set()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return decision, elapsed, detached_during_cleanup
+
+        decision, elapsed, detached_during_cleanup = asyncio.run(run())
+
+        self.assertFalse(decision)
+        self.assertLess(elapsed, 0.1)
+        self.assertEqual(detached_during_cleanup, 1)
+
+    def test_proactive_reply_hard_timeout_does_not_stall_monitor(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.allow_health_data_to_llm = True
+        plugin.proactive_reminder_provider_id = "stuck-provider"
+        plugin.proactive_reminder_persona_id = "persona"
+        plugin._owner_persona_prompt = AsyncMock(return_value="persona prompt")
+        plugin._health_provider_id = AsyncMock(return_value="stuck-provider")
+        plugin.context = Mock()
+
+        async def run():
+            release_cleanup = asyncio.Event()
+
+            async def stuck_provider(**kwargs):
+                del kwargs
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await release_cleanup.wait()
+                    raise
+
+            plugin.context.llm_generate = stuck_provider
+            started = asyncio.get_running_loop().time()
+            with patch(
+                "astrbot_plugin_mi_fitness_health.features.proactive_care.PROACTIVE_REPLY_TIMEOUT_SECONDS",
+                0.01,
+            ):
+                reply = await plugin._compose_proactive_reply(
+                    "qq:FriendMessage:123",
+                    ["当前为深夜且所有者刚刚有私聊活动"],
                 )
             elapsed = asyncio.get_running_loop().time() - started
             detached_during_cleanup = len(plugin._detached_tasks)
@@ -2228,6 +2413,7 @@ class MainLifecycleTest(unittest.TestCase):
 
         self.assertTrue(running)
         self.assertEqual(results, [])
+        event.stop_event.assert_called_once_with()
         plugin.database.touch_private_owner_session.assert_called_once_with(
             "123", "qq:FriendMessage:123", None, True
         )
@@ -2275,6 +2461,7 @@ class MainLifecycleTest(unittest.TestCase):
 
         self.assertEqual(results, [])
         self.assertTrue(running)
+        event.stop_event.assert_called_once_with()
         plugin.database.touch_private_owner_session.assert_called_once_with(
             "123", "qq:FriendMessage:123", None, True
         )
@@ -2303,6 +2490,67 @@ class MainLifecycleTest(unittest.TestCase):
                 await plugin._connection_task
 
         self.assertEqual(asyncio.run(run()), [])
+        event.stop_event.assert_called_once_with()
+
+    def test_concurrent_health_connection_starts_only_one_worker(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.user_id = "synthetic-user"
+        plugin.pass_token = "synthetic-token"
+        plugin.database = Mock()
+        plugin.owner_platform_id = "123"
+        entered_touch = asyncio.Event()
+        release_touch = asyncio.Event()
+        release_worker = asyncio.Event()
+
+        async def allow_guard(event):
+            if False:
+                yield None
+
+        async def delayed_to_thread(*args):
+            del args
+            entered_touch.set()
+            await release_touch.wait()
+
+        async def blocked_worker(session):
+            del session
+            await release_worker.wait()
+
+        plugin._guard = allow_guard
+        plugin._connection_worker = AsyncMock(side_effect=blocked_worker)
+        first_event = Mock()
+        first_event.unified_msg_origin = "qq:FriendMessage:123"
+        first_event.plain_result.side_effect = lambda text: text
+        second_event = Mock()
+        second_event.unified_msg_origin = "qq:FriendMessage:123"
+        second_event.plain_result.side_effect = lambda text: text
+
+        async def collect(event):
+            return [item async for item in plugin.health_connection(event)]
+
+        async def run():
+            with patch(
+                "astrbot_plugin_mi_fitness_health.main.asyncio.to_thread",
+                side_effect=delayed_to_thread,
+            ):
+                first = asyncio.create_task(collect(first_event))
+                await entered_touch.wait()
+                second_results = await collect(second_event)
+                release_touch.set()
+                first_results = await first
+            await asyncio.sleep(0)
+            running_task = plugin._connection_task
+            release_worker.set()
+            await running_task
+            return first_results, second_results
+
+        first_results, second_results = asyncio.run(run())
+
+        self.assertEqual(first_results, [])
+        self.assertEqual(len(second_results), 1)
+        self.assertIn("正在进行", second_results[0])
+        self.assertEqual(plugin._connection_worker.await_count, 1)
+        first_event.stop_event.assert_called_once_with()
+        second_event.stop_event.assert_called_once_with()
 
     def test_background_connection_sends_terminal_result_to_verified_session(
         self,
@@ -2806,6 +3054,58 @@ class MainLifecycleTest(unittest.TestCase):
         self.assertIn("本地健康缓存已清除", result)
         plugin.query_service.latest_sync_at.assert_not_awaited()
         self.assertFalse(plugin._local_data_clear_in_progress)
+
+    def test_local_clear_rejects_a_concurrent_manual_sync(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.auto_sync_enabled = False
+        plugin.proactive_monitor_enabled = False
+        plugin._auto_task = None
+        plugin._monitor_task = None
+        plugin._natural_refresh_task = None
+        plugin._connection_task = None
+        plugin.owner_platform_id = "owner"
+        plugin._sync = AsyncMock()
+        purge_started = asyncio.Event()
+        release_purge = asyncio.Event()
+
+        async def purge(owner):
+            del owner
+            purge_started.set()
+            await release_purge.wait()
+            return 5
+
+        plugin.sync_service = Mock()
+        plugin.sync_service.purge_local_data = AsyncMock(side_effect=purge)
+
+        async def allow_guard(event):
+            if False:
+                yield None
+
+        plugin._guard = allow_guard
+        event = Mock()
+        event.plain_result.side_effect = lambda text: text
+
+        async def run():
+            clear_task = asyncio.create_task(
+                anext(
+                    plugin.clear_local_health_data(
+                        event,
+                        "确认清除",
+                    )
+                )
+            )
+            await purge_started.wait()
+            sync_results = [item async for item in plugin.health_sync(event)]
+            release_purge.set()
+            clear_result = await clear_task
+            return sync_results, clear_result
+
+        sync_results, clear_result = asyncio.run(run())
+
+        self.assertEqual(len(sync_results), 1)
+        self.assertIn("正在清除", sync_results[0])
+        self.assertIn("本地健康缓存已清除", clear_result)
+        plugin._sync.assert_not_awaited()
 
     def test_health_help_does_not_expose_configuration_when_guard_denies(self) -> None:
         plugin = self._bare_plugin()

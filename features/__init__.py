@@ -4,6 +4,7 @@ from .conversation_routing import (
     DEFAULT_CONTEXT_DECISION_PROMPT,
     ConversationRoutingMixin,
 )
+from .health_commands import HealthCommandsMixin
 from .main_model_tooling import MainModelToolingMixin
 from .private_health_tool import (
     PRIVATE_HEALTH_CONTEXT_TAG,
@@ -24,6 +25,7 @@ __all__ = [
     "DEFAULT_CONTEXT_DECISION_PROMPT",
     "DEFAULT_PROACTIVE_CONTEXT_PROMPT",
     "DEFAULT_PROACTIVE_DECISION_PROMPT",
+    "HealthCommandsMixin",
     "MainModelToolingMixin",
     "ProactiveCareMixin",
     "PRIVATE_HEALTH_CONTEXT_TAG",

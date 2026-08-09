@@ -28,12 +28,18 @@ SAFE_TOOL_RESULT_UNAVAILABLE = (
 PrivateContextLoader = Callable[
     [ContextWrapper[AstrAgentContext]], Awaitable[str | None]
 ]
+ContextLoadedCallback = Callable[[], None]
 
 
 class PrivateHealthContextTool(FunctionTool[AstrAgentContext]):
     """Let the current main model request private context without logging its values."""
 
-    def __init__(self, loader: PrivateContextLoader, routing_prompt: str) -> None:
+    def __init__(
+        self,
+        loader: PrivateContextLoader,
+        routing_prompt: str,
+        on_context_loaded: ContextLoadedCallback | None = None,
+    ) -> None:
         bounded_prompt = " ".join(str(routing_prompt or "").split())[:2400]
         description = (
             "Load verified Xiaomi Mi Fitness life data for the configured owner. "
@@ -59,6 +65,13 @@ class PrivateHealthContextTool(FunctionTool[AstrAgentContext]):
             parameters={"type": "object", "properties": {}},
         )
         self._loader = loader
+        self._on_context_loaded = on_context_loaded
+
+    def _finish_loaded(self) -> str:
+        """Revoke every request-scoped tool after private context becomes visible."""
+        if self._on_context_loaded is not None:
+            self._on_context_loaded()
+        return SAFE_TOOL_RESULT_LOADED
 
     async def call(
         self, context: ContextWrapper[AstrAgentContext], **kwargs: Any
@@ -90,17 +103,17 @@ class PrivateHealthContextTool(FunctionTool[AstrAgentContext]):
             content = getattr(message, "content", None)
             if isinstance(content, str):
                 message.content = [TextPart(text=content), temporary_part]
-                return SAFE_TOOL_RESULT_LOADED
+                return self._finish_loaded()
             if isinstance(content, list):
                 content.append(temporary_part)
-                return SAFE_TOOL_RESULT_LOADED
+                return self._finish_loaded()
 
         # A normal main-agent turn always contains a user message. Keep a
         # fail-safe temporary message for unusual runners that omit it.
         fallback = Message(role="user", content=[temporary_part])
         fallback._no_save = True
         context.messages.append(fallback)
-        return SAFE_TOOL_RESULT_LOADED
+        return self._finish_loaded()
 
 
 def add_private_health_tool(
@@ -111,7 +124,25 @@ def add_private_health_tool(
     """Expose the private tool only on the already-authorized LLM request."""
     if req.func_tool is None:
         req.func_tool = ToolSet()
-    req.func_tool.add_tool(PrivateHealthContextTool(loader, routing_prompt))
+    owned_tool_set = req.func_tool
+
+    def disable_remaining_tools() -> None:
+        # In AstrBot's full-schema mode this is the active ToolSet. In
+        # skills-like mode the runner retains this set for execution and swaps
+        # ``req.func_tool`` to a lightweight copy. Clear both references so no
+        # side-effecting tool can run after private health context is loaded.
+        owned_tool_set.tools.clear()
+        active_tool_set = req.func_tool
+        if active_tool_set is not None and active_tool_set is not owned_tool_set:
+            active_tool_set.tools.clear()
+
+    owned_tool_set.add_tool(
+        PrivateHealthContextTool(
+            loader,
+            routing_prompt,
+            on_context_loaded=disable_remaining_tools,
+        )
+    )
 
 
 def _tool_call_name(tool_call: object) -> str:

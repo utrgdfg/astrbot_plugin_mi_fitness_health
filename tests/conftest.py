@@ -11,6 +11,8 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 TESTS_ROOT = REPOSITORY_ROOT / "tests"
 
 sys.path.insert(0, str(TESTS_ROOT))
+import astrbot_test_stub  # noqa: E402, F401
+
 if REPOSITORY_ROOT.name == PACKAGE_NAME:
     sys.path.insert(0, str(REPOSITORY_ROOT.parent))
 elif PACKAGE_NAME not in sys.modules:
