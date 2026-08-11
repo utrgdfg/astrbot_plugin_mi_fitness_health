@@ -15,7 +15,15 @@ class PrivacyTest(unittest.TestCase):
         metadata = (Path(__file__).parents[1] / "metadata.yaml").read_text(
             encoding="utf-8"
         )
-        version_match = re.search(r"^version:\s*(v\d+\.\d+\.\d+)\s*$", metadata, re.M)
+        version_match = re.search(
+            r"^version:\s*"
+            r"(v\d+\.\d+\.\d+"
+            r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+            r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)"
+            r"\s*$",
+            metadata,
+            re.M,
+        )
         self.assertIsNotNone(version_match)
         changelog = (Path(__file__).parents[1] / "CHANGELOG.md").read_text(
             encoding="utf-8"

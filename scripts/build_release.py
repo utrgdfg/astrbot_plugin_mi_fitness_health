@@ -37,7 +37,14 @@ RUNTIME_PACKAGES = (
     "utils",
 )
 TEXT_SUFFIXES = {".json", ".md", ".py", ".txt", ".yaml", ".yml"}
-VERSION_PATTERN = re.compile(r"^version:\s*(v\d+\.\d+\.\d+)\s*$", re.MULTILINE)
+VERSION_PATTERN = re.compile(
+    r"^version:\s*"
+    r"(v\d+\.\d+\.\d+"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)"
+    r"\s*$",
+    re.MULTILINE,
+)
 FORBIDDEN_SUFFIXES = {
     "-journal",
     "-shm",
@@ -56,7 +63,7 @@ def metadata_version(repository_root: Path) -> str:
     text = (repository_root / "metadata.yaml").read_text(encoding="utf-8")
     match = VERSION_PATTERN.search(text)
     if match is None:
-        raise ValueError("metadata.yaml 缺少有效的 vX.Y.Z 版本号")
+        raise ValueError("metadata.yaml 缺少有效的语义化版本号")
     return match.group(1)
 
 
