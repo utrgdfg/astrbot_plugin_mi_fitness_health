@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import astrbot_test_stub  # noqa: F401
+from astrbot.api import logger
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
 from astrbot.core.agent.tool import FunctionTool, ToolSet
@@ -415,7 +416,10 @@ class MainLifecycleTest(unittest.TestCase):
             {"role": "system", "content": "系统提示不得发送"},
             {"role": "user", "content": "昨晚一直在忙"},
             {"role": "tool", "content": "工具结果不得发送"},
-            {"role": "assistant", "content": "[Image Attachment: path D:/private.jpg]"},
+            {
+                "role": "assistant",
+                "content": "[Image Attachment: path D:/synthetic/private.jpg]",
+            },
             {
                 "role": "assistant",
                 "content": [{"type": "text", "text": "你是不是又没休息"}],
@@ -1229,6 +1233,24 @@ class MainLifecycleTest(unittest.TestCase):
                 self.assertFalse(
                     plugin._provider_native_tools_are_unsafe("provider-id")
                 )
+
+    def test_native_provider_warning_does_not_log_provider_identifier(self) -> None:
+        plugin = self._bare_plugin()
+        del plugin.__dict__["_provider_native_tools_are_unsafe"]
+        plugin.context = Mock()
+        plugin.context.get_provider_by_id.return_value = Mock(
+            provider_config={
+                "type": "xai_chat_completion",
+                "xai_native_search": True,
+            }
+        )
+        provider_id = "synthetic-private-provider"
+        logger.reset_mock()
+
+        self.assertTrue(plugin._provider_native_tools_are_unsafe(provider_id))
+
+        rendered_calls = " ".join(str(call) for call in logger.warning.call_args_list)
+        self.assertNotIn(provider_id, rendered_calls)
 
     def test_main_model_native_provider_blocks_classifier_and_refresh(self) -> None:
         plugin = self._bare_plugin()
@@ -2290,6 +2312,26 @@ class MainLifecycleTest(unittest.TestCase):
 
         self.assertIn("自然、温和、简短", prompt)
         plugin.context.persona_manager.get_persona.assert_not_called()
+
+    def test_missing_persona_warning_does_not_log_persona_identifier(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.context = Mock()
+        plugin.context.persona_manager = Mock()
+        plugin.context.persona_manager.get_persona = AsyncMock(return_value=None)
+        persona_id = "synthetic-private-persona"
+        logger.reset_mock()
+
+        prompt = asyncio.run(
+            plugin._owner_persona_prompt(
+                "qq:FriendMessage:synthetic-owner",
+                preferred_persona_id=persona_id,
+                allow_session_persona=False,
+            )
+        )
+
+        self.assertIn("自然、温和、简短", prompt)
+        rendered_calls = " ".join(str(call) for call in logger.warning.call_args_list)
+        self.assertNotIn(persona_id, rendered_calls)
 
     def test_proactive_reply_rejects_links_mentions_and_commands(self) -> None:
         unsafe_replies = (

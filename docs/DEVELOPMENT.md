@@ -89,6 +89,7 @@ python -m pip install -r requirements.txt pytest ruff
 python -m pytest
 python -m ruff check .
 python -m ruff format --check .
+python scripts/privacy_gate.py --repository .
 ```
 
 `pyproject.toml` 提供统一 pytest/Ruff 配置，`tests/conftest.py` 允许任意 ZIP 解压目录名下收集测试，GitHub Actions 使用 Python 3.11 和 3.12 复现以上检查。独立的 Runner 契约任务会检出 AstrBot v4.24.2 与 v4.27.2 的真实源码，核对插件依赖的私有方法、skills-like 标记、ToolSet 变体、临时内容和 fallback 调用顺序；业务行为测试仍使用最小 stub，避免连接真实服务。测试覆盖授权边界、云端字段解析、响应预算、限流熔断、睡眠链路、心率范围、活动覆盖保护、SQLite 归属、取消写入竞态、超时语义、自然刷新、主动关心和隐私脱敏。
@@ -102,13 +103,14 @@ python -m ruff format --check .
 1. `metadata.yaml`、CHANGELOG 和发布标签版本一致。
 2. `_conf_schema.json` 可以解析，并且配置页名称与 README 一致。
 3. 完整单元测试、Ruff、格式和真实 AstrBot 导入检查通过。
-4. 仓库中不存在 Cookie、`passToken`、用户 UID、Bot ID、个人截图或本地数据库。
+4. `python scripts/privacy_gate.py --repository .` 通过，仓库中不存在 Cookie、`passToken`、用户 UID、Bot ID、个人截图或本地数据库。
 5. 安装说明仍与 AstrBot 当前 WebUI 的“从链接安装”和“从文件安装”入口一致。
 
 正式安装包统一由仓库脚本生成：
 
 ```bash
 python scripts/build_release.py --output-dir dist
+python scripts/privacy_gate.py --archive dist/*.zip
 ```
 
 生成的 `astrbot_plugin_mi_fitness_health-vX.Y.Z.zip` 以 `main.py` 为压缩包根层入口，排除测试、缓存和数据库文件。将该文件作为同版本 GitHub Release 的资产上传；不要把 GitHub 自动生成的源码 ZIP 当作正式安装包。

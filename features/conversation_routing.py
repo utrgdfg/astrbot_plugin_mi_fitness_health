@@ -106,9 +106,8 @@ class ConversationRoutingMixin:
                     raise TypeError(f"{switch} is not a boolean")
                 if value:
                     logger.warning(
-                        "Mi Fitness disabled private health context because provider %s "
-                        "has server-native tools enabled",
-                        resolved_id,
+                        "Mi Fitness disabled private health context because the "
+                        "selected provider has server-native tools enabled"
                     )
                     return True
             return False
