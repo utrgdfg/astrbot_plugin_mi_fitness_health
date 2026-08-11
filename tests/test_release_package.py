@@ -11,6 +11,7 @@ import zipfile
 from pathlib import Path
 
 from scripts.build_release import build_release, metadata_version
+from scripts.privacy_gate import scan_archive
 
 
 class ReleasePackageTest(unittest.TestCase):
@@ -36,6 +37,7 @@ class ReleasePackageTest(unittest.TestCase):
             self.assertIn("features/health_commands.py", names)
             self.assertFalse(any(name.startswith("tests/") for name in names))
             self.assertFalse(any("__pycache__" in name for name in names))
+            self.assertEqual(scan_archive(first), [])
 
             environment = os.environ.copy()
             environment["PYTHONPATH"] = os.pathsep.join(
@@ -57,6 +59,20 @@ class ReleasePackageTest(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_untracked_runtime_python_file_is_never_packaged(self) -> None:
+        repository_root = Path(__file__).resolve().parents[1]
+        probe = repository_root / "services" / "__privacy_gate_untracked_probe__.py"
+        self.assertFalse(probe.exists())
+        try:
+            probe.write_text("SAFE_PROBE = True\n", encoding="utf-8")
+            with tempfile.TemporaryDirectory() as directory:
+                output_directory = Path(directory)
+                with self.assertRaisesRegex(ValueError, "尚未纳入 Git 管理"):
+                    build_release(repository_root, output_directory)
+                self.assertEqual(list(output_directory.iterdir()), [])
+        finally:
+            probe.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

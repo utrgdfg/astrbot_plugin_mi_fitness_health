@@ -3,9 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import subprocess
+import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
+
+try:
+    from .privacy_gate import assert_archive_clean
+except ImportError:  # Direct ``python scripts/build_release.py`` execution.
+    from privacy_gate import assert_archive_clean
 
 PLUGIN_NAME = "astrbot_plugin_mi_fitness_health"
 ROOT_FILES = (
@@ -65,6 +73,27 @@ def release_files(repository_root: Path) -> list[Path]:
     ]
     if missing:
         raise FileNotFoundError("发布文件缺失：" + "、".join(missing))
+    try:
+        tracked_output = subprocess.check_output(
+            ["git", "-C", str(repository_root), "ls-files", "-z"]
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError("无法确认发布文件是否已纳入 Git 管理") from error
+    tracked_paths = {
+        item.decode("utf-8", "surrogateescape").replace("\\", "/")
+        for item in tracked_output.split(b"\0")
+        if item
+    }
+    for path in files:
+        relative = path.relative_to(repository_root).as_posix()
+        if relative not in tracked_paths:
+            raise ValueError(f"发布文件尚未纳入 Git 管理：{relative}")
+        if path.is_symlink():
+            raise ValueError(f"发布文件不能是符号链接：{relative}")
+        try:
+            path.resolve().relative_to(repository_root)
+        except ValueError as error:
+            raise ValueError(f"发布文件超出仓库范围：{relative}") from error
     return sorted(
         set(files), key=lambda path: path.relative_to(repository_root).as_posix()
     )
@@ -104,20 +133,32 @@ def build_release(repository_root: Path, output_directory: Path) -> Path:
     output_directory.mkdir(parents=True, exist_ok=True)
     version = metadata_version(repository_root)
     output_path = output_directory / f"{PLUGIN_NAME}-{version}.zip"
-    with zipfile.ZipFile(
-        output_path,
-        "w",
-        compression=zipfile.ZIP_DEFLATED,
-        compresslevel=9,
-    ) as archive:
-        for source in release_files(repository_root):
-            relative = source.relative_to(repository_root).as_posix()
-            info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.create_system = 3
-            info.external_attr = 0o100644 << 16
-            archive.writestr(info, _archive_payload(source), compresslevel=9)
-    validate_archive(output_path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+        dir=output_directory,
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        with zipfile.ZipFile(
+            temporary_path,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=9,
+        ) as archive:
+            for source in release_files(repository_root):
+                relative = source.relative_to(repository_root).as_posix()
+                info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
+                info.compress_type = zipfile.ZIP_DEFLATED
+                info.create_system = 3
+                info.external_attr = 0o100644 << 16
+                archive.writestr(info, _archive_payload(source), compresslevel=9)
+        validate_archive(temporary_path)
+        assert_archive_clean(temporary_path)
+        temporary_path.replace(output_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
     return output_path
 
 
