@@ -32,6 +32,7 @@ class ReleasePackageTest(unittest.TestCase):
                 names = set(archive.namelist())
                 archive.extractall(package_root)
             self.assertIn("main.py", names)
+            self.assertIn("compat/runner_privacy_guard.py", names)
             self.assertIn("features/health_commands.py", names)
             self.assertFalse(any(name.startswith("tests/") for name in names))
             self.assertFalse(any("__pycache__" in name for name in names))

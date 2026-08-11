@@ -12,6 +12,7 @@ from .proactive_care import (
     SAFE_CROSS_PROVIDER_STYLE_PROMPT,
     ProactiveCareMixin,
 )
+from .runtime_coordination import RuntimeCoordinationMixin
 
 __all__ = [
     "ConversationRoutingMixin",
@@ -21,5 +22,6 @@ __all__ = [
     "HealthCommandsMixin",
     "MainModelToolingMixin",
     "ProactiveCareMixin",
+    "RuntimeCoordinationMixin",
     "SAFE_CROSS_PROVIDER_STYLE_PROMPT",
 ]

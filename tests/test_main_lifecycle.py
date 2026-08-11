@@ -3340,7 +3340,7 @@ class MainLifecycleTest(unittest.TestCase):
 
         async def run():
             with patch(
-                "astrbot_plugin_mi_fitness_health.main.CONNECTION_COMMAND_TIMEOUT_SECONDS",
+                "astrbot_plugin_mi_fitness_health.features.runtime_coordination.CONNECTION_COMMAND_TIMEOUT_SECONDS",
                 0.01,
             ):
                 await plugin._connection_worker(event.unified_msg_origin)
