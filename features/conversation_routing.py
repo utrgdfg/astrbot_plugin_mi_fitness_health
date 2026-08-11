@@ -348,10 +348,6 @@ class ConversationRoutingMixin:
             "服务心跳",
             "进程心跳",
             "接口心跳",
-            "线程休息",
-            "协程休息",
-            "休息日",
-            "休息制度",
             "熬夜主题的故事",
             "睡眠主题的故事",
             "故事",
@@ -371,6 +367,14 @@ class ConversationRoutingMixin:
             return False, ""
         if self._is_health_question(message):
             return True, message
+        care_only_non_owner_contexts = (
+            "线程休息",
+            "协程休息",
+            "休息日",
+            "休息制度",
+        )
+        if any(cue in compact for cue in care_only_non_owner_contexts):
+            return False, ""
         if self._is_care_conversation(message):
             return True, self._care_focus(message)
         return False, ""

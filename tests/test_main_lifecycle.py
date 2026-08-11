@@ -1426,6 +1426,11 @@ class MainLifecycleTest(unittest.TestCase):
             "休息日制度是什么",
             "在吗",
         )
+        explicit_queries_with_ambiguous_words = (
+            "今天是休息日，昨晚睡了多久",
+            "休息日想看看睡眠记录",
+            "我的休息制度不规律，看看最近心率",
+        )
 
         for message, focus in positive_cases.items():
             with self.subTest(message=message):
@@ -1436,6 +1441,11 @@ class MainLifecycleTest(unittest.TestCase):
             with self.subTest(message=message):
                 self.assertEqual(
                     plugin._fallback_context_decision(message), (False, "")
+                )
+        for message in explicit_queries_with_ambiguous_words:
+            with self.subTest(message=message):
+                self.assertEqual(
+                    plugin._fallback_context_decision(message), (True, message)
                 )
 
     def test_conversation_decision_fetches_and_injects_data_for_ambiguous_turn(
