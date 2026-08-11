@@ -39,7 +39,7 @@ class ConversationRoutingMixin:
     """Select, refresh, and prepare the smallest relevant health-data slice."""
 
     def _private_context_runtime_is_unsafe(self, session: str) -> bool:
-        """Fail closed when this turn can leave the guarded local runner."""
+        """Fail closed when the guarded local runner is not in use."""
         get_config = getattr(getattr(self, "context", None), "get_config", None)
         if not callable(get_config):
             logger.warning(
@@ -55,9 +55,6 @@ class ConversationRoutingMixin:
             agent_runner_type = provider_settings.get("agent_runner_type", "local")
             if not isinstance(agent_runner_type, str):
                 raise TypeError("agent_runner_type is not a string")
-            fallback_models = provider_settings.get("fallback_chat_models", [])
-            if not isinstance(fallback_models, list):
-                raise TypeError("fallback_chat_models is not a list")
         except Exception as error:
             logger.warning(
                 "Mi Fitness could not inspect fallback chat providers; "
@@ -65,9 +62,13 @@ class ConversationRoutingMixin:
                 type(error).__name__,
             )
             return True
-        return agent_runner_type.strip() != "local" or any(
-            isinstance(item, str) and item.strip() for item in fallback_models
-        )
+        if agent_runner_type.strip() != "local":
+            logger.warning(
+                "Mi Fitness private health context requires AstrBot's local agent "
+                "runner; skipping this turn"
+            )
+            return True
+        return False
 
     def _provider_native_tools_are_unsafe(self, provider_id: object) -> bool:
         """Fail closed when one configured provider can invoke server-native tools."""
@@ -232,18 +233,6 @@ class ConversationRoutingMixin:
                 "锻炼",
             )
         )
-
-    def _may_need_semantic_health_decision(
-        self,
-        message: str,
-        recent_context: list[dict[str, str]],
-    ) -> bool:
-        """Skip an extra main-provider call only for clearly unrelated turns."""
-        candidates = [message]
-        candidates.extend(
-            str(record.get("text") or "") for record in recent_context[-4:]
-        )
-        return any(self._fallback_context_decision(text)[0] for text in candidates)
 
     @classmethod
     def _care_focus(cls, text: str) -> str:

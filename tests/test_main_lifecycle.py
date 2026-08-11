@@ -802,6 +802,46 @@ class MainLifecycleTest(unittest.TestCase):
         self.assertEqual(response.tools_call_name, ["normal_tool"])
         self.assertEqual(response.tools_call_args, [{"value": "kept"}])
 
+    def test_fallback_provider_receives_no_private_health_context(self) -> None:
+        plugin = self._bare_plugin()
+        request = ProviderRequest()
+        self.assertTrue(
+            plugin._append_temporary_context(
+                request,
+                '<private_life_context source="mi_fitness">\n'
+                "PRIVATE-CANARY\n"
+                "</private_life_context>",
+            )
+        )
+        plugin._disable_request_tools(request)
+        primary_provider = Mock(provider_config={"type": "openai_chat_completion"})
+        fallback_provider = Mock(provider_config={"type": "openai_chat_completion"})
+        runner = ToolLoopAgentRunner()
+        runner.req = request
+        runner.provider = primary_provider
+        runner._skill_like_raw_tool_set = request.func_tool
+        private_part = request.extra_user_content_parts[0]
+        normal_part = Mock(text="ordinary user text")
+        message = Mock(content=[normal_part, private_part])
+        runner.run_context = Mock(messages=[message])
+        runner._test_responses = [Mock(tools_call_name=[])]
+
+        async def collect():
+            return [item async for item in runner._iter_llm_responses()]
+
+        self.assertEqual(len(asyncio.run(collect())), 1)
+
+        runner.provider = fallback_provider
+        runner._test_responses = [Mock(tools_call_name=[])]
+        self.assertEqual(len(asyncio.run(collect())), 1)
+        self.assertEqual(
+            [part.text for part in message.content], ["ordinary user text"]
+        )
+        self.assertEqual(request.extra_user_content_parts, [])
+        self.assertIsNone(request.func_tool)
+        self.assertIsNone(runner._skill_like_raw_tool_set)
+        self.assertFalse(hasattr(request, "_mi_fitness_reject_unadvertised_tool_calls"))
+
     def test_runner_guard_replaces_a_stale_reload_wrapper_without_stacking(
         self,
     ) -> None:
@@ -1035,6 +1075,7 @@ class MainLifecycleTest(unittest.TestCase):
         event = Mock()
         event.unified_msg_origin = "qq:FriendMessage:123"
         event.get_message_str.return_value = "帮我写代码"
+        event.get_extra.return_value = None
         request = ProviderRequest()
         original_tools = ToolSet()
         original_tools.add_tool(
@@ -1049,9 +1090,33 @@ class MainLifecycleTest(unittest.TestCase):
         asyncio.run(plugin.add_owner_health_context(event, request))
 
         self.assertEqual(request.extra_user_content_parts, [])
+        self.assertIn("启用小米运动健康集成", request.system_prompt)
         self.assertIs(request.func_tool, original_tools)
-        plugin._decide_context_focus.assert_not_awaited()
-        plugin.context.get_current_chat_provider_id.assert_not_awaited()
+        plugin._decide_context_focus.assert_awaited_once_with(
+            event.unified_msg_origin,
+            "帮我写代码",
+            [],
+            provider_id="main-provider",
+            model=None,
+        )
+        plugin.context.get_current_chat_provider_id.assert_awaited_once_with(
+            event.unified_msg_origin
+        )
+
+    def test_health_capability_instruction_is_request_local_and_idempotent(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        request = ProviderRequest()
+        request.system_prompt = "persona"
+
+        plugin._append_health_capability_instruction(request)
+        plugin._append_health_capability_instruction(request)
+
+        self.assertTrue(request.system_prompt.startswith("persona\n\n"))
+        self.assertEqual(request.system_prompt.count("启用小米运动健康集成"), 1)
+        self.assertIn("不一定出现在普通工具列表中", request.system_prompt)
+        self.assertIn("不得根据消息时间或聊天历史推测睡眠时长", request.system_prompt)
 
     def test_main_model_preflight_prefers_turn_selected_provider(self) -> None:
         plugin = self._bare_plugin()
@@ -1173,7 +1238,6 @@ class MainLifecycleTest(unittest.TestCase):
         plugin.care_dialogue_enabled = True
         plugin.allow_health_data_to_llm = True
         plugin._is_private_owner_event = Mock(return_value=True)
-        plugin._may_need_semantic_health_decision = Mock(return_value=True)
         plugin._decide_context_focus = AsyncMock(return_value=(True, "sleep"))
         plugin._refresh_for_natural_question = AsyncMock()
         plugin.context = Mock()
@@ -1224,7 +1288,7 @@ class MainLifecycleTest(unittest.TestCase):
         plugin._refresh_for_natural_question.assert_not_awaited()
         plugin.context.llm_generate.assert_not_called()
 
-    def test_configured_fallback_provider_prevents_private_context_injection(
+    def test_configured_fallback_provider_no_longer_disables_health_routing(
         self,
     ) -> None:
         plugin = self._bare_plugin()
@@ -1233,14 +1297,21 @@ class MainLifecycleTest(unittest.TestCase):
         plugin.care_dialogue_enabled = True
         plugin.allow_health_data_to_llm = True
         plugin._is_private_owner_event = Mock(return_value=True)
-        plugin._decide_context_focus = AsyncMock(return_value=(True, "今天 睡眠"))
+        plugin._decide_context_focus = AsyncMock(return_value=(False, ""))
         plugin.context = Mock()
         plugin.context.get_config.return_value = {
-            "provider_settings": {"fallback_chat_models": ["backup-provider"]}
+            "provider_settings": {
+                "agent_runner_type": "local",
+                "fallback_chat_models": ["backup-provider"],
+            }
         }
+        plugin.context.get_current_chat_provider_id = AsyncMock(
+            return_value="main-provider"
+        )
         event = Mock()
         event.unified_msg_origin = "qq:FriendMessage:123"
         event.get_message_str.return_value = "早上好"
+        event.get_extra.return_value = None
         request = ProviderRequest()
         original_tools = ToolSet()
         original_tools.add_tool(
@@ -1255,8 +1326,9 @@ class MainLifecycleTest(unittest.TestCase):
         asyncio.run(plugin.add_owner_health_context(event, request))
 
         plugin.context.get_config.assert_called_once_with(event.unified_msg_origin)
-        plugin._decide_context_focus.assert_not_awaited()
+        plugin._decide_context_focus.assert_awaited_once()
         self.assertEqual(request.extra_user_content_parts, [])
+        self.assertIn("启用小米运动健康集成", request.system_prompt)
         self.assertIs(request.func_tool, original_tools)
 
     def test_external_agent_runner_prevents_private_context_injection(self) -> None:
