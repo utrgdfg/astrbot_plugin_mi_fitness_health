@@ -226,6 +226,6 @@ https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health
 
 ## 开发者信息
 
-数据库结构、同步策略、隐私实现、测试方式和发布检查已移到 [开发与维护说明](https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/blob/v0.8.7/docs/DEVELOPMENT.md)，普通使用不需要阅读。
+数据库结构、同步策略、隐私实现、测试方式和发布检查已移到 [开发与维护说明](https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health/blob/v0.8.8/docs/DEVELOPMENT.md)，普通使用不需要阅读。
 
 云端协议层基于 [Mi Fitness MCP](https://github.com/kubulashvili/mi-fitness-mcp) 的实现进行移植，作者 Aleksej Kubulashvili。许可证与版权说明见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。

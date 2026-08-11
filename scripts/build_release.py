@@ -19,7 +19,15 @@ ROOT_FILES = (
     "metadata.yaml",
     "requirements.txt",
 )
-RUNTIME_PACKAGES = ("adapters", "features", "models", "services", "storage", "utils")
+RUNTIME_PACKAGES = (
+    "adapters",
+    "compat",
+    "features",
+    "models",
+    "services",
+    "storage",
+    "utils",
+)
 TEXT_SUFFIXES = {".json", ".md", ".py", ".txt", ".yaml", ".yml"}
 VERSION_PATTERN = re.compile(r"^version:\s*(v\d+\.\d+\.\d+)\s*$", re.MULTILINE)
 FORBIDDEN_SUFFIXES = {

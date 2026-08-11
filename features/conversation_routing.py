@@ -43,7 +43,7 @@ class ConversationRoutingMixin:
         get_config = getattr(getattr(self, "context", None), "get_config", None)
         if not callable(get_config):
             logger.warning(
-                "Mi Fitness could not inspect fallback chat providers; "
+                "Mi Fitness could not inspect local agent runner configuration; "
                 "skipping private health context for this turn"
             )
             return True
@@ -57,7 +57,7 @@ class ConversationRoutingMixin:
                 raise TypeError("agent_runner_type is not a string")
         except Exception as error:
             logger.warning(
-                "Mi Fitness could not inspect fallback chat providers; "
+                "Mi Fitness could not inspect local agent runner configuration; "
                 "skipping private health context for this turn (%s)",
                 type(error).__name__,
             )

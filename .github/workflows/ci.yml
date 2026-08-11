@@ -31,7 +31,7 @@ jobs:
           ruff check .
           ruff format --check .
       - name: Compile sources
-        run: python -m compileall -q adapters features models services storage utils main.py
+        run: python -m compileall -q adapters compat features models services storage utils main.py
       - name: Build installable archive
         run: python scripts/build_release.py --output-dir dist
       - name: Keep the Python 3.12 release candidate
@@ -41,3 +41,30 @@ jobs:
           name: astrbot-plugin-installation-zip
           path: dist/*.zip
           if-no-files-found: error
+
+  astrbot-runner-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        astrbot-ref: ["v4.24.2", "v4.27.2"]
+
+    steps:
+      - name: Check out plugin
+        uses: actions/checkout@v4
+        with:
+          path: plugin
+      - name: Check out AstrBot ${{ matrix.astrbot-ref }}
+        uses: actions/checkout@v4
+        with:
+          repository: AstrBotDevs/AstrBot
+          ref: ${{ matrix.astrbot-ref }}
+          path: astrbot-runtime
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check private runner compatibility contract
+        run: >-
+          python plugin/scripts/check_astrbot_runner_contract.py
+          astrbot-runtime

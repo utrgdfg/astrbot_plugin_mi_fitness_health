@@ -8,10 +8,12 @@
 
 ## 代码架构
 
-- `main.py` 是唯一 AstrBot 插件入口，只负责配置装配、任务生命周期、事件钩子与命令注册；不要在这里继续堆叠可独立测试的对话策略。
+- `main.py` 是唯一 AstrBot 插件入口，只负责配置装配、AstrBot 生命周期入口、事件钩子与命令注册；不要在这里继续堆叠可独立测试的运行任务或对话策略。
 - `features/conversation_routing.py` 负责普通私聊的语义判断、数据类别选择、缓存新鲜度检查和按需刷新。
-- `features/main_model_tooling.py` 负责私密摘要的边界转义、临时提示构造和请求级工具隔离。
+- `features/main_model_tooling.py` 负责私密摘要的边界转义与临时提示构造。
 - `features/proactive_care.py` 负责受限私聊上下文读取、主动关心发送判断和自然措辞生成。
+- `features/runtime_coordination.py` 负责插件拥有的后台任务、云连接、自动同步、监控循环和确定性卸载清理。
+- `compat/runner_privacy_guard.py` 是唯一允许依赖 AstrBot 私有 Runner 方法的兼容边界，负责请求级工具隔离、未声明工具调用清理和回退模型前的私密上下文移除。
 - `services/` 负责同步、查询与非诊断状态判断，`adapters/` 负责小米协议，`storage/` 负责 SQLite 持久化，`utils/` 保持无状态公共工具。
 
 AstrBot 的 `filter` 装饰器继续只放在 `main.py` 的插件类上，功能模块通过 mixin 提供内部方法。这样既保持 AstrBot 扫描和热重载兼容，也让对话功能可以独立审阅。`tests/test_architecture.py` 固定这一边界，并限制入口文件重新膨胀。
@@ -53,7 +55,7 @@ AstrBot 的 `filter` 装饰器继续只放在 `main.py` 的插件类上，功能
 - 所有健康数据入口同时校验使用者 UID、Bot ID 和私聊消息类型。
 - 群聊不会返回健康数据。
 - 向 LLM 提供健康摘要需要用户显式开启授权，默认关闭；主动判断读取最近私聊使用另一项独立且默认关闭的授权。
-- 所有模式都只在 `on_llm_request` 阶段通过 `mark_as_temp()` 内容块注入最小摘要；成功注入后使用兼容 AstrBot `skills_like` reset 的空 ToolSet 隔离本轮其他工具。`main_model_tooling` 会以请求标记包装 `ToolLoopAgentRunner._iter_llm_responses`，只在本插件的无工具私密请求中、任何 runner 日志/Trace/上下文追加之前清除 Provider 凭空返回的工具调用；普通请求和其他插件工具不受影响。当前 Provider 失败并切换回退模型时，wrapper 会先从 `run_context` 与请求附加内容中删除 `<private_life_context>`，清除私密请求标记，再让回退模型处理普通上下文。无法安装该兼容保护、不支持临时内容、使用非 `local` Agent 执行器，或当前 Provider 启用服务端原生搜索/代码工具时均 fail closed，不注入数据并保留原工具。
+- 所有模式都只在 `on_llm_request` 阶段通过 `mark_as_temp()` 内容块注入最小摘要；成功注入后使用兼容 AstrBot `skills_like` reset 的空 ToolSet 隔离本轮其他工具。独立的 `compat/runner_privacy_guard.py` 会以请求标记包装 `ToolLoopAgentRunner._iter_llm_responses`，只在本插件的无工具私密请求中、任何 runner 日志/Trace/上下文追加之前清除 Provider 凭空返回的工具调用；普通请求和其他插件工具不受影响。当前 Provider 失败并切换回退模型时，wrapper 会先从 `run_context` 与请求附加内容中删除 `<private_life_context>`，清除私密请求标记，再让回退模型处理普通上下文。无法安装该兼容保护、不支持临时内容、使用非 `local` Agent 执行器，或当前 Provider 启用服务端原生搜索/代码工具时均 fail closed，不注入数据并保留原工具。
 - 用户关注文本会被限长、压缩为单行并作为不可信数据隔离。
 - 获得独立私聊授权后，深夜闸门可通过 AstrBot 官方会话管理器、平台消息历史管理器或混合模式读取当前所有者私聊。平台历史记录必须携带可核验的消息类型或完整 UMO，否则丢弃并安全回退。配置范围为 0～50 条，总量仍限制为 4000 字符；可选择排除 assistant/Bot 文本，图片、工具结果和系统消息始终不会传入。刚收到但尚未落入 AstrBot 历史的所有者文本仅在插件内存中短暂补充，不写入插件 SQLite。
 - 配置补充回复草稿模型或人格后，相关最小化健康摘要会额外发送给该草稿使用的 Provider；配置页与 README 会明确披露第三方模型可能处理或保存这些内容。
@@ -89,7 +91,7 @@ python -m ruff check .
 python -m ruff format --check .
 ```
 
-`pyproject.toml` 提供统一 pytest/Ruff 配置，`tests/conftest.py` 允许任意 ZIP 解压目录名下收集测试，GitHub Actions 使用 Python 3.11 和 3.12 复现以上检查。测试覆盖授权边界、云端字段解析、响应预算、限流熔断、睡眠链路、心率范围、活动覆盖保护、SQLite 归属、取消写入竞态、超时语义、自然刷新、主动关心和隐私脱敏。
+`pyproject.toml` 提供统一 pytest/Ruff 配置，`tests/conftest.py` 允许任意 ZIP 解压目录名下收集测试，GitHub Actions 使用 Python 3.11 和 3.12 复现以上检查。独立的 Runner 契约任务会检出 AstrBot v4.24.2 与 v4.27.2 的真实源码，核对插件依赖的私有方法、skills-like 标记、ToolSet 变体、临时内容和 fallback 调用顺序；业务行为测试仍使用最小 stub，避免连接真实服务。测试覆盖授权边界、云端字段解析、响应预算、限流熔断、睡眠链路、心率范围、活动覆盖保护、SQLite 归属、取消写入竞态、超时语义、自然刷新、主动关心和隐私脱敏。
 
 真实小米账号、设备字段和区域兼容性必须由维护者在受控环境验证。不要把真实 Cookie、原始健康数据或个人截图加入 fixture、日志或 Issue。
 
