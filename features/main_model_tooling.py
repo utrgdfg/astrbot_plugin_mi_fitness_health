@@ -19,7 +19,18 @@ _RUNNER_TOOL_GUARD_ORIGINAL = "_mi_fitness_provider_tool_guard_original_v1"
 _RUNNER_TOOL_GUARD_WRAPPER = "_mi_fitness_provider_tool_guard_wrapper_v1"
 _RUNNER_TOOL_GUARD_TOKEN = "_mi_fitness_provider_tool_guard_token_v1"
 _RUNNER_FORCE_NONE_MARKER = "_mi_fitness_force_none_tools_for_provider"
+_RUNNER_PRIMARY_PROVIDER_MARKER = "_mi_fitness_private_context_primary_provider"
 _GUARD_IMPLEMENTATION_TOKEN = object()
+
+_HEALTH_CAPABILITY_INSTRUCTION = (
+    "当前会话已为配置的使用者启用小米运动健康集成。需要生活数据时，插件会自动以临时 "
+    "<private_life_context> 提供已核实记录；这项集成不一定出现在普通工具列表中，不能仅因"
+    "工具列表没有健康工具就声称无法使用或没有配置。若本轮没有已核实的生活数据上下文，"
+    "不得根据消息时间或聊天历史推测睡眠时长、入睡和起床时间、心率、活动量或其他数值；"
+    "应保持当前人格自然继续，不编造数据，也不讨论缓存、云同步或插件内部实现。"
+)
+_PRIVATE_CONTEXT_OPEN_TAG = '<private_life_context source="mi_fitness">'
+_PRIVATE_CONTEXT_CLOSE_TAG = "</private_life_context>"
 
 
 class _RunnerSafeEmptyToolSet(ToolSet):
@@ -52,6 +63,86 @@ def _is_private_no_tool_request(runner: object) -> bool:
         bool(getattr(candidate, "_mi_fitness_reject_unadvertised_tool_calls", False))
         for candidate in candidates
     )
+
+
+def _without_private_context(text: str) -> str:
+    """Remove every plugin-owned private context block while preserving user text."""
+    cleaned = text
+    while True:
+        start = cleaned.find(_PRIVATE_CONTEXT_OPEN_TAG)
+        if start < 0:
+            return cleaned
+        end = cleaned.find(_PRIVATE_CONTEXT_CLOSE_TAG, start)
+        if end < 0:
+            return cleaned[:start].rstrip()
+        cleaned = (
+            cleaned[:start] + cleaned[end + len(_PRIVATE_CONTEXT_CLOSE_TAG) :]
+        ).strip()
+
+
+def _strip_private_context_before_fallback(runner: object) -> None:
+    """Remove private records before allowing AstrBot to use a fallback provider."""
+
+    def scrub_parts(parts: list[object]) -> list[object]:
+        cleaned_parts: list[object] = []
+        for part in parts:
+            if isinstance(part, dict):
+                value = part.get("text")
+                if not isinstance(value, str):
+                    cleaned_parts.append(part)
+                    continue
+                cleaned = _without_private_context(value)
+                if cleaned:
+                    copy = dict(part)
+                    copy["text"] = cleaned
+                    cleaned_parts.append(copy)
+                continue
+            value = getattr(part, "text", None)
+            if not isinstance(value, str):
+                cleaned_parts.append(part)
+                continue
+            cleaned = _without_private_context(value)
+            if cleaned:
+                part.text = cleaned
+                cleaned_parts.append(part)
+        return cleaned_parts
+
+    request = getattr(runner, "req", None)
+    extra_parts = getattr(request, "extra_user_content_parts", None)
+    if isinstance(extra_parts, list):
+        request.extra_user_content_parts = scrub_parts(extra_parts)
+
+    run_context = getattr(runner, "run_context", None)
+    messages = getattr(run_context, "messages", None)
+    if isinstance(messages, list):
+        for message in messages:
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, str):
+                    message["content"] = _without_private_context(content)
+                elif isinstance(content, list):
+                    message["content"] = scrub_parts(content)
+                continue
+            content = getattr(message, "content", None)
+            if isinstance(content, str):
+                message.content = _without_private_context(content)
+            elif isinstance(content, list):
+                message.content = scrub_parts(content)
+
+    if request is not None:
+        try:
+            delattr(request, _REQUEST_GUARD_MARKER)
+        except AttributeError:
+            pass
+        request.func_tool = None
+    if bool(
+        getattr(
+            getattr(runner, "_skill_like_raw_tool_set", None),
+            "_mi_fitness_reject_unadvertised_tool_calls",
+            False,
+        )
+    ):
+        runner._skill_like_raw_tool_set = None
 
 
 def _strip_unadvertised_tool_call(response: object) -> None:
@@ -160,6 +251,26 @@ def _install_unadvertised_tool_call_guard() -> bool:
     async def guarded_responses(runner, *args, **kwargs):
         private_no_tool_request = _is_private_no_tool_request(runner)
         request = getattr(runner, "req", None)
+        if private_no_tool_request:
+            current_provider = getattr(runner, "provider", None)
+            primary_provider = getattr(runner, _RUNNER_PRIMARY_PROVIDER_MARKER, None)
+            if primary_provider is None:
+                if current_provider is None:
+                    raise RuntimeError(
+                        "Mi Fitness could not bind private context to one provider"
+                    )
+                setattr(
+                    runner,
+                    _RUNNER_PRIMARY_PROVIDER_MARKER,
+                    current_provider,
+                )
+            elif current_provider is not primary_provider:
+                logger.warning(
+                    "Mi Fitness removed private health context before switching to a "
+                    "fallback provider"
+                )
+                _strip_private_context_before_fallback(runner)
+                private_no_tool_request = False
         provider_config = getattr(
             getattr(runner, "provider", None), "provider_config", None
         )
@@ -317,6 +428,15 @@ class MainModelToolingMixin:
             return False
         req.extra_user_content_parts.append(part.mark_as_temp())
         return True
+
+    @staticmethod
+    def _append_health_capability_instruction(req: ProviderRequest) -> None:
+        """Tell the reply model about automatic health context without exposing data."""
+        existing = str(getattr(req, "system_prompt", "") or "")
+        if _HEALTH_CAPABILITY_INSTRUCTION in existing:
+            return
+        separator = "\n\n" if existing else ""
+        req.system_prompt = existing + separator + _HEALTH_CAPABILITY_INSTRUCTION
 
     @staticmethod
     def _disable_request_tools(req: ProviderRequest) -> None:

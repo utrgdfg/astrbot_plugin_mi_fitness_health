@@ -777,17 +777,18 @@ class MiFitnessHealthPlugin(
         # not knowable here, regardless of which routing mode selected the data.
         if getattr(req, "image_urls", None):
             return
+        # This request-local instruction is not health data. It prevents the model
+        # from mistaking automatic context delivery for a missing integration and
+        # from guessing measurements from chat timestamps when no record is loaded.
+        self._append_health_capability_instruction(req)
         if self._private_context_runtime_is_unsafe(event.unified_msg_origin):
-            # AstrBot retries the same request context with globally configured
-            # fallback providers. Keep private health data bound to one provider.
+            # The private runner guard only covers AstrBot's local agent runner.
             return
         mode = self._effective_conversation_health_mode()
         provider_id = None
         response_provider_checked = False
         if mode == "main_model":
             decision_history = self._decision_history_from_request(req, question)
-            if not self._may_need_semantic_health_decision(question, decision_history):
-                return
             selected_provider = event.get_extra("selected_provider")
             if selected_provider is not None:
                 if not isinstance(selected_provider, str):
