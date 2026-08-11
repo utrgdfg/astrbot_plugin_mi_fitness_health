@@ -1422,6 +1422,8 @@ class MainLifecycleTest(unittest.TestCase):
             "帮我写一个熬夜主题的故事",
             "昨天我朋友没睡好",
             "睡眠算法应该怎么排序",
+            "让线程休息一秒",
+            "休息日制度是什么",
             "在吗",
         )
 
@@ -3184,6 +3186,54 @@ class MainLifecycleTest(unittest.TestCase):
                 )
 
         asyncio.run(run())
+
+    def test_terminate_bounds_stubborn_close_and_reaps_it_after_completion(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        close_started = asyncio.Event()
+        close_cancelled = asyncio.Event()
+        release_close = asyncio.Event()
+
+        async def stubborn_close() -> None:
+            close_started.set()
+            try:
+                await release_close.wait()
+            except asyncio.CancelledError:
+                close_cancelled.set()
+                await release_close.wait()
+
+        plugin.sync_service.close = AsyncMock(side_effect=stubborn_close)
+
+        async def run() -> tuple[float, int]:
+            started = asyncio.get_running_loop().time()
+            with (
+                patch(
+                    "astrbot_plugin_mi_fitness_health.features.runtime_coordination.SHUTDOWN_CLOUD_CLOSE_TIMEOUT_SECONDS",
+                    0.01,
+                ),
+                patch(
+                    "astrbot_plugin_mi_fitness_health.features.runtime_coordination.DETACHED_TASK_DRAIN_SECONDS",
+                    0.01,
+                ),
+            ):
+                await plugin.terminate()
+            elapsed = asyncio.get_running_loop().time() - started
+            await close_started.wait()
+            await close_cancelled.wait()
+            detached_at_return = len(plugin._detached_tasks)
+            release_close.set()
+            await asyncio.gather(*tuple(plugin._detached_tasks), return_exceptions=True)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return elapsed, detached_at_return
+
+        elapsed, detached_at_return = asyncio.run(run())
+
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(detached_at_return, 1)
+        self.assertEqual(plugin._detached_tasks, set())
+        self.assertTrue(plugin._terminated)
 
     def test_mutating_command_during_reload_is_consumed_without_llm_fallthrough(
         self,

@@ -588,6 +588,45 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual({sample.bpm for sample in samples}, {68, 72})
         self.assertEqual(len({sample.record_id for sample in samples}), 2)
 
+    def test_successful_pagination_forwards_cursor_and_deduplicates_pages(self) -> None:
+        first = {"time": 1784692800, "value": {"bpm": 68}}
+        duplicate = {"time": 1784692860, "value": {"bpm": 70}}
+        last = {"time": 1784692920, "value": {"bpm": 72}}
+
+        class FixtureAdapter(MiFitnessCloudAdapter):
+            def __init__(self):
+                super().__init__("user", "token", "cn")
+                self.cursors = []
+
+            async def _fetch_page(
+                self, key, start, end, region, cursor=None, *, budget=None
+            ):
+                del key, start, end, region, budget
+                self.cursors.append(cursor)
+                if cursor is None:
+                    return {
+                        "data_list": [first, duplicate],
+                        "has_more": True,
+                        "next_key": "second-page",
+                    }
+                return {
+                    "data_list": [duplicate, last],
+                    "has_more": False,
+                }
+
+        adapter = FixtureAdapter()
+        records = asyncio.run(
+            adapter._fetch_key(
+                "heart_rate",
+                datetime.now(UTC),
+                datetime.now(UTC),
+                "cn",
+            )
+        )
+
+        self.assertEqual(adapter.cursors, [None, "second-page"])
+        self.assertEqual(records, [first, duplicate, last])
+
     def test_non_activity_pagination_page_limit_rejects_partial_records(self) -> None:
         class FixtureAdapter(MiFitnessCloudAdapter):
             calls = 0
@@ -1047,6 +1086,19 @@ class AdapterTest(unittest.TestCase):
         with self.assertRaisesRegex(MiFitnessResponseError, "HTTP 400"):
             asyncio.run(adapter._request("https://example.invalid", "/path", {}))
         self.assertEqual(adapter._client.calls, 1)
+
+    def test_health_api_401_invalidates_the_active_session_without_retry(self) -> None:
+        adapter = MiFitnessCloudAdapter("user", "token", "cn")
+        adapter._client = _StreamingClient(_http_response(401))
+        adapter._ssecurity = b"synthetic-security"
+        adapter._connected = True
+
+        with self.assertRaises(MiFitnessAuthenticationError):
+            asyncio.run(adapter._request("https://example.invalid", "/path", {}))
+
+        self.assertEqual(adapter._client.calls, 1)
+        self.assertFalse(adapter.is_connected())
+        self.assertTrue(adapter.authentication_failed)
 
     def test_transient_5xx_errors_retry_only_within_the_fixed_budget(self) -> None:
         adapter = MiFitnessCloudAdapter("user", "token", "cn")
