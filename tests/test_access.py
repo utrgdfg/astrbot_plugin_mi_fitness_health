@@ -58,7 +58,7 @@ class OwnerAccessTest(unittest.TestCase):
     def test_platform_instance_mismatch_is_precise(self) -> None:
         reason = owner_access_denial_reason(
             owner_platform_id="1234567890",
-            owner_platform_instance_id="另一个实例",
+            owner_platform_instance_id="另一个示例实例",
             sender_id="1234567890",
             platform_id="示例机器人",
             message_type="FriendMessage",

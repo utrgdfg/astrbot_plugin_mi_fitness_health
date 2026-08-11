@@ -87,6 +87,23 @@ class PrivacyTest(unittest.TestCase):
             self.assertIn(f"*.{suffix}-shm", patterns)
             self.assertIn(f"*.{suffix}-journal", patterns)
 
+    def test_common_private_artifacts_are_ignored(self) -> None:
+        patterns = set(
+            (Path(__file__).parents[1] / ".gitignore")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
+        for pattern in (
+            ".env",
+            ".env.*",
+            "*.log",
+            "*.jpg",
+            "*.zip",
+            "Screenshot*",
+            "截图*",
+        ):
+            self.assertIn(pattern, patterns)
+
     def test_common_xiaomi_and_provider_secrets_are_redacted(self) -> None:
         synthetic_secret = "synthetic-secret-value"
         samples = (
@@ -115,6 +132,50 @@ class PrivacyTest(unittest.TestCase):
             with self.subTest(sample=sample):
                 redacted = redact_error(sample)
                 self.assertNotIn("synthetic", redacted.lower())
+
+    def test_paths_emails_sessions_and_identifier_values_are_redacted(self) -> None:
+        samples = (
+            r"cannot open X:\synthetic-user\health.sqlite3",
+            r"cannot open \\synthetic-host\synthetic-share\health.sqlite3",
+            "cannot open /home/synthetic-user/health.sqlite3",
+            "owner@example.invalid failed",
+            "session=qq:FriendMessage:synthetic-owner",
+            "user_id=synthetic-user owner_platform_id=synthetic-owner",
+            "yetAnotherServiceToken=synthetic-secret-value",
+            "password=synthetic-password token=synthetic-token",
+            "id_token=synthetic-secret auth_token=synthetic-secret",
+            "db_password=synthetic-secret session_cookie=synthetic-secret",
+            "sessionId=synthetic-session owner_id=synthetic-owner",
+            "provider_id=synthetic-provider personaId=synthetic-persona",
+        )
+        for sample in samples:
+            with self.subTest(sample=sample):
+                redacted = redact_error(sample)
+                self.assertNotIn("private", redacted.lower())
+                self.assertNotIn("synthetic", redacted.lower())
+                self.assertNotIn("example.invalid", redacted.lower())
+
+    def test_redaction_preserves_non_sensitive_error_reason(self) -> None:
+        message = "temporary timeout while reading response; status 503"
+        self.assertEqual(redact_error(message), message)
+        self.assertIn(
+            "permission denied",
+            redact_error(r"open C:\Users\synthetic-user\secret.db: permission denied"),
+        )
+        self.assertIn(
+            "permission denied",
+            redact_error("open /usr/local/private/data.db: permission denied"),
+        )
+        self.assertEqual(redact_error("token expired"), "token expired")
+        self.assertEqual(
+            redact_error("password authentication failed"),
+            "password authentication failed",
+        )
+        self.assertEqual(redact_error("cookie jar is empty"), "cookie jar is empty")
+        self.assertEqual(
+            redact_error("session closed by peer"), "session closed by peer"
+        )
+        self.assertEqual(redact_error("owner check failed"), "owner check failed")
 
     def test_urls_controls_and_newlines_never_reach_status_text(self) -> None:
         redacted = redact_error(

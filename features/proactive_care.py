@@ -97,10 +97,7 @@ class ProactiveCareMixin:
                 )
                 if persona and getattr(persona, "system_prompt", ""):
                     return str(persona.system_prompt)
-                logger.warning(
-                    "Mi Fitness configured persona was not found: %s",
-                    preferred_persona_id,
-                )
+                logger.warning("Mi Fitness configured persona was not found")
             if not allow_session_persona:
                 return SAFE_CROSS_PROVIDER_STYLE_PROMPT
             conversation_id = (

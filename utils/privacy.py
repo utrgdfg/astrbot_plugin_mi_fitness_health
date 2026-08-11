@@ -27,10 +27,13 @@ def redact_error(error: Exception | str) -> str:
     )
     message = re.sub(
         (
-            r"(?i)\b(passToken|pass_token|serviceToken|accessToken|refreshToken|"
-            r"userId|cUserId|ssecurity|cookie|set-cookie|authorization|_nonce|"
-            r"signature|rc4_hash__|api[_-]?key|x-api-key|client[_-]?secret|"
-            r"secret[_-]?key|private[_-]?key)\b[\"']?\s*(?:=|:)\s*"
+            r"(?i)\b([a-z0-9_-]*token|[a-z0-9_-]*(?:password|passwd|pwd)|"
+            r"[a-z0-9_-]*cookie[a-z0-9_-]*|[a-z0-9_-]*secret[a-z0-9_-]*|"
+            r"(?:c?user|session|owner|provider|persona)[a-z0-9_-]*id|uid|"
+            r"platform_id|bot_id|session|ssecurity|set-cookie|authorization|"
+            r"_nonce|signature|rc4_hash__|api[_-]?key|x-api-key|private[_-]?key)"
+            r"\b[\"']?\s*"
+            r"(?:=|:)\s*"
             r"(?:[\"'][^\"']*[\"']|[^\s;,&]+)"
         ),
         r"\1=***",
@@ -42,6 +45,39 @@ def redact_error(error: Exception | str) -> str:
         message,
     )
     message = re.sub(r"https?://\S+", "[remote URL]", message)
+    message = re.sub(
+        r"(?i)([\"'])(?:[A-Z]:[\\/]|\\\\)[^\"'\r\n]+\1",
+        "[local path]",
+        message,
+    )
+    message = re.sub(
+        (
+            r"(?i)(?<![\w])(?:[A-Z]:[\\/]|\\\\[^\\/\s]+[\\/])"
+            r"(?:[^\\/\r\n:*?\"<>|]+[\\/])+[^\\/\s\r\n:*?\"<>|,;\)\]]+"
+        ),
+        "[local path]",
+        message,
+    )
+    message = re.sub(
+        r"(?i)([\"'])/(?!/)[^\"'\r\n]+/[^\"'\r\n]+\1",
+        "[local path]",
+        message,
+    )
+    message = re.sub(
+        r"(?i)(?<![\w:/])/(?:[^/\r\n:;,\)\]]+/)+[^/\s\r\n:;,\)\]]+",
+        "[local path]",
+        message,
+    )
+    message = re.sub(
+        r"(?i)\b[\w.+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+        "[email]",
+        message,
+    )
+    message = re.sub(
+        r"(?i)\b[\w.-]+:(?:FriendMessage|GroupMessage|PrivateMessage):[\w.-]+\b",
+        "[session]",
+        message,
+    )
     message = re.sub(r"[\x00-\x1f\x7f]+", " ", message)
     message = " ".join(message.split())
     return message[:180] or type(error).__name__
