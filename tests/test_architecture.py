@@ -40,8 +40,16 @@ class ArchitectureTest(unittest.TestCase):
 
     def test_private_runner_dependency_stays_in_compatibility_boundary(self) -> None:
         repository_root = Path(__file__).parents[1]
-        feature_root = Path(__file__).parents[1] / "features"
-        guarded_paths = [repository_root / "main.py", *feature_root.rglob("*.py")]
+        guarded_paths = [repository_root / "main.py"]
+        for package in (
+            "adapters",
+            "features",
+            "models",
+            "services",
+            "storage",
+            "utils",
+        ):
+            guarded_paths.extend((repository_root / package).rglob("*.py"))
         forbidden = (
             "astrbot.core.agent.runners",
             "ToolLoopAgentRunner",
@@ -63,6 +71,8 @@ class ArchitectureTest(unittest.TestCase):
         self.assertIn("repos/AstrBotDevs/AstrBot/releases?per_page=100", workflow)
         self.assertIn("select_latest_astrbot_4x.py", workflow)
         self.assertIn("v4.*", workflow)
+        self.assertIn("pip install -e ./astrbot-runtime", workflow)
+        self.assertIn("check_astrbot_runtime_smoke.py", workflow)
 
     def test_latest_stable_4x_selector_ignores_v5_and_prereleases(self) -> None:
         releases = [
