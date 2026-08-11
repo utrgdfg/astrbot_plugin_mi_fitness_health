@@ -47,28 +47,55 @@ jobs:
           if-no-files-found: error
 
   astrbot-runner-contract:
+    name: AstrBot runner contract (${{ matrix.channel }})
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        astrbot-ref: ["v4.24.2", "v4.27.2"]
+        channel: ["minimum-supported", "latest-stable-4x"]
 
     steps:
       - name: Check out plugin
         uses: actions/checkout@v4
         with:
-          path: plugin
-      - name: Check out AstrBot ${{ matrix.astrbot-ref }}
-        uses: actions/checkout@v4
-        with:
-          repository: AstrBotDevs/AstrBot
-          ref: ${{ matrix.astrbot-ref }}
-          path: astrbot-runtime
+          path: astrbot_plugin_mi_fitness_health
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Resolve AstrBot compatibility reference
+        id: astrbot_ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASTRBOT_CHANNEL: ${{ matrix.channel }}
+        run: |
+          if [ "$ASTRBOT_CHANNEL" = "minimum-supported" ]; then
+            ref="v4.24.2"
+          else
+            ref="$(gh api 'repos/AstrBotDevs/AstrBot/releases?per_page=100' | \
+              python astrbot_plugin_mi_fitness_health/scripts/select_latest_astrbot_4x.py)"
+            case "$ref" in
+              v4.*) ;;
+              *) echo "Latest stable AstrBot release is not a v4.x tag: $ref" >&2; exit 1 ;;
+            esac
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      - name: Check out AstrBot ${{ steps.astrbot_ref.outputs.ref }}
+        uses: actions/checkout@v4
+        with:
+          repository: AstrBotDevs/AstrBot
+          ref: ${{ steps.astrbot_ref.outputs.ref }}
+          path: astrbot-runtime
+      - name: Install AstrBot and plugin runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ./astrbot-runtime
+          python -m pip install -r ./astrbot_plugin_mi_fitness_health/requirements.txt
       - name: Check private runner compatibility contract
         run: >-
-          python plugin/scripts/check_astrbot_runner_contract.py
+          python astrbot_plugin_mi_fitness_health/scripts/check_astrbot_runner_contract.py
           astrbot-runtime
+      - name: Import plugin and install the real runner privacy guard
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python astrbot_plugin_mi_fitness_health/scripts/check_astrbot_runtime_smoke.py

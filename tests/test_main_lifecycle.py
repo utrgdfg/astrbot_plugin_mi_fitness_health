@@ -1410,6 +1410,44 @@ class MainLifecycleTest(unittest.TestCase):
         plugin.conversation_health_mode = "main_model"
         self.assertEqual(plugin._effective_conversation_health_mode(), "main_model")
 
+    def test_local_rule_routing_regression_matrix(self) -> None:
+        plugin = self._bare_plugin()
+        positive_cases = {
+            "我昨天睡了多久": "我昨天睡了多久",
+            "早上好": "今天 睡眠 心率",
+            "刚跑步回来": "活动",
+        }
+        negative_cases = (
+            "这个接口的压力测试结果怎么样？",
+            "帮我写一个熬夜主题的故事",
+            "昨天我朋友没睡好",
+            "睡眠算法应该怎么排序",
+            "让线程休息一秒",
+            "休息日制度是什么",
+            "在吗",
+        )
+        explicit_queries_with_ambiguous_words = (
+            "今天是休息日，昨晚睡了多久",
+            "休息日想看看睡眠记录",
+            "我的休息制度不规律，看看最近心率",
+        )
+
+        for message, focus in positive_cases.items():
+            with self.subTest(message=message):
+                self.assertEqual(
+                    plugin._fallback_context_decision(message), (True, focus)
+                )
+        for message in negative_cases:
+            with self.subTest(message=message):
+                self.assertEqual(
+                    plugin._fallback_context_decision(message), (False, "")
+                )
+        for message in explicit_queries_with_ambiguous_words:
+            with self.subTest(message=message):
+                self.assertEqual(
+                    plugin._fallback_context_decision(message), (True, message)
+                )
+
     def test_conversation_decision_fetches_and_injects_data_for_ambiguous_turn(
         self,
     ) -> None:
@@ -3105,6 +3143,106 @@ class MainLifecycleTest(unittest.TestCase):
 
         self.assertTrue(asyncio.run(run()))
         self.assertEqual(plugin._foreground_tasks, set())
+        self.assertTrue(plugin._terminated)
+
+    def test_repeated_initialize_terminate_cycles_leave_no_owned_tasks(self) -> None:
+        async def run() -> None:
+            for cycle in range(25):
+                plugin = self._bare_plugin()
+                plugin.name = f"mi-fitness-soak-{cycle}"
+                plugin.proactive_monitor_enabled = True
+                plugin.allow_health_data_to_llm = True
+                plugin.allow_proactive_chat_context = True
+                plugin.owner_platform_id = "synthetic-owner"
+                plugin.owner_platform_instance_id = "synthetic-bot"
+                plugin.user_id = "synthetic-user"
+                plugin.pass_token = "synthetic-token"
+                plugin.auto_sync_enabled = True
+                plugin.sync_service.initialize = AsyncMock()
+                plugin.sync_service.activity_timezone_reset = False
+
+                async def wait_until_cancelled() -> None:
+                    await asyncio.Event().wait()
+
+                plugin._health_monitor_loop = wait_until_cancelled
+                plugin._auto_sync_loop = wait_until_cancelled
+
+                await plugin.initialize()
+                monitor_task = plugin._monitor_task
+                auto_task = plugin._auto_task
+                self.assertIsNotNone(monitor_task)
+                self.assertIsNotNone(auto_task)
+                await asyncio.sleep(0)
+
+                await plugin.terminate()
+                await asyncio.sleep(0)
+
+                self.assertTrue(monitor_task.done())
+                self.assertTrue(auto_task.done())
+                self.assertIsNone(plugin._monitor_task)
+                self.assertIsNone(plugin._auto_task)
+                self.assertIsNone(plugin._natural_refresh_task)
+                self.assertIsNone(plugin._connection_task)
+                self.assertIsNone(plugin._owner_activity_task)
+                self.assertEqual(plugin._foreground_tasks, set())
+                self.assertEqual(plugin._detached_tasks, set())
+                self.assertFalse(
+                    any(
+                        not task.done()
+                        and task is not asyncio.current_task()
+                        and task.get_name().startswith(plugin.name)
+                        for task in asyncio.all_tasks()
+                    )
+                )
+
+        asyncio.run(run())
+
+    def test_terminate_bounds_stubborn_close_and_reaps_it_after_completion(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        close_started = asyncio.Event()
+        close_cancelled = asyncio.Event()
+        release_close = asyncio.Event()
+
+        async def stubborn_close() -> None:
+            close_started.set()
+            try:
+                await release_close.wait()
+            except asyncio.CancelledError:
+                close_cancelled.set()
+                await release_close.wait()
+
+        plugin.sync_service.close = AsyncMock(side_effect=stubborn_close)
+
+        async def run() -> tuple[float, int]:
+            started = asyncio.get_running_loop().time()
+            with (
+                patch(
+                    "astrbot_plugin_mi_fitness_health.features.runtime_coordination.SHUTDOWN_CLOUD_CLOSE_TIMEOUT_SECONDS",
+                    0.01,
+                ),
+                patch(
+                    "astrbot_plugin_mi_fitness_health.features.runtime_coordination.DETACHED_TASK_DRAIN_SECONDS",
+                    0.01,
+                ),
+            ):
+                await plugin.terminate()
+            elapsed = asyncio.get_running_loop().time() - started
+            await close_started.wait()
+            await close_cancelled.wait()
+            detached_at_return = len(plugin._detached_tasks)
+            release_close.set()
+            await asyncio.gather(*tuple(plugin._detached_tasks), return_exceptions=True)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return elapsed, detached_at_return
+
+        elapsed, detached_at_return = asyncio.run(run())
+
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(detached_at_return, 1)
+        self.assertEqual(plugin._detached_tasks, set())
         self.assertTrue(plugin._terminated)
 
     def test_mutating_command_during_reload_is_consumed_without_llm_fallthrough(
