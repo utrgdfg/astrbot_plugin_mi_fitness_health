@@ -8,6 +8,8 @@ from pathlib import Path
 from astrbot_plugin_mi_fitness_health.features import HealthCommandsMixin
 from astrbot_plugin_mi_fitness_health.main import MiFitnessHealthPlugin
 
+from scripts.select_latest_astrbot_4x import select_latest_stable_v4
+
 
 class ArchitectureTest(unittest.TestCase):
     def test_conversation_features_live_outside_the_entrypoint(self) -> None:
@@ -37,13 +39,43 @@ class ArchitectureTest(unittest.TestCase):
         self.assertIn("terminate", MiFitnessHealthPlugin.__dict__)
 
     def test_private_runner_dependency_stays_in_compatibility_boundary(self) -> None:
+        repository_root = Path(__file__).parents[1]
         feature_root = Path(__file__).parents[1] / "features"
-        for path in feature_root.rglob("*.py"):
+        guarded_paths = [repository_root / "main.py", *feature_root.rglob("*.py")]
+        forbidden = (
+            "astrbot.core.agent.runners",
+            "ToolLoopAgentRunner",
+            "_iter_llm_responses",
+            "_func_tool_for_provider",
+        )
+        for path in guarded_paths:
             with self.subTest(path=path.name):
-                self.assertNotIn(
-                    "astrbot.core.agent.runners",
-                    path.read_text(encoding="utf-8"),
-                )
+                text = path.read_text(encoding="utf-8")
+                for marker in forbidden:
+                    self.assertNotIn(marker, text)
+
+    def test_compatibility_matrix_tracks_minimum_and_latest_stable_4x(self) -> None:
+        workflow = (
+            Path(__file__).parents[1] / ".github" / "workflows" / "ci.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn('channel: ["minimum-supported", "latest-stable-4x"]', workflow)
+        self.assertIn('ref="v4.24.2"', workflow)
+        self.assertIn("repos/AstrBotDevs/AstrBot/releases?per_page=100", workflow)
+        self.assertIn("select_latest_astrbot_4x.py", workflow)
+        self.assertIn("v4.*", workflow)
+
+    def test_latest_stable_4x_selector_ignores_v5_and_prereleases(self) -> None:
+        releases = [
+            {"tag_name": "v5.0.0", "draft": False, "prerelease": False},
+            {"tag_name": "v4.30.0-rc.1", "draft": False, "prerelease": True},
+            {"tag_name": "v4.29.2", "draft": False, "prerelease": False},
+            {"tag_name": "v4.29.1", "draft": False, "prerelease": False},
+        ]
+        self.assertEqual(select_latest_stable_v4(releases), "v4.29.2")
+        with self.assertRaises(ValueError):
+            select_latest_stable_v4(
+                [{"tag_name": "v5.0.0", "draft": False, "prerelease": False}]
+            )
 
     def test_decorated_command_entrypoints_remain_in_main_module(self) -> None:
         for name in (
