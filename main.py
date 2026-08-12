@@ -568,36 +568,43 @@ class MiFitnessHealthPlugin(
     # smaller, independently testable feature mixin.
     @filter.command("健康帮助")
     async def health_help(self, event: AstrMessageEvent):
+        """查看小米运动健康插件的使用方法与隐私状态。"""
         async for result in HealthCommandsMixin.health_help(self, event):
             yield result
 
     @filter.command("健康连接")
     async def health_connection(self, event: AstrMessageEvent):
+        """检查小米账号凭证与健康云连接是否可用。"""
         async for result in HealthCommandsMixin.health_connection(self, event):
             yield result
 
     @filter.command("健康同步")
     async def health_sync(self, event: AstrMessageEvent):
+        """手动同步最近的小米运动健康云数据。"""
         async for result in HealthCommandsMixin.health_sync(self, event):
             yield result
 
     @filter.command("今日健康")
     async def health_today(self, event: AstrMessageEvent):
+        """查看今天已同步的活动、心率与生活数据摘要。"""
         async for result in HealthCommandsMixin.health_today(self, event):
             yield result
 
     @filter.command("健康详情")
     async def health_details(self, event: AstrMessageEvent):
+        """查看最近已同步的睡眠、血氧与压力数据。"""
         async for result in HealthCommandsMixin.health_details(self, event):
             yield result
 
     @filter.command("健康诊断")
     async def health_diagnose(self, event: AstrMessageEvent):
+        """检查各类小米云数据是否可读取，不进行医疗诊断。"""
         async for result in HealthCommandsMixin.health_diagnose(self, event):
             yield result
 
     @filter.command("健康状态")
     async def health_status(self, event: AstrMessageEvent):
+        """查看连接、同步、后台任务与隐私授权状态。"""
         async for result in HealthCommandsMixin.health_status(self, event):
             yield result
 
@@ -605,6 +612,7 @@ class MiFitnessHealthPlugin(
     async def clear_local_health_data(
         self, event: AstrMessageEvent, confirmation: str = ""
     ):
+        """清除本地健康缓存，不删除小米云数据或配置凭证。"""
         async for result in HealthCommandsMixin.clear_local_health_data(
             self, event, confirmation
         ):
@@ -612,15 +620,18 @@ class MiFitnessHealthPlugin(
 
     @filter.command("心率记录")
     async def heart_rate_records(self, event: AstrMessageEvent, hours: int = 24):
+        """查看指定小时范围内已同步的心率记录。"""
         async for result in HealthCommandsMixin.heart_rate_records(self, event, hours):
             yield result
 
     @filter.command("身体数据")
     async def body_data(self, event: AstrMessageEvent):
+        """查看最近已同步的体重与身体测量数据。"""
         async for result in HealthCommandsMixin.body_data(self, event):
             yield result
 
     @filter.command("健康趋势")
     async def health_trend(self, event: AstrMessageEvent, days: int = 7):
+        """查看指定天数内的步数、热量与平均心率趋势。"""
         async for result in HealthCommandsMixin.health_trend(self, event, days):
             yield result
