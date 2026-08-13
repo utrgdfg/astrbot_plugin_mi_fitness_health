@@ -1258,6 +1258,8 @@ class MainLifecycleTest(unittest.TestCase):
             {},
             {"temperature": 0.2, "top_p": 0.9},
             {"tool_choice": "none"},
+            {"tools": []},
+            {"code_execution": False, "web_search": None},
         )
         for extra_body in safe_bodies:
             with self.subTest(extra_body=extra_body):

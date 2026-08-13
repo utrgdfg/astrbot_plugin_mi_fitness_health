@@ -104,12 +104,18 @@ class ConversationRoutingMixin:
             custom_extra_body = provider_config.get("custom_extra_body", {})
             if not isinstance(custom_extra_body, Mapping):
                 raise TypeError("custom_extra_body is not a mapping")
-            custom_keys = {
-                str(key).strip().lower()
-                for key in custom_extra_body
-                if str(key).strip()
-            }
-            if custom_keys.intersection(self._CUSTOM_PROVIDER_TOOL_KEYS):
+            custom_tools_enabled = False
+            for key, value in custom_extra_body.items():
+                normalized_key = str(key).strip().lower()
+                if normalized_key not in self._CUSTOM_PROVIDER_TOOL_KEYS:
+                    continue
+                if normalized_key == "tools" and value == []:
+                    continue
+                if value in (None, False, ""):
+                    continue
+                custom_tools_enabled = True
+                break
+            if custom_tools_enabled:
                 logger.warning(
                     "Mi Fitness disabled private health context because the "
                     "selected provider has custom server-side tool parameters"
