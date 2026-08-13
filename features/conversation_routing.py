@@ -38,6 +38,18 @@ DEFAULT_CONTEXT_DECISION_PROMPT = (
 class ConversationRoutingMixin:
     """Select, refresh, and prepare the smallest relevant health-data slice."""
 
+    _CUSTOM_PROVIDER_TOOL_KEYS = frozenset(
+        {
+            "tools",
+            "web_search_options",
+            "search_parameters",
+            "web_search",
+            "computer_use",
+            "code_execution",
+            "url_context",
+        }
+    )
+
     def _private_context_runtime_is_unsafe(self, session: str) -> bool:
         """Fail closed when the guarded local runner is not in use."""
         get_config = getattr(getattr(self, "context", None), "get_config", None)
@@ -88,6 +100,21 @@ class ConversationRoutingMixin:
             provider_type = provider_config.get("type")
             if not isinstance(provider_type, str) or not provider_type.strip():
                 raise TypeError("provider type is invalid")
+
+            custom_extra_body = provider_config.get("custom_extra_body", {})
+            if not isinstance(custom_extra_body, Mapping):
+                raise TypeError("custom_extra_body is not a mapping")
+            custom_keys = {
+                str(key).strip().lower()
+                for key in custom_extra_body
+                if str(key).strip()
+            }
+            if custom_keys.intersection(self._CUSTOM_PROVIDER_TOOL_KEYS):
+                logger.warning(
+                    "Mi Fitness disabled private health context because the "
+                    "selected provider has custom server-side tool parameters"
+                )
+                return True
 
             native_switches: tuple[str, ...]
             if provider_type == "xai_chat_completion":

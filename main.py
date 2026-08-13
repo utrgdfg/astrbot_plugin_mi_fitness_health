@@ -349,6 +349,17 @@ class MiFitnessHealthPlugin(
         """Conversational health data is available only in the owner's private chat."""
         return self._access_denial_reason(event) is None
 
+    def _llm_health_authorization_is_current(self, event: AstrMessageEvent) -> bool:
+        """Recheck mutable consent and lifecycle state immediately before disclosure."""
+        return bool(
+            self.care_dialogue_enabled
+            and self.allow_health_data_to_llm
+            and not self._local_data_clear_in_progress
+            and not self._terminating
+            and not self._terminated
+            and self._is_private_owner_event(event)
+        )
+
     def _schedule_owner_activity_touch(self, session: str, seen_at: datetime) -> None:
         """Coalesce non-critical owner-session writes outside the chat pipeline."""
         if self._local_data_clear_in_progress or self._terminating or self._terminated:
@@ -545,6 +556,12 @@ class MiFitnessHealthPlugin(
                 snapshot,
                 displayed_last_sync,
             )
+        if await self._private_context_provider_is_unsafe(
+            event, event.unified_msg_origin, provider_id
+        ):
+            return
+        if not self._llm_health_authorization_is_current(event):
+            return
         text = self._build_private_life_context(
             snapshot,
             displayed_last_sync,

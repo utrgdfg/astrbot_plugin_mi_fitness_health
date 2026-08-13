@@ -517,6 +517,13 @@ class ProactiveCareMixin:
         recent_context = await self._recent_private_context(session)
         if not recent_context:
             return False
+        if (
+            not self.allow_health_data_to_llm
+            or not getattr(self, "allow_proactive_chat_context", False)
+            or getattr(self, "_terminating", False)
+            or getattr(self, "_terminated", False)
+        ):
+            return False
         serialized_context = json.dumps(recent_context, ensure_ascii=False)
         context_prompt = str(
             getattr(
@@ -550,6 +557,13 @@ class ProactiveCareMixin:
                 session, self.proactive_reminder_provider_id
             )
             if self._provider_native_tools_are_unsafe(provider_id):
+                return False
+            if (
+                not self.allow_health_data_to_llm
+                or not getattr(self, "allow_proactive_chat_context", False)
+                or getattr(self, "_terminating", False)
+                or getattr(self, "_terminated", False)
+            ):
                 return False
             response = await await_with_hard_timeout(
                 self.context.llm_generate(
@@ -604,6 +618,12 @@ class ProactiveCareMixin:
                 "Mi Fitness skipped proactive reply: owner persona unavailable"
             )
             return None
+        if (
+            not self.allow_health_data_to_llm
+            or getattr(self, "_terminating", False)
+            or getattr(self, "_terminated", False)
+        ):
+            return None
         prompt = (
             "已由生活数据插件完成后台读取和关心时机判断；下面是已核实的事实：\n"
             + "\n".join(f"- {fact}" for fact in facts)
@@ -617,6 +637,12 @@ class ProactiveCareMixin:
                 session, self.proactive_reminder_provider_id
             )
             if self._provider_native_tools_are_unsafe(provider_id):
+                return None
+            if (
+                not self.allow_health_data_to_llm
+                or getattr(self, "_terminating", False)
+                or getattr(self, "_terminated", False)
+            ):
                 return None
             response = await await_with_hard_timeout(
                 self.context.llm_generate(
@@ -661,6 +687,12 @@ class ProactiveCareMixin:
         )
         if not persona_prompt:
             return None
+        if (
+            not self.allow_health_data_to_llm
+            or getattr(self, "_terminating", False)
+            or getattr(self, "_terminated", False)
+        ):
+            return None
         bounded_focus = self._sanitize_focus(focus)
         escaped_focus = html.escape(bounded_focus, quote=True)
         escaped_snapshot = html.escape(snapshot, quote=True)
@@ -683,6 +715,12 @@ class ProactiveCareMixin:
                 session, self.health_dialogue_provider_id
             )
             if self._provider_native_tools_are_unsafe(provider_id):
+                return None
+            if (
+                not self.allow_health_data_to_llm
+                or getattr(self, "_terminating", False)
+                or getattr(self, "_terminated", False)
+            ):
                 return None
             response = await await_with_hard_timeout(
                 self.context.llm_generate(
