@@ -897,6 +897,22 @@ class AdapterTest(unittest.TestCase):
         with self.assertRaises(MiFitnessAuthenticationError):
             asyncio.run(adapter._login_with_token())
 
+    def test_login_http_403_is_classified_as_authentication_failure(self) -> None:
+        adapter = MiFitnessCloudAdapter("user", "token", "cn")
+        adapter._client = _StreamingClient(_http_response(403))
+        with self.assertRaises(MiFitnessAuthenticationError):
+            asyncio.run(adapter._login_with_token())
+
+    def test_login_rejects_malformed_prefixed_json_as_authentication_failure(
+        self,
+    ) -> None:
+        adapter = MiFitnessCloudAdapter("user", "token", "cn")
+        adapter._client = _StreamingClient(
+            _http_response(200, content=LOGIN_PREFIX + b"{not-json")
+        )
+        with self.assertRaises(MiFitnessAuthenticationError):
+            asyncio.run(adapter._login_with_token())
+
     def test_login_rate_limit_sets_cooldown_and_is_not_swallowed(self) -> None:
         adapter = MiFitnessCloudAdapter("user", "token", "cn")
         adapter._client = _StreamingClient(
@@ -1014,6 +1030,96 @@ class AdapterTest(unittest.TestCase):
         )
         self.assertNotIn("unknownCookie", adapter._cookies)
 
+    def test_login_accepts_matching_session_user_when_payload_omits_user_id(
+        self,
+    ) -> None:
+        payload = {
+            "ssecurity": base64.b64encode(b"s" * 16).decode(),
+            "location": "https://api.io.mi.com/session",
+        }
+        session_headers = httpx.Headers(
+            [
+                ("Set-Cookie", "serviceToken=service; Secure; HttpOnly"),
+                ("Set-Cookie", "userId=user; Secure"),
+            ]
+        )
+        adapter = MiFitnessCloudAdapter("user", "token", "cn")
+        adapter._client = _StreamingClient(
+            _http_response(
+                200,
+                content=LOGIN_PREFIX + json.dumps(payload).encode(),
+            ),
+            _http_response(200, headers=session_headers),
+        )
+
+        candidate = asyncio.run(adapter._login_with_token())
+
+        self.assertEqual(candidate, ("user", "token"))
+
+    def test_login_rejects_unbound_account_when_payload_and_cookie_omit_user_id(
+        self,
+    ) -> None:
+        payload = {
+            "ssecurity": base64.b64encode(b"s" * 16).decode(),
+            "location": "https://api.io.mi.com/session",
+        }
+        adapter = MiFitnessCloudAdapter("user", "token", "cn")
+        adapter._client = _StreamingClient(
+            _http_response(
+                200,
+                content=LOGIN_PREFIX + json.dumps(payload).encode(),
+            ),
+            _http_response(
+                200,
+                headers={"Set-Cookie": "serviceToken=service; Secure; HttpOnly"},
+            ),
+        )
+
+        with self.assertRaisesRegex(MiFitnessAuthenticationError, "确认配置账号"):
+            asyncio.run(adapter._login_with_token())
+
+    def test_login_rejects_conflicting_session_user_id(self) -> None:
+        payload = {
+            "ssecurity": base64.b64encode(b"s" * 16).decode(),
+            "location": "https://api.io.mi.com/session",
+            "userId": "user",
+        }
+        session_headers = httpx.Headers(
+            [
+                ("Set-Cookie", "serviceToken=service; Secure; HttpOnly"),
+                ("Set-Cookie", "userId=different-user; Secure"),
+            ]
+        )
+        adapter = MiFitnessCloudAdapter("user", "token", "cn")
+        adapter._client = _StreamingClient(
+            _http_response(
+                200,
+                content=LOGIN_PREFIX + json.dumps(payload).encode(),
+            ),
+            _http_response(200, headers=session_headers),
+        )
+
+        with self.assertRaisesRegex(MiFitnessAuthenticationError, "账号与配置"):
+            asyncio.run(adapter._login_with_token())
+
+    def test_login_requires_a_service_token_cookie(self) -> None:
+        payload = {
+            "ssecurity": base64.b64encode(b"s" * 16).decode(),
+            "location": "https://api.io.mi.com/session",
+            "userId": "user",
+        }
+        adapter = MiFitnessCloudAdapter("user", "token", "cn")
+        adapter._client = _StreamingClient(
+            _http_response(
+                200,
+                content=LOGIN_PREFIX + json.dumps(payload).encode(),
+            ),
+            _http_response(200, headers={"Set-Cookie": "userId=user; Secure"}),
+        )
+
+        with self.assertRaisesRegex(MiFitnessAuthenticationError, "服务令牌"):
+            asyncio.run(adapter._login_with_token())
+
     def test_login_rejects_session_with_only_unknown_cookies(self) -> None:
         payload = {
             "ssecurity": base64.b64encode(b"s" * 16).decode(),
@@ -1099,6 +1205,61 @@ class AdapterTest(unittest.TestCase):
         self.assertEqual(adapter._client.calls, 1)
         self.assertFalse(adapter.is_connected())
         self.assertTrue(adapter.authentication_failed)
+        self.assertEqual(adapter._cookies, "")
+        self.assertEqual(adapter._ssecurity, b"")
+
+    def test_health_api_business_403_invalidates_session_material(self) -> None:
+        adapter = MiFitnessCloudAdapter("user", "token", "cn")
+        adapter._client = _StreamingClient(
+            _http_response(
+                200,
+                content=base64.b64encode(
+                    json.dumps({"code": 403, "message": "permission denied"}).encode()
+                ),
+            )
+        )
+        adapter._ssecurity = b"s" * 16
+        adapter._cookies = "serviceToken=synthetic"
+        adapter._connected = True
+
+        with patch(
+            "astrbot_plugin_mi_fitness_health.adapters.mi_fitness_cloud._rc4_crypt",
+            side_effect=lambda _key, payload: payload,
+        ):
+            with self.assertRaises(MiFitnessAuthenticationError):
+                asyncio.run(adapter._request("https://example.invalid", "/path", {}))
+
+        self.assertFalse(adapter.is_connected())
+        self.assertTrue(adapter.authentication_failed)
+        self.assertEqual(adapter._cookies, "")
+        self.assertEqual(adapter._ssecurity, b"")
+
+    def test_unknown_business_error_does_not_invalidate_valid_session(self) -> None:
+        adapter = MiFitnessCloudAdapter("user", "token", "cn")
+        adapter._client = _StreamingClient(
+            _http_response(
+                200,
+                content=base64.b64encode(
+                    json.dumps(
+                        {"code": 70001, "message": "synthetic data error"}
+                    ).encode()
+                ),
+            )
+        )
+        adapter._ssecurity = b"s" * 16
+        adapter._cookies = "serviceToken=synthetic"
+        adapter._connected = True
+
+        with patch(
+            "astrbot_plugin_mi_fitness_health.adapters.mi_fitness_cloud._rc4_crypt",
+            side_effect=lambda _key, payload: payload,
+        ):
+            with self.assertRaises(MiFitnessResponseError):
+                asyncio.run(adapter._request("https://example.invalid", "/path", {}))
+
+        self.assertTrue(adapter.is_connected())
+        self.assertFalse(adapter.authentication_failed)
+        self.assertEqual(adapter._cookies, "serviceToken=synthetic")
 
     def test_transient_5xx_errors_retry_only_within_the_fixed_budget(self) -> None:
         adapter = MiFitnessCloudAdapter("user", "token", "cn")

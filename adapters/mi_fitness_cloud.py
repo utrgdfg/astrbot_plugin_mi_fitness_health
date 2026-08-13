@@ -62,6 +62,7 @@ MAX_SESSION_COOKIE_BYTES = 32 * 1024
 SESSION_COOKIE_NAMES = frozenset(
     {"serviceToken", "yetAnotherServiceToken", "cUserId", "userId"}
 )
+SERVICE_TOKEN_COOKIE_NAMES = frozenset({"serviceToken", "yetAnotherServiceToken"})
 MAX_RATE_LIMIT_DELAY_SECONDS = 15 * 60
 DEFAULT_RATE_LIMIT_DELAY_SECONDS = 60
 DIAGNOSTIC_TIMEOUT_SECONDS = 120
@@ -214,6 +215,13 @@ class MiFitnessCloudAdapter(DataAdapter):
         """Return whether Xiaomi session setup completed."""
         return self._connected and self._client is not None
 
+    def _invalidate_authentication(self) -> None:
+        """Make expired session material unusable before the next reconnect."""
+        self._connected = False
+        self.authentication_failed = True
+        self._cookies = ""
+        self._ssecurity = b""
+
     async def connect(self) -> bool:
         """Log in and probe recent data without concealing the sanitized cause.
 
@@ -350,7 +358,12 @@ class MiFitnessCloudAdapter(DataAdapter):
         response.raise_for_status()
         if not raw.startswith(LOGIN_PREFIX):
             raise MiFitnessAuthenticationError("小米登录响应无效；请重新获取 Cookie。")
-        payload = json.loads(raw[len(LOGIN_PREFIX) :].decode())
+        try:
+            payload = json.loads(raw[len(LOGIN_PREFIX) :].decode())
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise MiFitnessAuthenticationError(
+                "小米登录响应格式无效；请重新获取 Cookie。"
+            ) from error
         if not isinstance(payload, dict):
             raise MiFitnessAuthenticationError(
                 "小米登录响应格式无效；请重新获取 Cookie。"
@@ -450,6 +463,19 @@ class MiFitnessCloudAdapter(DataAdapter):
             name = name.strip()
             if separator and name in SESSION_COOKIE_NAMES and cookie_value:
                 session_cookies[name] = cookie_value
+        session_user_id = session_cookies.get("userId")
+        if session_user_id is not None and session_user_id != self.user_id:
+            raise MiFitnessAuthenticationError(
+                "小米登录会话的账号与配置 userId 不一致；请重新获取同一账号的 Cookie。"
+            )
+        if returned_user_id in (None, "") and session_user_id is None:
+            raise MiFitnessAuthenticationError(
+                "小米登录响应未能确认配置账号；请重新获取同一账号的 Cookie。"
+            )
+        if not SERVICE_TOKEN_COOKIE_NAMES.intersection(session_cookies):
+            raise MiFitnessAuthenticationError(
+                "未取得小米健康云服务令牌；请重新登录后更新 Cookie。"
+            )
         candidate_cookies = "; ".join(
             f"{name}={value}" for name, value in session_cookies.items()
         )
@@ -516,8 +542,7 @@ class MiFitnessCloudAdapter(DataAdapter):
                 if budget is not None:
                     budget.consume_response(encrypted_body)
                 if response.status_code in (401, 403):
-                    self._connected = False
-                    self.authentication_failed = True
+                    self._invalidate_authentication()
                     raise MiFitnessAuthenticationError(
                         "小米健康云授权已失效；请重新获取 Cookie。"
                     )
@@ -555,7 +580,7 @@ class MiFitnessCloudAdapter(DataAdapter):
                     raise MiFitnessResponseError("小米健康云响应状态格式无效。")
                 if str(code_value) != "0":
                     message = str(body.get("message") or "Mi Fitness request failed")
-                    if any(
+                    if str(code_value).strip() in {"401", "403"} or any(
                         marker in message.lower()
                         for marker in (
                             "unauthorized",
@@ -581,8 +606,7 @@ class MiFitnessCloudAdapter(DataAdapter):
                             "凭证过期",
                         )
                     ):
-                        self._connected = False
-                        self.authentication_failed = True
+                        self._invalidate_authentication()
                         raise MiFitnessAuthenticationError(
                             "小米健康云授权已失效；请重新获取 Cookie。"
                         )
