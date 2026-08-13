@@ -63,6 +63,12 @@ class QueryService:
         "stress": "压力",
     }
     COMPREHENSIVE_FOCUS_CUES = (
+        "身体健康",
+        "健康状况",
+        "身体状况",
+        "整体健康",
+        "总体健康",
+        "综合健康",
         "综合概况",
         "综合情况",
         "综合状态",
@@ -226,7 +232,7 @@ class QueryService:
     def llm_categories_for_focus(cls, focus: str) -> tuple[str, ...]:
         """Return a fail-closed, minimal category set for an LLM-generated focus.
 
-        Ordinary model output is limited to the first two explicitly mentioned
+        Ordinary model output is limited to the first three explicitly mentioned
         categories.  Only an unambiguous Chinese comprehensive-data cue may
         request every category.  Empty, unknown, or generic English wording
         returns no categories instead of expanding to all sensitive records.
@@ -247,14 +253,11 @@ class QueryService:
             if positions:
                 matches.append((min(positions), declaration_order, category))
         matches.sort()
-        return tuple(category for _, _, category in matches[:2])
+        return tuple(category for _, _, category in matches[:3])
 
     @classmethod
     def normalize_llm_focus(cls, focus: str) -> str:
         """Convert an LLM focus into a safe focus accepted by existing queries."""
-        categories = cls.llm_categories_for_focus(focus)
-        if not categories:
-            return ""
         compact = cls._compact_focus(focus)
         if "昨天" in compact or "昨日" in compact:
             scope = "昨天"
@@ -264,6 +267,11 @@ class QueryService:
             scope = "今天"
         else:
             scope = ""
+        if any(cue in compact for cue in cls.COMPREHENSIVE_FOCUS_CUES):
+            return " ".join(part for part in (scope, "综合概况") if part)
+        categories = cls.llm_categories_for_focus(focus)
+        if not categories:
+            return ""
         labels = (cls.CATEGORY_FOCUS_LABELS[category] for category in categories)
         return " ".join(part for part in (scope, *labels) if part)
 

@@ -232,6 +232,15 @@ class MiFitnessHealthPlugin(
         self.context_decision_timeout_seconds = _config_int(
             config, "context_decision_timeout_seconds", 8, 3, 30
         )
+        decision_context_source = str(
+            config.get("context_decision_context_source") or "conversation_history"
+        ).strip()
+        self.context_decision_context_source = (
+            decision_context_source
+            if decision_context_source
+            in {"conversation_history", "platform_message_history", "hybrid"}
+            else "conversation_history"
+        )
         self.context_decision_message_count = _config_int(
             config, "context_decision_message_count", 8, 0, 20
         )
@@ -453,10 +462,17 @@ class MiFitnessHealthPlugin(
             # The private runner guard only covers AstrBot's local agent runner.
             return
         mode = self._effective_conversation_health_mode()
+        direct_decision = self._direct_context_decision(question)
         provider_id = None
         response_provider_checked = False
-        if mode == "main_model":
-            decision_history = self._decision_history_from_request(req, question)
+        if direct_decision is not None:
+            use_data, focus = direct_decision
+        elif mode == "main_model":
+            decision_history = await self._decision_context_for_request(
+                event,
+                req,
+                question,
+            )
             selected_provider = event.get_extra("selected_provider")
             if selected_provider is not None:
                 if not isinstance(selected_provider, str):
@@ -508,10 +524,15 @@ class MiFitnessHealthPlugin(
                 self.context_decision_provider_id,
             ):
                 return
+            decision_history = await self._decision_context_for_request(
+                event,
+                req,
+                question,
+            )
             use_data, focus = await self._decide_context_focus(
                 event.unified_msg_origin,
                 question,
-                self._decision_history_from_request(req, question),
+                decision_history,
             )
         else:
             use_data, focus = self._fallback_context_decision(question)
@@ -526,8 +547,7 @@ class MiFitnessHealthPlugin(
             return
         wait_seconds = float(self.natural_query_cloud_wait_seconds)
         force_refresh = self._wants_fresh_cloud_data(question)
-        message_focus = self.query_service.normalize_llm_focus(question)
-        focus = message_focus or self.query_service.normalize_llm_focus(focus)
+        focus = self.query_service.normalize_llm_focus(focus)
         if not focus:
             return
         focus = self._normalize_context_focus_for_message(question, focus)

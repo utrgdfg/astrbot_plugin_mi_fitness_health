@@ -18,6 +18,7 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
 from astrbot.core.agent.tool import FunctionTool, ToolSet
 from astrbot_plugin_mi_fitness_health.adapters import MiFitnessAuthenticationError
+from astrbot_plugin_mi_fitness_health.features import DEFAULT_CONTEXT_DECISION_PROMPT
 from astrbot_plugin_mi_fitness_health.main import MiFitnessHealthPlugin
 from astrbot_plugin_mi_fitness_health.services.query_service import QueryService
 from astrbot_plugin_mi_fitness_health.services.sync_service import SyncServiceBusyError
@@ -36,6 +37,7 @@ class MainLifecycleTest(unittest.TestCase):
         plugin.context_decision_provider_id = ""
         plugin.context_decision_timeout_seconds = 8
         plugin.natural_query_cloud_wait_seconds = 5
+        plugin.context_decision_context_source = "conversation_history"
         plugin.context_decision_message_count = 8
         plugin.context_decision_include_bot_messages = True
         plugin._last_proactive_delivery_at = None
@@ -176,7 +178,27 @@ class MainLifecycleTest(unittest.TestCase):
                 '```json\n{"use_data":true,"categories":'
                 '["sleep","heart","activity"],"time_scope":"yesterday"}\n```'
             ),
-            (True, "昨天 睡眠 心率"),
+            (True, "昨天 睡眠 心率 活动"),
+        )
+        self.assertEqual(
+            MiFitnessHealthPlugin._parse_context_decision(
+                '{"use_data":true,"overview":true,"categories":[],'
+                '"time_scope":"recent"}'
+            ),
+            (True, "最近 综合概况"),
+        )
+        self.assertIsNone(
+            MiFitnessHealthPlugin._parse_context_decision(
+                '{"use_data":true,"overview":true,"categories":["sleep"],'
+                '"time_scope":"recent"}'
+            )
+        )
+        self.assertIsNone(
+            MiFitnessHealthPlugin._parse_context_decision(
+                '{"use_data":true,"overview":false,'
+                '"categories":["sleep","heart","spo2","stress"],'
+                '"time_scope":"recent"}'
+            )
         )
         self.assertEqual(
             MiFitnessHealthPlugin._parse_context_decision(
@@ -470,6 +492,218 @@ class MainLifecycleTest(unittest.TestCase):
             ],
         )
         self.assertEqual(request.extra_user_content_parts, [])
+
+    def test_decision_context_can_use_verified_platform_history(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.context_decision_context_source = "platform_message_history"
+        plugin.context_decision_message_count = 4
+        plugin._is_configured_owner_private_session = AsyncMock(return_value=True)
+        plugin._platform_private_context = AsyncMock(
+            return_value=[
+                "机器人: 最近是不是一直很紧绷？",
+                "用户: 没什么，就是脑袋晕乎乎的",
+            ]
+        )
+        event = Mock(unified_msg_origin="bot:FriendMessage:owner")
+        request = ProviderRequest()
+        request.contexts = [{"role": "assistant", "content": "请求历史备用"}]
+
+        context = asyncio.run(
+            plugin._decision_context_for_request(event, request, "现在好多了")
+        )
+
+        self.assertEqual(
+            context,
+            [
+                {"role": "assistant", "text": "最近是不是一直很紧绷？"},
+                {"role": "user", "text": "没什么，就是脑袋晕乎乎的"},
+            ],
+        )
+        plugin._platform_private_context.assert_awaited_once_with(
+            event.unified_msg_origin,
+            4,
+            True,
+        )
+
+    def test_decision_platform_history_falls_back_when_session_is_unverified(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        plugin.context_decision_context_source = "platform_message_history"
+        plugin._is_configured_owner_private_session = AsyncMock(return_value=False)
+        plugin._platform_private_context = AsyncMock()
+        event = Mock(unified_msg_origin="other:GroupMessage:owner")
+        request = ProviderRequest()
+        request.contexts = [
+            {"role": "assistant", "content": "你是不是一直喘不过气？"},
+        ]
+
+        context = asyncio.run(
+            plugin._decision_context_for_request(event, request, "还是有点晕")
+        )
+
+        self.assertEqual(
+            context,
+            [{"role": "assistant", "text": "你是不是一直喘不过气？"}],
+        )
+        plugin._platform_private_context.assert_not_awaited()
+
+    def test_decision_hybrid_context_deduplicates_request_and_platform(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.context_decision_context_source = "hybrid"
+        plugin.context_decision_message_count = 4
+        plugin._is_configured_owner_private_session = AsyncMock(return_value=True)
+        plugin._platform_private_context = AsyncMock(
+            return_value=[
+                "机器人: 你是不是一直喘不过气？",
+                "用户: 还是有点晕",
+            ]
+        )
+        event = Mock(unified_msg_origin="bot:FriendMessage:owner")
+        request = ProviderRequest()
+        request.contexts = [
+            {"role": "assistant", "content": "你是不是一直喘不过气？"},
+            {"role": "user", "content": "还是有点晕"},
+        ]
+
+        context = asyncio.run(
+            plugin._decision_context_for_request(event, request, "现在呢")
+        )
+
+        self.assertEqual(
+            context,
+            [
+                {"role": "assistant", "text": "你是不是一直喘不过气？"},
+                {"role": "user", "text": "还是有点晕"},
+            ],
+        )
+
+    def test_decision_prompt_routes_implicit_stress_and_spo2_semantics(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.context_decision_provider_id = "classifier"
+        plugin.context_decision_prompt = DEFAULT_CONTEXT_DECISION_PROMPT
+        plugin.context = Mock()
+        plugin.context.llm_generate = AsyncMock(
+            return_value=Mock(
+                completion_text=(
+                    '{"use_data":true,"overview":false,'
+                    '"categories":["stress","heart","spo2"],'
+                    '"time_scope":"recent"}'
+                )
+            )
+        )
+
+        decision = asyncio.run(
+            plugin._decide_context_focus(
+                "bot:FriendMessage:owner",
+                "就是脑袋晕乎乎的",
+                [
+                    {"role": "assistant", "text": "最近是不是一直绷着？"},
+                    {"role": "user", "text": "到了高原以后也总觉得喘"},
+                ],
+            )
+        )
+
+        self.assertEqual(decision, (True, "最近 压力 心率 血氧"))
+        prompt = plugin.context.llm_generate.await_args.kwargs["prompt"]
+        self.assertIn("判断表达的实际含义", prompt)
+        self.assertIn("呼吸、高原", prompt)
+        self.assertIn("普通语境选择真正有帮助的 1～3 类", prompt)
+        self.assertIn("最近是不是一直绷着", prompt)
+        self.assertIn("到了高原以后也总觉得喘", prompt)
+
+    def test_explicit_health_overview_bypasses_classifier_with_all_categories(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        plugin.query_service = Mock()
+        plugin.query_service.normalize_llm_focus.side_effect = (
+            QueryService.normalize_llm_focus
+        )
+
+        decision = plugin._direct_context_decision("我的身体健康怎么样")
+
+        self.assertEqual(decision, (True, "综合概况"))
+        self.assertEqual(
+            set(
+                QueryService(Mock(), "user", "Asia/Shanghai").llm_sync_types_for_focus(
+                    "综合概况"
+                )
+            ),
+            set(QueryService.CATEGORY_SYNC_TYPES.values()),
+        )
+
+    def test_explicit_health_overview_skips_classifier_but_keeps_data_isolation(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        plugin.conversation_health_mode = "main_model"
+        plugin.care_dialogue_enabled = True
+        plugin.allow_health_data_to_llm = True
+        plugin._is_private_owner_event = Mock(return_value=True)
+        plugin._decide_context_focus = AsyncMock()
+        plugin._refresh_for_natural_question = AsyncMock(return_value=True)
+        plugin.query_service = Mock()
+        plugin.query_service.normalize_llm_focus.side_effect = (
+            QueryService.normalize_llm_focus
+        )
+        plugin.query_service.llm_care_snapshot = AsyncMock(
+            return_value="综合生活数据摘要"
+        )
+        plugin.query_service.sync_at_for_focus = AsyncMock(return_value=None)
+        event = Mock()
+        event.unified_msg_origin = "bot:FriendMessage:owner"
+        event.get_message_str.return_value = "我的身体健康怎么样"
+        request = ProviderRequest()
+        request.func_tool = ToolSet()
+        request.func_tool.add_tool(
+            FunctionTool(
+                name="side_effecting_tool",
+                description="send data elsewhere",
+                parameters={"type": "object", "properties": {}},
+            )
+        )
+
+        asyncio.run(plugin.add_owner_health_context(event, request))
+
+        plugin._decide_context_focus.assert_not_awaited()
+        plugin._refresh_for_natural_question.assert_awaited_once_with(
+            "综合概况",
+            wait_for_result=True,
+            force_refresh=False,
+            wait_timeout=5.0,
+        )
+        self.assertEqual(len(request.extra_user_content_parts), 1)
+        self.assertIn("综合生活数据摘要", request.extra_user_content_parts[0].text)
+        self.assertTrue(request.extra_user_content_parts[0]._no_save)
+        self.assertTrue(request.func_tool)
+        self.assertTrue(request.func_tool.empty())
+
+    def test_ambiguous_symptom_is_left_for_model_reasoning(self) -> None:
+        plugin = self._bare_plugin()
+
+        for message in (
+            "我脑袋晕乎乎的",
+            "最近一直绷着，静不下来",
+            "到了高原以后总觉得喘",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(plugin._direct_context_decision(message))
+
+    def test_direct_health_request_rejects_technical_and_third_party_contexts(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+
+        for message in (
+            "这个血氧算法怎么样",
+            "帮我看看压力接口",
+            "写一篇关于血氧的文章",
+            "我朋友最近血氧怎么样",
+            "孩子最近的压力数据怎么样",
+        ):
+            with self.subTest(message=message):
+                self.assertIsNone(plugin._direct_context_decision(message))
 
     def test_main_model_preflight_uses_current_provider_and_revokes_tools(self) -> None:
         plugin = self._bare_plugin()
@@ -2761,7 +2995,7 @@ class MainLifecycleTest(unittest.TestCase):
 
         self.assertEqual(request.extra_user_content_parts, [])
         plugin.query_service.llm_care_snapshot.assert_awaited_once_with(
-            "今天 睡眠",
+            "今天 睡眠 心率",
             include_missing_notice=False,
         )
         plugin.query_service.sync_at_for_focus.assert_not_awaited()
@@ -4146,6 +4380,27 @@ class MainLifecycleTest(unittest.TestCase):
             self.assertFalse(default_plugin.auto_sync_enabled)
             self.assertTrue(enabled_plugin.auto_sync_enabled)
             self.assertFalse(default_plugin.allow_proactive_chat_context)
+            self.assertEqual(
+                default_plugin.context_decision_context_source,
+                "conversation_history",
+            )
+
+    def test_invalid_decision_context_source_falls_back_to_conversation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            plugin = MiFitnessHealthPlugin(
+                Mock(),
+                {
+                    "database_path": str(Path(directory) / "context.sqlite3"),
+                    "context_decision_context_source": "untrusted-source",
+                },
+            )
+
+        self.assertEqual(
+            plugin.context_decision_context_source,
+            "conversation_history",
+        )
 
     def test_malformed_config_uses_bounded_safe_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
