@@ -12,7 +12,7 @@ from astrbot.api import logger
 from astrbot.api.provider import ProviderRequest
 
 from ..adapters import MiFitnessAuthenticationError
-from ..utils.async_tools import await_cancellation_safe, await_with_hard_timeout
+from ..utils.async_tools import await_with_hard_timeout
 from ..utils.privacy import redact_error
 
 DEFAULT_CONTEXT_DECISION_TIMEOUT_SECONDS = 8.0
@@ -744,9 +744,7 @@ class ConversationRoutingMixin:
         include_bot = bool(getattr(self, "context_decision_include_bot_messages", True))
         try:
             lines = await await_with_hard_timeout(
-                await_cancellation_safe(
-                    self._verified_platform_decision_lines(session, count, include_bot)
-                ),
+                self._verified_platform_decision_lines(session, count, include_bot),
                 DECISION_CONTEXT_SOURCE_TIMEOUT_SECONDS,
                 registry=getattr(self, "_detached_tasks", None),
             )
