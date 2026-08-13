@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import unittest
@@ -44,6 +45,26 @@ class PrivacyTest(unittest.TestCase):
         )
         self.assertEqual(schema["context_decision_provider_id"]["default"], "")
         self.assertEqual(schema["conversation_health_mode"]["default"], "auto")
+        self.assertEqual(
+            schema["context_decision_context_source"]["options"],
+            [
+                "conversation_history",
+                "platform_message_history",
+                "hybrid",
+            ],
+        )
+        self.assertEqual(
+            schema["context_decision_context_source"]["default"],
+            "conversation_history",
+        )
+        self.assertEqual(
+            schema["context_decision_platform_history_timeout_seconds"]["default"],
+            3,
+        )
+        self.assertEqual(
+            schema["context_decision_platform_history_timeout_seconds"]["slider"],
+            {"min": 1, "max": 15, "step": 1},
+        )
         self.assertIn(
             "main_model",
             schema["conversation_health_mode"]["options"],
@@ -54,6 +75,10 @@ class PrivacyTest(unittest.TestCase):
         )
         self.assertEqual(schema["context_decision_prompt"]["type"], "text")
         self.assertTrue(schema["context_decision_prompt"]["default"])
+        self.assertIn(
+            "判断表达的实际含义", schema["context_decision_prompt"]["default"]
+        )
+        self.assertIn("头晕", schema["context_decision_prompt"]["default"])
         self.assertEqual(schema["proactive_decision_prompt"]["type"], "text")
         self.assertIn(
             "拿不准时不要发送", schema["proactive_decision_prompt"]["default"]
@@ -81,6 +106,30 @@ class PrivacyTest(unittest.TestCase):
         self.assertIn(
             "处理或保存",
             schema["health_dialogue_provider_id"]["hint"],
+        )
+
+    def test_context_decision_prompt_default_matches_runtime_constant(self) -> None:
+        root = Path(__file__).parents[1]
+        schema = json.loads((root / "_conf_schema.json").read_text(encoding="utf-8"))
+        module = ast.parse(
+            (root / "features" / "conversation_routing.py").read_text(encoding="utf-8")
+        )
+        runtime_default = None
+        for node in module.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if any(
+                isinstance(target, ast.Name)
+                and target.id == "DEFAULT_CONTEXT_DECISION_PROMPT"
+                for target in node.targets
+            ):
+                runtime_default = ast.literal_eval(node.value)
+                break
+
+        self.assertIsNotNone(runtime_default)
+        self.assertEqual(
+            schema["context_decision_prompt"]["default"],
+            runtime_default,
         )
 
     def test_sqlite_health_cache_artifacts_are_ignored(self) -> None:

@@ -12,8 +12,11 @@ from ..compat import install_private_context_guard, isolate_private_context_requ
 
 _HEALTH_CAPABILITY_INSTRUCTION = (
     "当前会话已为配置的使用者启用小米运动健康集成。需要生活数据时，插件会自动以临时 "
-    "<private_life_context> 提供已核实记录；这项集成不一定出现在普通工具列表中，不能仅因"
-    "工具列表没有健康工具就声称无法使用或没有配置。若本轮没有已核实的生活数据上下文，"
+    "<private_life_context> 提供已核实记录；这项集成不一定出现在普通工具列表中。"
+    "如果本轮出现该标签，就表示你已经直接拿到其中列出的记录，无需再寻找或调用健康工具；"
+    "应根据当前对话自然使用相关记录，也可以如实说明本轮能够参考这些记录，不能声称自己"
+    "看不见、无法访问或没有健康工具。用户不必直接询问指标，只要这些记录能帮助理解、核实"
+    "或温和纠正其当前表达，就可以在保持当前人格的前提下自然参考。若本轮没有该标签，"
     "不得根据消息时间或聊天历史推测睡眠时长、入睡和起床时间、心率、活动量或其他数值；"
     "应保持当前人格自然继续，不编造数据，也不讨论缓存、云同步或插件内部实现。"
 )
@@ -62,7 +65,12 @@ class MainModelToolingMixin:
             + sync_line
             + dialogue_line
             + "\n"
-            + "These are delayed Xiaomi cloud records, not real-time monitoring. "
+            + "The records above are available to you in this turn. Use them directly "
+            + "without looking for another tool, and never claim that you cannot see or "
+            + "access them. If the owner asks whether you can see their health data, explain "
+            + "naturally that you can reference the Xiaomi records supplied for this turn, "
+            + "without describing plugin internals. These are delayed Xiaomi cloud records, "
+            + "not real-time monitoring. "
             + instruction
             + " Sleep timestamps are already converted to the owner's configured timezone "
             "and use a 24-hour clock; never add an offset or convert them again. For example, "

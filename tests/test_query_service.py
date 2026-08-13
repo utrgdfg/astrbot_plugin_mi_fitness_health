@@ -100,20 +100,34 @@ class QueryServiceTest(unittest.TestCase):
                     "",
                 )
 
-    def test_llm_focus_limits_ordinary_requests_to_first_two_categories(self) -> None:
+    def test_llm_focus_limits_ordinary_requests_to_first_three_categories(self) -> None:
         service = QueryService(_RecordingDatabase(), "user", "Asia/Shanghai")
 
         self.assertEqual(
             service.llm_categories_for_focus("昨天睡眠、心率和步数"),
-            ("sleep", "heart"),
+            ("sleep", "heart", "activity"),
         )
         self.assertEqual(
             service.normalize_llm_focus("昨天睡眠、心率和步数"),
-            "昨天 睡眠 心率",
+            "昨天 睡眠 心率 活动",
         )
+
+    def test_llm_focus_treats_plain_health_status_as_comprehensive(self) -> None:
+        service = QueryService(_RecordingDatabase(), "user", "Asia/Shanghai")
+
+        for focus in (
+            "我的身体健康怎么样",
+            "最近健康状况如何",
+            "看看整体健康",
+        ):
+            with self.subTest(focus=focus):
+                self.assertEqual(
+                    set(service.llm_categories_for_focus(focus)),
+                    set(service.CATEGORY_SYNC_TYPES),
+                )
         self.assertEqual(
             service.llm_sync_types_for_focus("昨天睡眠、心率和步数"),
-            ("sleep", "heart_rate"),
+            ("sleep", "heart_rate", "daily_activity"),
         )
         self.assertEqual(
             service.llm_categories_for_focus("身体数据"),
@@ -128,6 +142,16 @@ class QueryServiceTest(unittest.TestCase):
         self.assertEqual(
             service.llm_categories_for_focus("请给我今天的综合概况"),
             tuple(service.CATEGORY_SYNC_TYPES),
+        )
+        self.assertEqual(
+            service.normalize_llm_focus("请给我今天的综合概况"),
+            "今天 综合概况",
+        )
+        self.assertEqual(
+            service.normalize_llm_focus(
+                service.normalize_llm_focus("请给我今天的综合概况")
+            ),
+            "今天 综合概况",
         )
         self.assertEqual(
             set(service.llm_sync_types_for_focus("请给我今天的综合概况")),
