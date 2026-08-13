@@ -548,6 +548,79 @@ class MainLifecycleTest(unittest.TestCase):
         )
         plugin._platform_private_context.assert_not_awaited()
 
+    def test_decision_platform_history_timeout_falls_back_without_blocking(
+        self,
+    ) -> None:
+        async def scenario() -> None:
+            plugin = self._bare_plugin()
+            plugin.context_decision_context_source = "platform_message_history"
+            plugin._is_configured_owner_private_session = AsyncMock(return_value=True)
+            entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def stubborn_history(*_args: object) -> list[str]:
+                entered.set()
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    await release.wait()
+                return ["用户: 不应阻塞本轮回复"]
+
+            plugin._platform_private_context = AsyncMock(side_effect=stubborn_history)
+            event = Mock(unified_msg_origin="bot:FriendMessage:owner")
+            request = ProviderRequest()
+            request.contexts = [{"role": "assistant", "content": "请求历史备用"}]
+
+            try:
+                with patch(
+                    "astrbot_plugin_mi_fitness_health.features.conversation_routing."
+                    "DECISION_CONTEXT_SOURCE_TIMEOUT_SECONDS",
+                    0.01,
+                ):
+                    started = asyncio.get_running_loop().time()
+                    context = await plugin._decision_context_for_request(
+                        event, request, "现在呢"
+                    )
+                    elapsed = asyncio.get_running_loop().time() - started
+
+                self.assertLess(elapsed, 0.2)
+                self.assertEqual(
+                    context,
+                    [{"role": "assistant", "text": "请求历史备用"}],
+                )
+                self.assertTrue(entered.is_set())
+                self.assertEqual(len(plugin._detached_tasks), 1)
+            finally:
+                release.set()
+                for _ in range(10):
+                    if not plugin._detached_tasks:
+                        break
+                    await asyncio.sleep(0)
+            self.assertFalse(plugin._detached_tasks)
+
+        asyncio.run(scenario())
+
+    def test_decision_platform_history_error_falls_back_to_request_history(
+        self,
+    ) -> None:
+        plugin = self._bare_plugin()
+        plugin.context_decision_context_source = "platform_message_history"
+        plugin._is_configured_owner_private_session = AsyncMock(
+            side_effect=RuntimeError("synthetic history failure")
+        )
+        event = Mock(unified_msg_origin="bot:FriendMessage:owner")
+        request = ProviderRequest()
+        request.contexts = [{"role": "assistant", "content": "请求历史备用"}]
+
+        context = asyncio.run(
+            plugin._decision_context_for_request(event, request, "现在呢")
+        )
+
+        self.assertEqual(
+            context,
+            [{"role": "assistant", "text": "请求历史备用"}],
+        )
+
     def test_decision_hybrid_context_deduplicates_request_and_platform(self) -> None:
         plugin = self._bare_plugin()
         plugin.context_decision_context_source = "hybrid"
@@ -633,6 +706,21 @@ class MainLifecycleTest(unittest.TestCase):
             set(QueryService.CATEGORY_SYNC_TYPES.values()),
         )
 
+    def test_direct_health_request_accepts_unambiguous_owner_forms(self) -> None:
+        plugin = self._bare_plugin()
+        plugin.query_service = Mock()
+        plugin.query_service.normalize_llm_focus.side_effect = (
+            QueryService.normalize_llm_focus
+        )
+
+        for message, expected in (
+            ("血氧多少", (True, "血氧")),
+            ("昨晚睡了多久", (True, "睡眠")),
+            ("帮我看看最近的心率", (True, "最近 心率")),
+        ):
+            with self.subTest(message=message):
+                self.assertEqual(plugin._direct_context_decision(message), expected)
+
     def test_explicit_health_overview_skips_classifier_but_keeps_data_isolation(
         self,
     ) -> None:
@@ -701,6 +789,15 @@ class MainLifecycleTest(unittest.TestCase):
             "写一篇关于血氧的文章",
             "我朋友最近血氧怎么样",
             "孩子最近的压力数据怎么样",
+            "小明的血氧怎么样",
+            "小李昨晚睡了多久",
+            "告诉我小王的心率",
+            "我的老板心率怎么样",
+            "我最近想知道小王的睡眠",
+            "血氧正常值是多少",
+            "心率正常范围是多少",
+            "运动有什么好处",
+            "活动策划怎么写",
         ):
             with self.subTest(message=message):
                 self.assertIsNone(plugin._direct_context_decision(message))

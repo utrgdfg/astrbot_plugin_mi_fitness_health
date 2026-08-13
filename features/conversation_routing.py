@@ -12,10 +12,11 @@ from astrbot.api import logger
 from astrbot.api.provider import ProviderRequest
 
 from ..adapters import MiFitnessAuthenticationError
-from ..utils.async_tools import await_with_hard_timeout
+from ..utils.async_tools import await_cancellation_safe, await_with_hard_timeout
 from ..utils.privacy import redact_error
 
 DEFAULT_CONTEXT_DECISION_TIMEOUT_SECONDS = 8.0
+DECISION_CONTEXT_SOURCE_TIMEOUT_SECONDS = 1.0
 
 DEFAULT_CONTEXT_DECISION_PROMPT = (
     "结合最近对话与当前消息，判断小米运动健康生活数据是否可能让 Bot 的本轮回复"
@@ -70,6 +71,106 @@ class ConversationRoutingMixin:
         "所有健康数据",
         "全部身体数据",
         "所有身体数据",
+    )
+    _DIRECT_OWNER_DATA_PREFIXES = (
+        "我的血氧",
+        "我的心率",
+        "我的心跳",
+        "我的睡眠",
+        "我的步数",
+        "我的运动",
+        "我的活动",
+        "我的卡路里",
+        "我的热量",
+        "我的体重",
+        "我的体脂",
+        "我的身体成分",
+        "我的压力记录",
+        "我的压力数据",
+        "我的身体健康",
+        "我的健康状况",
+        "我的身体状况",
+        "我的整体健康",
+        "我的总体健康",
+        "我的综合健康",
+        "我的健康概况",
+        "我的整体状态",
+        "我的总体状态",
+        "我的综合状态",
+        "我昨晚睡",
+        "我昨天睡",
+        "我今天睡",
+        "我今天走",
+        "我最近睡",
+        "我最近走",
+        "我这两天睡",
+        "我这两天走",
+        "我刚才运动",
+        "我刚刚运动",
+        "血氧",
+        "心率",
+        "心跳",
+        "睡眠",
+        "睡得",
+        "昨晚睡",
+        "昨天睡",
+        "今天睡",
+        "最近睡",
+        "这两天睡",
+        "最近心率",
+        "最近的心率",
+        "最近血氧",
+        "最近的血氧",
+        "步数",
+        "今天走",
+        "昨天走",
+        "最近走",
+        "运动",
+        "活动",
+        "卡路里",
+        "热量",
+        "体重",
+        "体脂",
+        "身体成分",
+        "压力记录",
+        "压力数据",
+        *_COMPREHENSIVE_HEALTH_QUESTION_CUES,
+    )
+    _DIRECT_OWNER_COMMAND_PREFIXES = (
+        "帮我看看",
+        "帮我看下",
+        "帮我查查",
+        "帮我查询",
+        "给我看看",
+        "给我看下",
+        "给我查查",
+        "我想知道",
+        "我想看看",
+        "我想查查",
+        "查一下",
+        "查询一下",
+        "看看",
+        "看一下",
+        "看下",
+        "查查",
+        "查询",
+        "告诉我",
+    )
+    _DIRECT_KNOWLEDGE_QUESTION_CUES = (
+        "正常值",
+        "正常范围",
+        "参考范围",
+        "标准范围",
+        "一般是多少",
+        "是什么",
+        "有什么作用",
+        "有什么好处",
+        "有什么坏处",
+        "怎么计算",
+        "如何计算",
+        "计算公式",
+        "数据结构",
+        "活动策划",
     )
 
     def _private_context_runtime_is_unsafe(self, session: str) -> bool:
@@ -464,7 +565,19 @@ class ConversationRoutingMixin:
         allowed, _focus = self._fallback_context_decision(message)
         if not allowed:
             return None
-        compact = message.lower().replace(" ", "")
+        compact = "".join(message.lower().split())
+        if any(cue in compact for cue in self._DIRECT_KNOWLEDGE_QUESTION_CUES):
+            return None
+        direct_subject = compact
+        for prefix in self._DIRECT_OWNER_COMMAND_PREFIXES:
+            if direct_subject.startswith(prefix):
+                direct_subject = direct_subject[len(prefix) :]
+                break
+        # Named third-party questions are deliberately left to the semantic
+        # classifier. The direct path may only bypass it when the owner or the
+        # requested metric is the explicit grammatical subject.
+        if not direct_subject.startswith(self._DIRECT_OWNER_DATA_PREFIXES):
+            return None
         if any(cue in compact for cue in self._COMPREHENSIVE_HEALTH_QUESTION_CUES):
             if "昨天" in compact or "昨日" in compact:
                 scope = "昨天"
@@ -584,6 +697,17 @@ class ConversationRoutingMixin:
         text = " ".join(text.split())[:600]
         return {"role": role, "text": text} if text else None
 
+    async def _verified_platform_decision_lines(
+        self,
+        session: str,
+        count: int,
+        include_bot: bool,
+    ) -> list[str]:
+        """Read only a verified owner-private platform history."""
+        if not await self._is_configured_owner_private_session(session):
+            return []
+        return await self._platform_private_context(session, count, include_bot)
+
     async def _decision_context_for_request(
         self,
         event: object,
@@ -617,23 +741,36 @@ class ConversationRoutingMixin:
 
         session = str(getattr(event, "unified_msg_origin", "") or "")
         platform_entries: list[dict[str, str]] = []
-        if await self._is_configured_owner_private_session(session):
-            include_bot = bool(
-                getattr(self, "context_decision_include_bot_messages", True)
+        include_bot = bool(getattr(self, "context_decision_include_bot_messages", True))
+        try:
+            lines = await await_with_hard_timeout(
+                await_cancellation_safe(
+                    self._verified_platform_decision_lines(session, count, include_bot)
+                ),
+                DECISION_CONTEXT_SOURCE_TIMEOUT_SECONDS,
+                registry=getattr(self, "_detached_tasks", None),
             )
-            lines = await self._platform_private_context(
-                session,
-                count,
-                include_bot,
+        except TimeoutError:
+            logger.warning(
+                "Mi Fitness platform history lookup timed out; using current "
+                "conversation history for this turn"
             )
-            bounded_current = self._decision_context_text(current_message)[:600]
-            for line in lines:
-                entry = self._decision_entry_from_private_line(line)
-                if entry is None:
-                    continue
-                if entry["role"] == "user" and entry["text"] == bounded_current:
-                    continue
-                platform_entries.append(entry)
+            lines = []
+        except Exception as error:
+            logger.warning(
+                "Mi Fitness platform history lookup failed; using current "
+                "conversation history for this turn (%s)",
+                type(error).__name__,
+            )
+            lines = []
+        bounded_current = self._decision_context_text(current_message)[:600]
+        for line in lines:
+            entry = self._decision_entry_from_private_line(line)
+            if entry is None:
+                continue
+            if entry["role"] == "user" and entry["text"] == bounded_current:
+                continue
+            platform_entries.append(entry)
 
         if source == "platform_message_history":
             entries = platform_entries or request_entries
