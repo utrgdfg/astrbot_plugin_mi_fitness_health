@@ -1120,7 +1120,26 @@ class MainLifecycleTest(unittest.TestCase):
         self.assertTrue(request.system_prompt.startswith("persona\n\n"))
         self.assertEqual(request.system_prompt.count("启用小米运动健康集成"), 1)
         self.assertIn("不一定出现在普通工具列表中", request.system_prompt)
+        self.assertIn("已经直接拿到其中列出的记录", request.system_prompt)
+        self.assertIn("不能声称自己看不见", request.system_prompt)
+        self.assertIn("用户不必直接询问指标", request.system_prompt)
         self.assertIn("不得根据消息时间或聊天历史推测睡眠时长", request.system_prompt)
+
+    def test_injected_health_context_is_an_explicit_usage_contract(self) -> None:
+        context = MiFitnessHealthPlugin._build_private_life_context(
+            "今日睡眠 420 分钟",
+            "2026-08-14 08:00",
+            None,
+            health_question=False,
+        )
+
+        self.assertIn("The records above are available to you in this turn", context)
+        self.assertIn("without looking for another tool", context)
+        self.assertIn("never claim that you cannot see or access them", context)
+        self.assertIn(
+            "If the owner asks whether you can see their health data", context
+        )
+        self.assertIn("Use one relevant record naturally", context)
 
     def test_main_model_preflight_prefers_turn_selected_provider(self) -> None:
         plugin = self._bare_plugin()
