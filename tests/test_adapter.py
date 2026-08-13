@@ -1006,7 +1006,7 @@ class AdapterTest(unittest.TestCase):
         session_headers = httpx.Headers(
             [
                 ("Set-Cookie", "unknownCookie=ignored; Secure"),
-                ("Set-Cookie", "serviceToken=service; Secure; HttpOnly"),
+                ("Set-Cookie", "serviceToken=synthetic-service; Secure; HttpOnly"),
                 ("Set-Cookie", "cUserId=cloud-user; Secure"),
                 ("Set-Cookie", "userId=user; Secure"),
                 ("Set-Cookie", "yetAnotherServiceToken=alternate; Secure"),
@@ -1025,7 +1025,7 @@ class AdapterTest(unittest.TestCase):
 
         self.assertEqual(
             adapter._cookies,
-            "serviceToken=service; cUserId=cloud-user; userId=user; "
+            "serviceToken=synthetic-service; cUserId=cloud-user; userId=user; "
             "yetAnotherServiceToken=alternate",
         )
         self.assertNotIn("unknownCookie", adapter._cookies)
@@ -1071,7 +1071,9 @@ class AdapterTest(unittest.TestCase):
             ),
             _http_response(
                 200,
-                headers={"Set-Cookie": "serviceToken=service; Secure; HttpOnly"},
+                headers={
+                    "Set-Cookie": "serviceToken=synthetic-service; Secure; HttpOnly"
+                },
             ),
         )
 
@@ -1086,7 +1088,7 @@ class AdapterTest(unittest.TestCase):
         }
         session_headers = httpx.Headers(
             [
-                ("Set-Cookie", "serviceToken=service; Secure; HttpOnly"),
+                ("Set-Cookie", "serviceToken=synthetic-service; Secure; HttpOnly"),
                 ("Set-Cookie", "userId=different-user; Secure"),
             ]
         )
@@ -1106,15 +1108,17 @@ class AdapterTest(unittest.TestCase):
         payload = {
             "ssecurity": base64.b64encode(b"s" * 16).decode(),
             "location": "https://api.io.mi.com/session",
-            "userId": "user",
+            "userId": "synthetic-user",
         }
-        adapter = MiFitnessCloudAdapter("user", "token", "cn")
+        adapter = MiFitnessCloudAdapter("synthetic-user", "token", "cn")
         adapter._client = _StreamingClient(
             _http_response(
                 200,
                 content=LOGIN_PREFIX + json.dumps(payload).encode(),
             ),
-            _http_response(200, headers={"Set-Cookie": "userId=user; Secure"}),
+            _http_response(
+                200, headers={"Set-Cookie": "userId=synthetic-user; Secure"}
+            ),
         )
 
         with self.assertRaisesRegex(MiFitnessAuthenticationError, "服务令牌"):
