@@ -38,6 +38,7 @@ class MainLifecycleTest(unittest.TestCase):
         plugin.context_decision_timeout_seconds = 8
         plugin.natural_query_cloud_wait_seconds = 5
         plugin.context_decision_context_source = "conversation_history"
+        plugin.context_decision_platform_history_timeout_seconds = 3
         plugin.context_decision_message_count = 8
         plugin.context_decision_include_bot_messages = True
         plugin._last_proactive_delivery_at = None
@@ -572,16 +573,12 @@ class MainLifecycleTest(unittest.TestCase):
             request.contexts = [{"role": "assistant", "content": "请求历史备用"}]
 
             try:
-                with patch(
-                    "astrbot_plugin_mi_fitness_health.features.conversation_routing."
-                    "DECISION_CONTEXT_SOURCE_TIMEOUT_SECONDS",
-                    0.01,
-                ):
-                    started = asyncio.get_running_loop().time()
-                    context = await plugin._decision_context_for_request(
-                        event, request, "现在呢"
-                    )
-                    elapsed = asyncio.get_running_loop().time() - started
+                plugin.context_decision_platform_history_timeout_seconds = 0.01
+                started = asyncio.get_running_loop().time()
+                context = await plugin._decision_context_for_request(
+                    event, request, "现在呢"
+                )
+                elapsed = asyncio.get_running_loop().time() - started
 
                 self.assertLess(elapsed, 0.2)
                 self.assertEqual(
@@ -4481,6 +4478,10 @@ class MainLifecycleTest(unittest.TestCase):
                 default_plugin.context_decision_context_source,
                 "conversation_history",
             )
+            self.assertEqual(
+                default_plugin.context_decision_platform_history_timeout_seconds,
+                3,
+            )
 
     def test_invalid_decision_context_source_falls_back_to_conversation(
         self,
@@ -4513,6 +4514,7 @@ class MainLifecycleTest(unittest.TestCase):
                     "health_check_interval_minutes": "broken",
                     "natural_query_sync_minutes": None,
                     "context_decision_timeout_seconds": "broken",
+                    "context_decision_platform_history_timeout_seconds": "broken",
                     "natural_query_cloud_wait_seconds": 999999,
                     "sync_interval_minutes": 999999,
                     "data_retention_days": "bad",
@@ -4527,6 +4529,10 @@ class MainLifecycleTest(unittest.TestCase):
         self.assertEqual(plugin.monitor_interval, 30)
         self.assertEqual(plugin.natural_query_sync_minutes, 15)
         self.assertEqual(plugin.context_decision_timeout_seconds, 8)
+        self.assertEqual(
+            plugin.context_decision_platform_history_timeout_seconds,
+            3,
+        )
         self.assertEqual(plugin.natural_query_cloud_wait_seconds, 30)
         self.assertEqual(plugin.sync_interval, 1440)
         self.assertEqual(plugin.data_retention_days, 90)
@@ -4539,11 +4545,13 @@ class MainLifecycleTest(unittest.TestCase):
                     "database_path": str(Path(directory) / "timeouts.sqlite3"),
                     "conversation_health_mode": "main_model",
                     "context_decision_timeout_seconds": 12,
+                    "context_decision_platform_history_timeout_seconds": 9,
                     "natural_query_cloud_wait_seconds": 0,
                 },
             )
 
         self.assertEqual(plugin.context_decision_timeout_seconds, 12)
+        self.assertEqual(plugin.context_decision_platform_history_timeout_seconds, 9)
         self.assertEqual(plugin.conversation_health_mode, "main_model")
         self.assertEqual(plugin.natural_query_cloud_wait_seconds, 0)
 

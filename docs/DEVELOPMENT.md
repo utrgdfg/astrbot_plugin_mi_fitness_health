@@ -70,7 +70,7 @@ AstrBot 的 `filter` 装饰器继续只放在 `main.py` 的插件类上，功能
 
 `conversation_health_mode=auto` 用于兼容升级：已有 `context_decision_provider_id` 时解析为独立判断模型，否则解析为本地规则。显式 `main_model` 对候选生活话题调用本轮文字 Provider 做分类，分类命中后才检查缓存、访问小米云并向正式回复临时提供相关摘要；图片回退 Provider 身份无法确认、Provider 为空或分类失败时均 fail closed。显式 `decision_model` 缺少 Provider 时同样 fail closed，不暗中退回本地规则。
 
-`context_decision_provider_id` 仅用于独立判断模型。它接收当前所有者私聊中经过长度限制和边界转义的最近 `user`/可选 `assistant` 纯文本，以及当前消息，并返回严格 JSON；不接收 system、tool、多媒体内容或本轮刚读取的小米生活数据。`context_decision_context_source` 可选择本轮 AstrBot 对话历史、经过会话验证的平台私聊流水或合并去重；平台记录不可验证时回退到本轮对话历史。历史条数由 `context_decision_message_count` 控制（0～20，总量最多 4000 字符），是否包含 Bot 回复由 `context_decision_include_bot_messages` 控制。明确且无歧义的数据询问可直接映射到类别，其他日常表达由模型结合上下文判断；普通结果最多选择三个类别，显式综合健康询问可选择全部支持类别。随后仍由插件根据每类缓存的新鲜度决定是否联网刷新。模型失败、超时、输出无效或处于 1、5、15 分钟退避期间均静默跳过本轮健康上下文，不由本地规则接管；有效结果立即清零退避。原始消息的强制刷新意图单独保留，不依赖模型生成的焦点文本。
+`context_decision_provider_id` 仅用于独立判断模型。它接收当前所有者私聊中经过长度限制和边界转义的最近 `user`/可选 `assistant` 纯文本，以及当前消息，并返回严格 JSON；不接收 system、tool、多媒体内容或本轮刚读取的小米生活数据。`context_decision_context_source` 可选择本轮 AstrBot 对话历史、经过会话验证的平台私聊流水或合并去重；平台记录不可验证或读取超时时回退到本轮对话历史。平台流水读取等待由 `context_decision_platform_history_timeout_seconds` 控制（默认 3 秒，可配置 1～15 秒），不影响判断模型或小米云刷新时限。历史条数由 `context_decision_message_count` 控制（0～20，总量最多 4000 字符），是否包含 Bot 回复由 `context_decision_include_bot_messages` 控制。明确且无歧义的数据询问可直接映射到类别，其他日常表达由模型结合上下文判断；普通结果最多选择三个类别，显式综合健康询问可选择全部支持类别。随后仍由插件根据每类缓存的新鲜度决定是否联网刷新。模型失败、超时、输出无效或处于 1、5、15 分钟退避期间均静默跳过本轮健康上下文，不由本地规则接管；有效结果立即清零退避。原始消息的强制刷新意图单独保留，不依赖模型生成的焦点文本。
 
 `context_decision_prompt` 和 `proactive_decision_prompt` 使用官方 `text` 配置类型。前者定义生活数据语义分类任务；当前主模型预判和独立判断模式都会固定追加允许类别、JSON 输出协议、提示注入隔离和 fail-closed 规则。后者定义深夜候选时机的发送取舍；配置提示词不能移除代码层的权限与隐私边界。
 

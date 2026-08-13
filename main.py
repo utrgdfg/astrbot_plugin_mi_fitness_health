@@ -241,6 +241,13 @@ class MiFitnessHealthPlugin(
             in {"conversation_history", "platform_message_history", "hybrid"}
             else "conversation_history"
         )
+        self.context_decision_platform_history_timeout_seconds = _config_int(
+            config,
+            "context_decision_platform_history_timeout_seconds",
+            3,
+            1,
+            15,
+        )
         self.context_decision_message_count = _config_int(
             config, "context_decision_message_count", 8, 0, 20
         )

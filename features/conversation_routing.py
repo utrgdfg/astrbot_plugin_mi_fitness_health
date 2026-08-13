@@ -16,7 +16,7 @@ from ..utils.async_tools import await_with_hard_timeout
 from ..utils.privacy import redact_error
 
 DEFAULT_CONTEXT_DECISION_TIMEOUT_SECONDS = 8.0
-DECISION_CONTEXT_SOURCE_TIMEOUT_SECONDS = 1.0
+DEFAULT_DECISION_PLATFORM_HISTORY_TIMEOUT_SECONDS = 3.0
 
 DEFAULT_CONTEXT_DECISION_PROMPT = (
     "结合最近对话与当前消息，判断小米运动健康生活数据是否可能让 Bot 的本轮回复"
@@ -745,7 +745,13 @@ class ConversationRoutingMixin:
         try:
             lines = await await_with_hard_timeout(
                 self._verified_platform_decision_lines(session, count, include_bot),
-                DECISION_CONTEXT_SOURCE_TIMEOUT_SECONDS,
+                float(
+                    getattr(
+                        self,
+                        "context_decision_platform_history_timeout_seconds",
+                        DEFAULT_DECISION_PLATFORM_HISTORY_TIMEOUT_SECONDS,
+                    )
+                ),
                 registry=getattr(self, "_detached_tasks", None),
             )
         except TimeoutError:

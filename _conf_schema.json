@@ -113,6 +113,17 @@
     ],
     "default": "conversation_history"
   },
+  "context_decision_platform_history_timeout_seconds": {
+    "type": "int",
+    "description": "平台私聊流水读取等待时间（秒）",
+    "hint": "仅在生活数据判断选择“平台真实私聊流水”或“混合模式”时使用。默认等待 3 秒，可在 1～15 秒之间调整；超时会安全回退到当前 AstrBot LLM 对话历史，不会阻断普通回复。此项不影响判断模型或小米云同步的等待时间。",
+    "default": 3,
+    "slider": {
+      "min": 1,
+      "max": 15,
+      "step": 1
+    }
+  },
   "context_decision_message_count": {
     "type": "int",
     "description": "调用判断读取的最近消息条数",

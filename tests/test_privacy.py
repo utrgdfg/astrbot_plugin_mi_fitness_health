@@ -57,6 +57,14 @@ class PrivacyTest(unittest.TestCase):
             schema["context_decision_context_source"]["default"],
             "conversation_history",
         )
+        self.assertEqual(
+            schema["context_decision_platform_history_timeout_seconds"]["default"],
+            3,
+        )
+        self.assertEqual(
+            schema["context_decision_platform_history_timeout_seconds"]["slider"],
+            {"min": 1, "max": 15, "step": 1},
+        )
         self.assertIn(
             "main_model",
             schema["conversation_health_mode"]["options"],
