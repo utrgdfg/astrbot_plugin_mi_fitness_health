@@ -35,10 +35,11 @@ from .utils.access import (
     owner_access_denial_reason,
 )
 from .utils.async_tools import await_cancellation_safe
+from .utils.config_layout import GroupedConfigView, migrate_grouped_config
 
 
 def _config_bool(
-    config: AstrBotConfig, key: str, default: bool, *, fail_closed: bool = False
+    config: GroupedConfigView, key: str, default: bool, *, fail_closed: bool = False
 ) -> bool:
     """Parse one bool without treating arbitrary non-empty strings as true."""
     value = config.get(key, default)
@@ -62,7 +63,7 @@ def _config_bool(
 
 
 def _config_int(
-    config: AstrBotConfig,
+    config: GroupedConfigView,
     key: str,
     default: int,
     minimum: int,
@@ -145,6 +146,7 @@ class MiFitnessHealthPlugin(
         """
         super().__init__(context)
         self.config = config
+        config = migrate_grouped_config(config)
         self.data_dir = Path(StarTools.get_data_dir(self.name))
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.user_id = str(

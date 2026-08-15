@@ -1,5 +1,7 @@
 # AstrBot 小米运动健康
 
+![Moe Counter](https://count.getloli.com/@utrgdfg-astrbot_plugin_mi_fitness_health?theme=booru-lewd)
+
 这是一个为日常聊天补充生活数据的 AstrBot 插件，不是一个需要反复下指令的健康查询机器人。
 
 配置完成后，你只需要像平时一样和 Bot 聊天。例如说“早啊，今天不太想起床”“今天好累”“刚散步回来”“还在加班”或“晚安”。当聊天内容与作息、疲劳或活动有关时，插件会在后台准备少量相关数据，让 Bot 继续按照原有模型和人格自然接话。

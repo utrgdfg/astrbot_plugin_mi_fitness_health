@@ -4555,6 +4555,44 @@ class MainLifecycleTest(unittest.TestCase):
         self.assertEqual(plugin.conversation_health_mode, "main_model")
         self.assertEqual(plugin.natural_query_cloud_wait_seconds, 0)
 
+    def test_grouped_configuration_is_used_without_flat_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = str(Path(directory) / "grouped.sqlite3")
+            plugin = MiFitnessHealthPlugin(
+                Mock(),
+                {
+                    "_config_layout_version": 1,
+                    "account": {
+                        "user_id": "synthetic-grouped-user",
+                        "pass_token": "synthetic-grouped-token",
+                        "owner_platform_id": "synthetic-grouped-owner",
+                        "owner_platform_instance_id": "synthetic-grouped-bot",
+                        "region": "cn",
+                        "user_timezone": "Asia/Shanghai",
+                    },
+                    "privacy": {
+                        "allow_health_data_to_llm": True,
+                        "allow_proactive_chat_context": False,
+                    },
+                    "conversation_routing": {
+                        "context_decision_timeout_seconds": 12,
+                    },
+                    "sync_storage": {"database_path": database_path},
+                },
+            )
+
+        self.assertEqual(plugin.user_id, "synthetic-grouped-user")
+        self.assertEqual(plugin.pass_token, "synthetic-grouped-token")
+        self.assertEqual(plugin.owner_platform_id, "synthetic-grouped-owner")
+        self.assertEqual(
+            plugin.owner_platform_instance_id,
+            "synthetic-grouped-bot",
+        )
+        self.assertTrue(plugin.allow_health_data_to_llm)
+        self.assertFalse(plugin.allow_proactive_chat_context)
+        self.assertEqual(plugin.context_decision_timeout_seconds, 12)
+        self.assertEqual(str(plugin.database.path), database_path)
+
     def test_failed_manual_sync_does_not_start_cooldown(self) -> None:
         plugin = self._bare_plugin()
         plugin._last_manual_sync_at = None

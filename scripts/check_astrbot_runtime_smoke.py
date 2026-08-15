@@ -3,7 +3,55 @@
 from __future__ import annotations
 
 import importlib
+import json
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
+
+
+def _check_grouped_config_migration() -> None:
+    """Verify one real AstrBotConfig upgrade from the v1.0.3 flat layout."""
+    from astrbot.core.config.astrbot_config import AstrBotConfig
+
+    layout = importlib.import_module(
+        "astrbot_plugin_mi_fitness_health.utils.config_layout"
+    )
+    repository_root = Path(__file__).resolve().parents[1]
+    schema = json.loads(
+        (repository_root / "_conf_schema.json").read_text(encoding="utf-8")
+    )
+    legacy_values = {
+        "user_id": "synthetic-xiaomi-user",
+        "pass_token": "synthetic-pass-token",
+        "owner_platform_id": "synthetic-owner",
+        "owner_platform_instance_id": "synthetic-bot",
+        "region": "cn",
+        "user_timezone": "Asia/Shanghai",
+        "allow_health_data_to_llm": True,
+        "allow_proactive_chat_context": True,
+        "conversation_health_mode": "decision_model",
+        "context_decision_timeout_seconds": 12,
+        "context_decision_platform_history_timeout_seconds": 7,
+        "enable_auto_sync": True,
+        "sync_interval_minutes": 90,
+        "database_path": "",
+    }
+    with tempfile.TemporaryDirectory() as directory:
+        config_path = Path(directory) / "plugin_config.json"
+        config_path.write_text(
+            json.dumps(legacy_values, ensure_ascii=False), encoding="utf-8"
+        )
+        config = AstrBotConfig(config_path=str(config_path), schema=schema)
+        view = layout.migrate_grouped_config(config)
+        for key, expected in legacy_values.items():
+            if view.get(key) != expected:
+                raise AssertionError(f"legacy config value was not migrated: {key}")
+
+        reloaded = AstrBotConfig(config_path=str(config_path), schema=schema)
+        reloaded_view = layout.migrate_grouped_config(reloaded)
+        for key, expected in legacy_values.items():
+            if reloaded_view.get(key) != expected:
+                raise AssertionError(f"grouped config value was not retained: {key}")
 
 
 def main() -> int:
@@ -48,6 +96,8 @@ def main() -> int:
         raise AssertionError("fallback scrub retained private context")
     if request.func_tool is not None:
         raise AssertionError("fallback scrub retained the isolated tool set")
+
+    _check_grouped_config_migration()
 
     print("AstrBot runtime smoke OK")
     return 0
