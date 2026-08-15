@@ -1,6 +1,6 @@
 # AstrBot 小米运动健康
 
-![Moe Counter](https://count.getloli.com/@utrgdfg-astrbot_plugin_mi_fitness_health?theme=booru-lewd)
+[![Moe Counter](https://mayu.due.moe/get/@utrgdfg-astrbot_plugin_mi_fitness_health?theme=booru-lewd)](https://github.com/utrgdfg/astrbot_plugin_mi_fitness_health)
 
 这是一个为日常聊天补充生活数据的 AstrBot 插件，不是一个需要反复下指令的健康查询机器人。
 
