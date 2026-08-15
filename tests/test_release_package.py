@@ -17,7 +17,7 @@ from scripts.privacy_gate import scan_archive
 class ReleasePackageTest(unittest.TestCase):
     def test_release_version_is_v1(self) -> None:
         repository_root = Path(__file__).resolve().parents[1]
-        self.assertEqual(metadata_version(repository_root), "v1.0.3")
+        self.assertEqual(metadata_version(repository_root), "v1.0.4")
 
     def test_release_archive_is_reproducible_and_importable(self) -> None:
         repository_root = Path(__file__).resolve().parents[1]
